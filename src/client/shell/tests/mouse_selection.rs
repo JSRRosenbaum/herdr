@@ -508,6 +508,51 @@ fn pane_pixel_mouse_preserves_pane_relative_pixel_coordinates() {
 }
 
 #[test]
+fn navigation_mouse_uses_raw_endpoint_input_without_click_or_focus() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_endpoint_methods(Some(
+        crate::server::client_commands::supported_client_shell_method_names()
+            .iter()
+            .map(|method| (*method).to_owned())
+            .collect(),
+    ));
+    let mut panes = surface();
+    panes.panes[0].mouse_reporting = true;
+    panes.panes[0].sgr_pixel_mouse = true;
+    panes.panes[0].pixel_width = 39;
+    panes.panes[0].pixel_height = 38;
+    state.set_pane_surface(panes);
+    state.compose(106, 20).expect("frame");
+    let pane = state.hits.panes[0].clone();
+    let geometry = crate::input::mouse::HostGeometry::new(106, 20, 1060, 400).unwrap();
+    let x = u32::from(pane.inner_rect.x) * 10 + 21;
+    let y = u32::from(pane.inner_rect.y) * 20 + 21;
+    for button in [128, 129, 156, 157] {
+        for suffix in ['M', 'm'] {
+            let report = format!("\x1b[<{button};{x};{y}{suffix}");
+            let outcome = state.handle_pixel_mouse(report.as_bytes(), geometry);
+            assert!(outcome.requests.is_empty());
+            let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+                panic!("expected raw input endpoint request");
+            };
+            assert_eq!(
+                request.method,
+                crate::api::schema::Method::PaneSendText(crate::api::schema::PaneSendTextParams {
+                    pane_id: "pane_1".into(),
+                    text: format!("\x1b[<{button};20;20{suffix}"),
+                })
+            );
+            assert!(state.pane_mouse_gesture.is_none());
+        }
+    }
+    state.mode = ClientShellMode::Copy;
+    let outcome = state.handle_pixel_mouse(format!("\x1b[<128;{x};{y}M").as_bytes(), geometry);
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.requests.is_empty());
+}
+
+#[test]
 fn pane_owned_right_click_forwards_the_complete_gesture() {
     let mut snapshot = snapshot();
     snapshot.panes[0].right_click_passthrough = true;

@@ -30,6 +30,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.resize",
     "pane.scroll",
     "pane.selection.read",
+    "pane.send_text",
     "pane.split",
     "pane.swap",
     "pane.zoom",
@@ -285,7 +286,8 @@ mod tests {
             "/tests/fixtures/endpoint-method-shapes-v1.json"
         )))
         .expect("endpoint method shape fixture");
-        let actual = endpoint_method_shape_digests();
+        let mut actual = endpoint_method_shape_digests();
+        assert!(actual.remove("pane.send_text").is_some());
 
         assert_eq!(
             actual,

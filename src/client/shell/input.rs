@@ -101,6 +101,42 @@ impl ClientShellState {
         let Some((column, row)) = geometry.cell(x, y) else {
             return ClientShellInput::default();
         };
+        if let Some(button) = crate::input::mouse::navigation_report(data) {
+            let mut outcome = ClientShellInput::default();
+            if self.mode != ClientShellMode::Terminal
+                || self.overlay.is_some()
+                || self.popup_pending
+                || self.popup_input_target().is_some()
+            {
+                return outcome;
+            }
+            let Some(hit) = self.hits.panes.iter().find(|hit| {
+                !hit.popup
+                    && hit.mouse_reporting
+                    && hit.sgr_pixel_mouse
+                    && self.focused_pane_id().as_deref() == Some(hit.pane_id.as_str())
+                    && super::contains(hit.inner_rect, (column, row))
+            }) else {
+                return outcome;
+            };
+            let Some(crate::input::mouse::Position::Pixels { x, y }) =
+                (crate::input::mouse::HostPixels { x, y, geometry }).pane_position(
+                    hit.inner_rect,
+                    hit.pixel_width,
+                    hit.pixel_height,
+                )
+            else {
+                return outcome;
+            };
+            let suffix = if data.ends_with(b"M") { 'M' } else { 'm' };
+            let method =
+                crate::api::schema::Method::PaneSendText(crate::api::schema::PaneSendTextParams {
+                    pane_id: hit.pane_id.clone(),
+                    text: format!("\x1b[<{button};{x};{y}{suffix}"),
+                });
+            self.push_endpoint_method(method, &mut outcome);
+            return outcome;
+        }
         let Some(cell_report) = crate::input::mouse::report_at_cell(data, column, row) else {
             return ClientShellInput::default();
         };

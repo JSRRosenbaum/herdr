@@ -140,6 +140,14 @@ pub(crate) fn parse_report(data: &[u8]) -> Option<(u32, u32)> {
 }
 
 #[cfg(any(unix, test))]
+pub(crate) fn navigation_report(data: &[u8]) -> Option<u32> {
+    parse_report(data)?;
+    let body = data.strip_prefix(b"\x1b[<")?;
+    let code = parse_number(body.split(|byte| *byte == b';').next()?)?;
+    matches!(code & !28, 128 | 129).then_some(code)
+}
+
+#[cfg(any(unix, test))]
 pub(crate) fn report_at_cell(data: &[u8], column: u16, row: u16) -> Option<Vec<u8>> {
     let body = data.strip_prefix(b"\x1b[<")?;
     let suffix = if body.ends_with(b"M") { 'M' } else { 'm' };
@@ -185,6 +193,30 @@ fn scale(pixel: u32, source: u32, target: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_reports_preserve_only_side_presses_and_releases() {
+        for button in [128, 129] {
+            for modifiers in 0..8 {
+                let code = button | (modifiers << 2);
+                for suffix in ['M', 'm'] {
+                    let report = format!("\x1b[<{code};12;34{suffix}");
+                    assert_eq!(navigation_report(report.as_bytes()), Some(code));
+                }
+            }
+        }
+        for code in [0, 1, 2, 64, 65, 130, 131, 160, 161, 192] {
+            let report = format!("\x1b[<{code};12;34M");
+            assert_eq!(navigation_report(report.as_bytes()), None);
+        }
+        for report in [
+            b"\x1b[<128;12;34".as_slice(),
+            b"\x1b[<128;12;34Mtext",
+            b"text",
+        ] {
+            assert_eq!(navigation_report(report), None);
+        }
+    }
 
     #[test]
     fn parser_accepts_only_complete_sgr_mouse_reports() {
