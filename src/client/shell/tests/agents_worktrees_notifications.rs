@@ -155,6 +155,10 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
             .right()
             .saturating_sub("ws_22".len() as u16 + 1)
     );
+    let child = &state.hits.workspaces[1];
+    let child_status = usize::from(child.rect.y) * usize::from(frame.width)
+        + usize::from(child.rect.x.saturating_add(3));
+    assert_eq!(frame.cells[child_status].symbol, "○");
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;
