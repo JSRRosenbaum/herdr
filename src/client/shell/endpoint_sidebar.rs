@@ -292,14 +292,6 @@ pub(super) fn render_expanded(
             );
         }
     }
-    let workspace_tag_width = state
-        .endpoints
-        .iter()
-        .filter_map(|endpoint| endpoint.snapshot.as_deref())
-        .flat_map(|snapshot| snapshot.workspaces.iter())
-        .map(|workspace| display_width(&workspace.workspace_id))
-        .max()
-        .unwrap_or(0);
     let body = Rect::new(
         workspace_area.x,
         workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
@@ -491,9 +483,11 @@ pub(super) fn render_expanded(
                     status,
                     config.status_indicators,
                     entry,
-                    &workspace.workspace_id,
-                    (tokens, config.spaces.worktree_layout),
-                    workspace_tag_width,
+6:                     (tokens, config.spaces.worktree_layout),
+7:             (rows, config.spaces.worktree_layout),
+8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
+9:                 tag_width,
+                &workspace.workspace_id,
                     group_toggle.is_some(),
                     endpoint_active && workspace.focused,
                     selected,

@@ -226,12 +226,6 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
-    let workspace_tag_width = snapshot
-        .workspaces
-        .iter()
-        .map(|workspace| display_width(&workspace.workspace_id))
-        .max()
-        .unwrap_or(0);
     let entries = workspace_entries(snapshot, state.collapsed_groups);
     let body = Rect::new(
         workspace_area.x,
@@ -342,9 +336,11 @@ pub(crate) fn render_sidebar(
             status,
             config.status_indicators,
             entry,
-            &workspace.workspace_id,
-            (rows, config.spaces.worktree_layout),
-            workspace_tag_width,
+6:                     (tokens, config.spaces.worktree_layout),
+7:             (rows, config.spaces.worktree_layout),
+8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
+9:                 tag_width,
+                &workspace.workspace_id,
             group_toggle.is_some(),
             workspace.focused,
             selected,
@@ -695,9 +691,11 @@ pub(in crate::client::shell) fn render_workspace_rows(
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
-    workspace_id: &str,
-    rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
-    workspace_tag_width: u16,
+6:                     (tokens, config.spaces.worktree_layout),
+7:             (rows, config.spaces.worktree_layout),
+8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
+9:                 tag_width,
+                &workspace.workspace_id,
     has_group_toggle: bool,
     focused: bool,
     selected: bool,
@@ -759,13 +757,13 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             palette.overlay0
         });
+        let tag_width = display_width(&workspace.workspace_id);
         let tag_right = area.right().saturating_sub(u16::from(has_group_toggle));
         let available_width = tag_right.saturating_sub(x);
-        let show_workspace_tag = row_index == 0
-            && workspace_tag_width > 0
-            && available_width > workspace_tag_width.saturating_add(1);
+        let show_workspace_tag =
+            row_index == 0 && available_width > tag_width.saturating_add(1);
         let content_right = if show_workspace_tag {
-            tag_right.saturating_sub(workspace_tag_width.saturating_add(1))
+            tag_right.saturating_sub(tag_width.saturating_add(1))
         } else {
             tag_right
         };
@@ -787,15 +785,21 @@ pub(in crate::client::shell) fn render_workspace_rows(
                 crate::ui::separator
             },
         );
+        let span_width = spans.iter().fold(0u16, |width, span| {
+            width.saturating_add(display_width(span.content.as_ref()))
+        });
         Paragraph::new(Line::from(spans))
             .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
         if show_workspace_tag {
             put_text(
                 buffer,
-                tag_right.saturating_sub(workspace_tag_width),
+                x.saturating_add(span_width).saturating_add(1),
                 y,
-                workspace_tag_width,
-                workspace_id,
+6:                     (tokens, config.spaces.worktree_layout),
+7:             (rows, config.spaces.worktree_layout),
+8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
+9:                 tag_width,
+                &workspace.workspace_id,
                 Style::default().fg(palette.overlay0),
             );
         }
