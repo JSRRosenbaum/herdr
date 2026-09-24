@@ -327,6 +327,14 @@ pub(crate) fn render_sidebar(
         } else if workspace.focused {
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
+        let group_toggle = render_parent_group_toggle(
+            buffer,
+            rect,
+            snapshot,
+            entry.index,
+            state.collapsed_groups,
+            palette,
+        );
         render_workspace_rows(
             buffer,
             rect,
@@ -336,18 +344,11 @@ pub(crate) fn render_sidebar(
             entry,
             rows,
             workspace_tag_width,
+            group_toggle.is_some(),
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
             dragged,
-            palette,
-        );
-        let group_toggle = render_parent_group_toggle(
-            buffer,
-            rect,
-            snapshot,
-            entry.index,
-            state.collapsed_groups,
             palette,
         );
         hits.workspaces.push(WorkspaceHit {
@@ -669,6 +670,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
     workspace_tag_width: u16,
+    has_group_toggle: bool,
     focused: bool,
     selected: bool,
     navigating: bool,
@@ -723,7 +725,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             palette.overlay0
         });
-        let tag_right = area.right().saturating_sub(2);
+        let tag_right = area.right().saturating_sub(u16::from(has_group_toggle));
         let available_width = tag_right.saturating_sub(x);
         let show_workspace_tag = row_index == 0
             && workspace_tag_width > 0

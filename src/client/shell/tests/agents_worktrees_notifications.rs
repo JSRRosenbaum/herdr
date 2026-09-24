@@ -135,6 +135,14 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert!(text.contains("feature"));
     assert!(text.contains("ws_1"));
     assert!(text.contains("ws_2"));
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent.group_toggle.as_ref().expect("parent group toggle");
+    let tag_start = toggle.x.saturating_sub("ws_1".len() as u16);
+    let tag_end = usize::from(parent.rect.y) * usize::from(frame.width)
+        + usize::from(toggle.x.saturating_sub(1));
+    let tag_start = usize::from(parent.rect.y) * usize::from(frame.width) + usize::from(tag_start);
+    assert_eq!(frame.cells[tag_start].symbol, "w");
+    assert_eq!(frame.cells[tag_end].symbol, "1");
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;

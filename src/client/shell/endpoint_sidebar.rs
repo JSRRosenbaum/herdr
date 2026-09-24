@@ -460,6 +460,14 @@ pub(super) fn render_expanded(
                 let selected = state.selected_workspace_id.is_some_and(|target| {
                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
                 });
+                let group_toggle = super::sidebar::render_parent_group_toggle(
+                    buffer,
+                    rect,
+                    snapshot,
+                    entry.index,
+                    collapsed_groups,
+                    palette,
+                );
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
@@ -469,6 +477,7 @@ pub(super) fn render_expanded(
                     entry,
                     tokens,
                     workspace_tag_width,
+                    group_toggle.is_some(),
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),
@@ -483,14 +492,7 @@ pub(super) fn render_expanded(
                             .add_modifier(Modifier::DIM),
                     );
                 }
-                let group_toggle = super::sidebar::render_parent_group_toggle(
-                    buffer,
-                    rect,
-                    snapshot,
-                    entry.index,
-                    collapsed_groups,
-                    palette,
-                );
+
                 hits.workspaces.push(WorkspaceHit {
                     rect,
                     endpoint_id: endpoint.endpoint_id.clone(),
