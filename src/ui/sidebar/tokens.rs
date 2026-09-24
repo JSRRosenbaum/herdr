@@ -182,6 +182,10 @@ pub(crate) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
         || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
     {
         " "
+    } else if matches!(previous.kind, ResolvedTokenKind::Workspace(_))
+        && matches!(current.kind, ResolvedTokenKind::Branch(_))
+    {
+        " - "
     } else {
         " · "
     }
@@ -533,6 +537,17 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(
                 "repo".into()
             ))]]
+        );
+    }
+
+    #[test]
+    fn workspace_branch_separator_is_hyphenated() {
+        assert_eq!(
+            separator(
+                &ResolvedToken::unstyled(ResolvedTokenKind::Workspace("Athena".into())),
+                &ResolvedToken::unstyled(ResolvedTokenKind::Branch("main".into())),
+            ),
+            " - "
         );
     }
 
