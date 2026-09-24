@@ -466,10 +466,12 @@ pub struct SpacesSidebarConfig {
 impl Default for SpacesSidebarConfig {
     fn default() -> Self {
         Self {
-            rows: vec![
-                vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
-            ],
+            rows: vec![vec![
+                SpaceSidebarToken::StateIcon,
+                SpaceSidebarToken::Workspace,
+                SpaceSidebarToken::Branch,
+                SpaceSidebarToken::GitStatus,
+            ]],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }
     }
@@ -505,10 +507,12 @@ mod tests {
         assert_eq!(config.agents.row_gap, 0);
         assert_eq!(
             config.spaces.rows,
-            vec![
-                vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
-            ]
+            vec![vec![
+                SpaceSidebarToken::StateIcon,
+                SpaceSidebarToken::Workspace,
+                SpaceSidebarToken::Branch,
+                SpaceSidebarToken::GitStatus,
+            ]]
         );
         assert_eq!(config.spaces.row_gap, 0);
     }
