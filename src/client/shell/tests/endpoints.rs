@@ -546,6 +546,9 @@ fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
 #[test]
 fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
     let (mut state, _) = state_with_remote();
+    // Leave room for both the workspace label and the right-aligned ID column.
+    state.sidebar_width = 36;
+    state.sidebar_width_manual = true;
     let frame = state.compose(100, 28).expect("combined endpoint frame");
     let text = frame
         .cells
@@ -560,6 +563,7 @@ fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
     assert!(text.contains("Local"));
     assert!(text.contains("Build"));
     assert!(text.contains("remote-workspace"));
+    assert!(text.contains("ws_1"));
     let local = state
         .hits
         .machines
