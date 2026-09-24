@@ -133,6 +133,8 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert!(text.contains("main"));
     assert!(text.contains("└─"));
     assert!(text.contains("feature"));
+    assert!(text.contains("ws_1"));
+    assert!(text.contains("ws_2"));
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;
