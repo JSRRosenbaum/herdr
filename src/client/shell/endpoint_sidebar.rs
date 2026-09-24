@@ -278,6 +278,14 @@ pub(super) fn render_expanded(
             );
         }
     }
+    let workspace_tag_width = state
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.snapshot.as_deref())
+        .flat_map(|snapshot| snapshot.workspaces.iter())
+        .map(|workspace| display_width(&workspace.workspace_id))
+        .max()
+        .unwrap_or(0);
     let body = Rect::new(
         workspace_area.x,
         workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
@@ -455,7 +463,7 @@ pub(super) fn render_expanded(
                 let group_toggle = super::sidebar::render_parent_group_toggle(
                     buffer,
                     rect,
-                    &workspace.workspace_id,
+                    workspace_tag_width,
                     snapshot,
                     entry.index,
                     collapsed_groups,
@@ -469,6 +477,8 @@ pub(super) fn render_expanded(
                     config.status_indicators,
                     entry,
                     tokens,
+                    workspace_tag_width,
+                    group_toggle.is_some(),
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),

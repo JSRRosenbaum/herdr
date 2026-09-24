@@ -100,7 +100,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
         is_linked_worktree: false,
     });
     snapshot.workspaces.push(ClientShellWorkspace {
-        workspace_id: "ws_2".into(),
+        workspace_id: "ws_22".into(),
         active_tab_id: "tab_ws2".into(),
         new_workspace_cwd: "/repo/feature".into(),
         number: 2,
@@ -134,7 +134,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert!(text.contains("└─"));
     assert!(text.contains("feature"));
     assert!(text.contains("ws_1"));
-    assert!(text.contains("ws_2"));
+    assert!(text.contains("ws_22"));
     let parent = &state.hits.workspaces[0];
     let (toggle, _) = parent.group_toggle.as_ref().expect("parent group toggle");
     let row_start = usize::from(parent.rect.y) * usize::from(frame.width);
@@ -148,11 +148,17 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
         })
         .expect("workspace tag");
     assert_eq!(tag_start + "ws_1".len(), usize::from(parent.rect.right()));
-    assert_eq!(tag_start, usize::from(toggle.x.saturating_add(1)));
+    assert_eq!(
+        toggle.x,
+        parent
+            .rect
+            .right()
+            .saturating_sub("ws_22".len() as u16 + 1)
+    );
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;
-    replacement.focused_workspace_id = Some("ws_2".into());
+    replacement.focused_workspace_id = Some("ws_22".into());
     replacement.workspaces[0].focused = false;
     replacement.workspaces[1].focused = true;
     replacement.workspaces[1].agent_status = AgentStatus::Blocked;
