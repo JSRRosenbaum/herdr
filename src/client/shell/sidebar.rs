@@ -226,6 +226,12 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
+    let workspace_tag_width = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| display_width(&workspace.workspace_id))
+        .max()
+        .unwrap_or(0);
     let entries = workspace_entries(snapshot, state.collapsed_groups);
     let body = Rect::new(
         workspace_area.x,
@@ -328,6 +334,7 @@ pub(crate) fn render_sidebar(
             config.status_indicators,
             entry,
             rows,
+            workspace_tag_width,
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
@@ -659,6 +666,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
+    workspace_tag_width: u16,
     focused: bool,
     selected: bool,
     navigating: bool,
@@ -713,6 +721,16 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             palette.overlay0
         });
+        let tag_right = area.right().saturating_sub(2);
+        let available_width = tag_right.saturating_sub(x);
+        let show_workspace_tag = row_index == 0
+            && workspace_tag_width > 0
+            && available_width > workspace_tag_width.saturating_add(1);
+        let content_right = if show_workspace_tag {
+            tag_right.saturating_sub(workspace_tag_width.saturating_add(1))
+        } else {
+            tag_right
+        };
         let spans = crate::ui::resolved_token_spans(
             row,
             (
@@ -724,12 +742,20 @@ pub(in crate::client::shell) fn render_workspace_rows(
             secondary_style,
             Style::default().fg(palette.overlay1),
             palette,
-            area.right().saturating_sub(2).saturating_sub(x) as usize,
+            content_right.saturating_sub(x) as usize,
         );
-        Paragraph::new(Line::from(spans)).render(
-            Rect::new(x, y, area.right().saturating_sub(2).saturating_sub(x), 1),
-            buffer,
-        );
+        Paragraph::new(Line::from(spans))
+            .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
+        if show_workspace_tag {
+            put_text(
+                buffer,
+                tag_right.saturating_sub(workspace_tag_width),
+                y,
+                workspace_tag_width,
+                &workspace.workspace_id,
+                Style::default().fg(palette.overlay0),
+            );
+        }
     }
 
     let background = if selected {
