@@ -162,6 +162,8 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     let child_status = usize::from(child.rect.y) * usize::from(frame.width)
         + usize::from(child.rect.x.saturating_add(4));
     assert_eq!(frame.cells[child_status].symbol, "○");
+    assert!(text.contains("ws_1"));
+    assert!(text.contains("ws_2"));
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;
