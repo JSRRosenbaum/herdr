@@ -324,6 +324,7 @@ pub(crate) fn render_sidebar(
         let group_toggle = render_parent_group_toggle(
             buffer,
             rect,
+            &workspace.workspace_id,
             snapshot,
             entry.index,
             state.collapsed_groups,
@@ -336,11 +337,7 @@ pub(crate) fn render_sidebar(
             status,
             config.status_indicators,
             entry,
-6:                     (tokens, config.spaces.worktree_layout),
-7:             (rows, config.spaces.worktree_layout),
-8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
-9:                 tag_width,
-                &workspace.workspace_id,
+            (rows, config.spaces.worktree_layout),
             group_toggle.is_some(),
             workspace.focused,
             selected,
@@ -573,6 +570,7 @@ fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<Stri
 pub(in crate::client::shell) fn render_parent_group_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
+    workspace_id: &str,
     snapshot: &ClientShellSnapshot,
     workspace_index: usize,
     collapsed_groups: &HashSet<String>,
@@ -580,7 +578,9 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
 ) -> Option<(Rect, String)> {
     let key = parent_group_key(snapshot, workspace_index)?;
     let toggle = Rect::new(
-        workspace_rect.right().saturating_sub(1),
+        workspace_rect
+            .right()
+            .saturating_sub(display_width(workspace_id).saturating_add(1)),
         workspace_rect.y,
         1,
         1,
@@ -691,11 +691,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
-6:                     (tokens, config.spaces.worktree_layout),
-7:             (rows, config.spaces.worktree_layout),
-8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
-9:                 tag_width,
-                &workspace.workspace_id,
+    rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
     has_group_toggle: bool,
     focused: bool,
     selected: bool,
@@ -758,7 +754,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
             palette.overlay0
         });
         let tag_width = display_width(&workspace.workspace_id);
-        let tag_right = area.right().saturating_sub(u16::from(has_group_toggle));
+        let tag_right = area.right();
         let available_width = tag_right.saturating_sub(x);
         let show_workspace_tag =
             row_index == 0 && available_width > tag_width.saturating_add(1);
@@ -785,20 +781,15 @@ pub(in crate::client::shell) fn render_workspace_rows(
                 crate::ui::separator
             },
         );
-        let span_width = spans.iter().fold(0u16, |width, span| {
-            width.saturating_add(display_width(span.content.as_ref()))
-        });
+
         Paragraph::new(Line::from(spans))
             .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
         if show_workspace_tag {
             put_text(
                 buffer,
-                x.saturating_add(span_width).saturating_add(1),
+                tag_right.saturating_sub(tag_width),
                 y,
-6:                     (tokens, config.spaces.worktree_layout),
-7:             (rows, config.spaces.worktree_layout),
-8:     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
-9:                 tag_width,
+                tag_width,
                 &workspace.workspace_id,
                 Style::default().fg(palette.overlay0),
             );
