@@ -147,7 +147,8 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
                 .eq(["w", "s", "_", "1"])
         })
         .expect("workspace tag");
-    assert!(tag_start + "ws_1".len() < usize::from(toggle.x));
+    assert_eq!(tag_start + "ws_1".len(), usize::from(parent.rect.right()));
+    assert_eq!(tag_start, usize::from(toggle.x.saturating_add(1)));
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;

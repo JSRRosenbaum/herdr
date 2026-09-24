@@ -324,6 +324,7 @@ pub(crate) fn render_sidebar(
         let group_toggle = render_parent_group_toggle(
             buffer,
             rect,
+            &workspace.workspace_id,
             snapshot,
             entry.index,
             state.collapsed_groups,
@@ -337,7 +338,6 @@ pub(crate) fn render_sidebar(
             config.status_indicators,
             entry,
             rows,
-            group_toggle.is_some(),
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
@@ -569,6 +569,7 @@ fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<Stri
 pub(in crate::client::shell) fn render_parent_group_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
+    workspace_id: &str,
     snapshot: &ClientShellSnapshot,
     workspace_index: usize,
     collapsed_groups: &HashSet<String>,
@@ -576,7 +577,9 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
 ) -> Option<(Rect, String)> {
     let key = parent_group_key(snapshot, workspace_index)?;
     let toggle = Rect::new(
-        workspace_rect.right().saturating_sub(1),
+        workspace_rect
+            .right()
+            .saturating_sub(display_width(workspace_id).saturating_add(1)),
         workspace_rect.y,
         1,
         1,
@@ -662,7 +665,6 @@ pub(in crate::client::shell) fn render_workspace_rows(
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
-    has_group_toggle: bool,
     focused: bool,
     selected: bool,
     navigating: bool,
@@ -718,7 +720,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
             palette.overlay0
         });
         let tag_width = display_width(&workspace.workspace_id);
-        let tag_right = area.right().saturating_sub(u16::from(has_group_toggle));
+        let tag_right = area.right();
         let available_width = tag_right.saturating_sub(x);
         let show_workspace_tag =
             row_index == 0 && available_width > tag_width.saturating_add(1);
@@ -740,15 +742,13 @@ pub(in crate::client::shell) fn render_workspace_rows(
             palette,
             content_right.saturating_sub(x) as usize,
         );
-        let span_width = spans.iter().fold(0u16, |width, span| {
-            width.saturating_add(display_width(span.content.as_ref()))
-        });
+
         Paragraph::new(Line::from(spans))
             .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
         if show_workspace_tag {
             put_text(
                 buffer,
-                x.saturating_add(span_width).saturating_add(1),
+                tag_right.saturating_sub(tag_width),
                 y,
                 tag_width,
                 &workspace.workspace_id,
