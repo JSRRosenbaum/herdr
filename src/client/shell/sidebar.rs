@@ -226,6 +226,12 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
+    let workspace_tag_width = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| display_width(&workspace.workspace_id))
+        .max()
+        .unwrap_or(0);
     let entries = workspace_entries(snapshot, state.collapsed_groups);
     let body = Rect::new(
         workspace_area.x,
@@ -324,7 +330,7 @@ pub(crate) fn render_sidebar(
         let group_toggle = render_parent_group_toggle(
             buffer,
             rect,
-            &workspace.workspace_id,
+            workspace_tag_width,
             snapshot,
             entry.index,
             state.collapsed_groups,
@@ -338,6 +344,8 @@ pub(crate) fn render_sidebar(
             config.status_indicators,
             entry,
             rows,
+            workspace_tag_width,
+            group_toggle.is_some(),
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
@@ -569,7 +577,7 @@ fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<Stri
 pub(in crate::client::shell) fn render_parent_group_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
-    workspace_id: &str,
+    workspace_tag_width: u16,
     snapshot: &ClientShellSnapshot,
     workspace_index: usize,
     collapsed_groups: &HashSet<String>,
@@ -579,7 +587,7 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
     let toggle = Rect::new(
         workspace_rect
             .right()
-            .saturating_sub(display_width(workspace_id).saturating_add(1)),
+            .saturating_sub(workspace_tag_width.saturating_add(1)),
         workspace_rect.y,
         1,
         1,
@@ -665,6 +673,8 @@ pub(in crate::client::shell) fn render_workspace_rows(
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
+    workspace_tag_width: u16,
+    has_group_toggle: bool,
     focused: bool,
     selected: bool,
     navigating: bool,
@@ -724,8 +734,13 @@ pub(in crate::client::shell) fn render_workspace_rows(
         let available_width = tag_right.saturating_sub(x);
         let show_workspace_tag =
             row_index == 0 && available_width > tag_width.saturating_add(1);
+        let reserved_tag_width = if has_group_toggle {
+            workspace_tag_width
+        } else {
+            tag_width
+        };
         let content_right = if show_workspace_tag {
-            tag_right.saturating_sub(tag_width.saturating_add(1))
+            tag_right.saturating_sub(reserved_tag_width.saturating_add(1))
         } else {
             tag_right
         };
