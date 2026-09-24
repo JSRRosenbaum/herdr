@@ -330,6 +330,7 @@ pub(crate) fn render_sidebar(
         render_workspace_rows(
             buffer,
             rect,
+            workspace,
             status,
             config.status_indicators,
             entry,
@@ -662,6 +663,7 @@ pub(in crate::client::shell) fn workspace_rows(
 pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
+    workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
