@@ -674,14 +674,14 @@ pub(in crate::client::shell) fn render_workspace_rows(
         if entry.indented {
             let prefix = if row_index == 0 {
                 if entry.last_child {
-                    "   └─ "
+                    "└─ "
                 } else {
-                    "   ├─ "
+                    "├─ "
                 }
             } else if entry.last_child {
-                "        "
+                "   "
             } else {
-                "   │    "
+                "│  "
             };
             x = put_segment(
                 buffer,
