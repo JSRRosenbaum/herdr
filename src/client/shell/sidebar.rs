@@ -327,7 +327,7 @@ pub(crate) fn render_sidebar(
             status,
             config.status_indicators,
             entry,
-            rows,
+            (rows, config.spaces.worktree_layout),
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
@@ -639,17 +639,43 @@ pub(in crate::client::shell) fn workspace_rows(
         &workspace.label
     };
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
-    crate::ui::sidebar_space_rows(
-        config,
-        crate::ui::SpaceTokenContext {
-            workspace: label,
-            branch: workspace.branch.as_deref(),
-            state_text: status_text(status),
-            ahead_behind: workspace.git_ahead_behind,
-            tokens: &token_values,
-            suppress_git_details: indented,
-        },
-    )
+    let rows = if config.worktree_layout.is_compact() && !config.rows_explicit {
+        let row = [
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+            crate::config::SpaceSidebarToken::Branch,
+            crate::config::SpaceSidebarToken::GitStatus,
+        ]
+        .to_vec();
+        let compact = SpacesSidebarConfig {
+            rows: vec![row],
+            ..config.clone()
+        };
+        crate::ui::sidebar_space_rows(
+            &compact,
+            crate::ui::SpaceTokenContext {
+                workspace: label,
+                branch: workspace.branch.as_deref(),
+                state_text: status_text(status),
+                ahead_behind: workspace.git_ahead_behind,
+                tokens: &token_values,
+                suppress_git_details: indented,
+            },
+        )
+    } else {
+        crate::ui::sidebar_space_rows(
+            config,
+            crate::ui::SpaceTokenContext {
+                workspace: label,
+                branch: workspace.branch.as_deref(),
+                state_text: status_text(status),
+                ahead_behind: workspace.git_ahead_behind,
+                tokens: &token_values,
+                suppress_git_details: indented,
+            },
+        )
+    };
+    rows
 }
 
 pub(in crate::client::shell) fn render_workspace_rows(
@@ -658,13 +684,14 @@ pub(in crate::client::shell) fn render_workspace_rows(
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
-    rows: Vec<Vec<crate::ui::ResolvedToken>>,
+    rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
     focused: bool,
     selected: bool,
     navigating: bool,
     dragged: bool,
     palette: &Palette,
 ) {
+    let (rows, worktree_layout) = rows;
     for (row_index, row) in rows.iter().enumerate() {
         let y = area.y + row_index as u16;
         if y >= area.bottom() {
@@ -672,16 +699,21 @@ pub(in crate::client::shell) fn render_workspace_rows(
         }
         let mut x = area.x;
         if entry.indented {
+            let compact = worktree_layout.is_compact();
             let prefix = if row_index == 0 {
                 if entry.last_child {
-                    "└─ "
-                } else {
+                    if compact { "└─ " } else { "   └─ " }
+                } else if compact {
                     "├─ "
+                } else {
+                    "   ├─ "
                 }
             } else if entry.last_child {
-                "   "
-            } else {
+                if compact { "   " } else { "        " }
+            } else if compact {
                 "│  "
+            } else {
+                "   │    "
             };
             x = put_segment(
                 buffer,
@@ -725,6 +757,11 @@ pub(in crate::client::shell) fn render_workspace_rows(
             Style::default().fg(palette.overlay1),
             palette,
             area.right().saturating_sub(2).saturating_sub(x) as usize,
+            if worktree_layout.is_compact() {
+                crate::ui::compact_separator
+            } else {
+                crate::ui::separator
+            },
         );
         Paragraph::new(Line::from(spans)).render(
             Rect::new(x, y, area.right().saturating_sub(2).saturating_sub(x), 1),

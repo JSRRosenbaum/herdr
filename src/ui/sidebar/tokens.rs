@@ -182,6 +182,19 @@ pub(crate) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
         || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
     {
         " "
+    } else {
+        " · "
+    }
+}
+
+pub(crate) fn compact_separator(
+    previous: &ResolvedToken,
+    current: &ResolvedToken,
+) -> &'static str {
+    if matches!(previous.kind, ResolvedTokenKind::StateIcon)
+        || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
+    {
+        " "
     } else if matches!(previous.kind, ResolvedTokenKind::Workspace(_))
         && matches!(current.kind, ResolvedTokenKind::Branch(_))
     {
@@ -287,6 +300,7 @@ rows = [[{ token = "workspace", rules = [{ equals = "long-workspace-name", fg = 
                 theme,
                 &super::super::Palette::catppuccin(),
                 width,
+                separator,
             );
             assert_eq!(spans.len(), 1);
             assert!(super::super::display_width(&spans[0].content) <= width);
@@ -543,11 +557,18 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
     #[test]
     fn workspace_branch_separator_is_hyphenated() {
         assert_eq!(
-            separator(
+            compact_separator(
                 &ResolvedToken::unstyled(ResolvedTokenKind::Workspace("Athena".into())),
                 &ResolvedToken::unstyled(ResolvedTokenKind::Branch("main".into())),
             ),
             " - "
+        );
+        assert_eq!(
+            separator(
+                &ResolvedToken::unstyled(ResolvedTokenKind::Workspace("Athena".into())),
+                &ResolvedToken::unstyled(ResolvedTokenKind::Branch("main".into())),
+            ),
+            " · "
         );
     }
 

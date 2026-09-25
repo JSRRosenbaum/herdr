@@ -1,6 +1,31 @@
 use super::*;
+use crate::config::WorktreeLayout;
 
 #[test]
+fn capture_compact_layout_modes() {
+    let snapshot = compact_grouped_snapshot();
+    let mut out = String::new();
+    for mode in [(WorktreeLayout::Tree, "tree"), (WorktreeLayout::Compact, "compact")] {
+        let (layout, name) = mode;
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.spaces.worktree_layout = layout;
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot.clone()));
+        state.set_pane_surface(surface());
+        let frame = state.compose(106, 20).expect("frame");
+        out.push_str(&format!("\n=== worktree_layout = {name} ===\n"));
+        for row in frame.cells.chunks(frame.width as usize) {
+            let line: String = row
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            out.push_str(&line.replace(' ', "·"));
+            out.push('\n');
+        }
+    }
+    std::fs::write("/tmp/sidebar-captures/compact.txt", &out).expect("write capture");
+}
+
 fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
     let config = ClientShellConfig::from_config(&Config::default());
     let mut state = ClientShellState::new(config);
@@ -135,7 +160,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert!(text.contains("feature"));
     let child = &state.hits.workspaces[1];
     let child_status = usize::from(child.rect.y) * usize::from(frame.width)
-        + usize::from(child.rect.x.saturating_add(3));
+        + usize::from(child.rect.x.saturating_add(4));
     assert_eq!(frame.cells[child_status].symbol, "○");
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
@@ -172,6 +197,87 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
                     if target.workspace_id == "ws_1"
             )
     ));
+}
+
+fn compact_grouped_snapshot() -> ClientShellSnapshot {
+    let mut snapshot = snapshot();
+    snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    snapshot.workspaces.push(ClientShellWorkspace {
+        workspace_id: "ws_22".into(),
+        active_tab_id: "tab_ws2".into(),
+        new_workspace_cwd: "/repo/feature".into(),
+        number: 2,
+        label: "repo-feature".into(),
+        custom_label: false,
+        branch: Some("worktree/feature".into()),
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: true,
+        }),
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    });
+    snapshot
+}
+
+#[test]
+fn compact_layout_renders_shallow_connectors_and_inline_branch() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(compact_grouped_snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 20).expect("composed frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("└─ "));
+    assert!(!text.contains("   ├─ "));
+    assert!(!text.contains("   └─ "));
+    assert!(text.contains("main"));
+    assert!(text.contains("feature"));
+    assert!(text.contains(" - "));
+    let child = &state.hits.workspaces[1];
+    let child_status = usize::from(child.rect.y) * usize::from(frame.width)
+        + usize::from(child.rect.x.saturating_add(4));
+    assert_eq!(frame.cells[child_status].symbol, "○");
+}
+
+#[test]
+fn explicit_rows_keep_upstream_connectors_in_compact_layout() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    config.spaces.rows_explicit = true;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(compact_grouped_snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 20).expect("composed frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("   └─ ") || text.contains("   ├─ "));
+    assert!(!text.contains(" - "));
 }
 
 #[test]

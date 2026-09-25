@@ -455,24 +455,116 @@ impl Default for AgentsSidebarConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default)]
-pub struct SpacesSidebarConfig {
-    #[serde(deserialize_with = "deserialize_sidebar_rows")]
-    pub rows: SpaceSidebarRows,
-    pub row_gap: u16,
+/// Worktree presentation in the expanded sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeLayout {
+    /// Upstream two-row layout with deep `   ├─`/`   └─` connectors. Default.
+    #[default]
+    Tree,
+    /// Shallow `├─`/`└─` connectors, a `workspace - branch` separator, and a
+    /// single-row default layout.
+    Compact,
 }
 
+fn deserialize_worktree_layout<'de, D>(deserializer: D) -> Result<WorktreeLayout, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "tree" => Ok(WorktreeLayout::Tree),
+        "compact" => Ok(WorktreeLayout::Compact),
+        other => Err(serde::de::Error::custom(format!(
+            "worktree_layout must be \"tree\" or \"compact\", found {other:?}"
+        ))),
+    }
+}
+
+impl<'de> Deserialize<'de> for WorktreeLayout {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_worktree_layout(deserializer)
+    }
+}
+
+impl WorktreeLayout {
+    pub const fn is_compact(self) -> bool {
+        matches!(self, Self::Compact)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(default)]
+pub struct SpacesSidebarConfig {
+    /// Rows shown per Space, in display order.
+    pub rows: SpaceSidebarRows,
+    pub row_gap: u16,
+    /// Worktree presentation in the expanded sidebar. Default: "tree".
+    pub worktree_layout: WorktreeLayout,
+    /// Whether the user set `rows` explicitly, so an explicit layout always
+    /// wins over the compact single-row default.
+    #[serde(skip)]
+    pub rows_explicit: bool,
+}
+
+#[derive(Deserialize)]
+struct SpacesSidebarConfigInput {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_sidebar_rows"
+    )]
+    rows: Option<SpaceSidebarRows>,
+    #[serde(default)]
+    row_gap: u16,
+    #[serde(default, deserialize_with = "deserialize_worktree_layout")]
+    worktree_layout: WorktreeLayout,
+}
+
+fn deserialize_optional_sidebar_rows<'de, D>(
+    deserializer: D,
+) -> Result<Option<SpaceSidebarRows>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Option::<Vec<Vec<SpaceSidebarToken>>>::deserialize(deserializer)?;
+    match rows {
+        Some(rows) => {
+            validate_sidebar_rows(&rows).map_err(serde::de::Error::custom)?;
+            Ok(Some(rows))
+        }
+        None => Ok(None),
+    }
+}
+
+impl<'de> Deserialize<'de> for SpacesSidebarConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = SpacesSidebarConfigInput::deserialize(deserializer)?;
+        let rows_explicit = input.rows.is_some();
+        let rows = input.rows.unwrap_or_default();
+        Ok(Self {
+            rows_explicit,
+            rows,
+            row_gap: input.row_gap,
+            worktree_layout: input.worktree_layout,
+        })
+    }
+}
 impl Default for SpacesSidebarConfig {
     fn default() -> Self {
         Self {
-            rows: vec![vec![
-                SpaceSidebarToken::StateIcon,
-                SpaceSidebarToken::Workspace,
-                SpaceSidebarToken::Branch,
-                SpaceSidebarToken::GitStatus,
-            ]],
+            rows: vec![
+                vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
+                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+            ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
+            worktree_layout: WorktreeLayout::Tree,
+            rows_explicit: false,
         }
     }
 }
@@ -507,14 +599,45 @@ mod tests {
         assert_eq!(config.agents.row_gap, 0);
         assert_eq!(
             config.spaces.rows,
-            vec![vec![
-                SpaceSidebarToken::StateIcon,
-                SpaceSidebarToken::Workspace,
-                SpaceSidebarToken::Branch,
-                SpaceSidebarToken::GitStatus,
-            ]]
+            vec![
+                vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
+                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+            ]
         );
         assert_eq!(config.spaces.row_gap, 0);
+        assert_eq!(config.spaces.worktree_layout, WorktreeLayout::Tree);
+        assert!(!config.spaces.rows_explicit);
+    }
+
+    #[test]
+    fn parses_worktree_layout_and_rejects_unknown_values() {
+        let compact: crate::config::Config =
+            toml::from_str("[ui.sidebar.spaces]\nworktree_layout = \"compact\"\n").expect("compact");
+        assert_eq!(
+            compact.ui.sidebar.spaces.worktree_layout,
+            WorktreeLayout::Compact
+        );
+        let tree: crate::config::Config =
+            toml::from_str("[ui.sidebar.spaces]\nworktree_layout = \"tree\"\n").expect("tree");
+        assert_eq!(tree.ui.sidebar.spaces.worktree_layout, WorktreeLayout::Tree);
+        let error = toml::from_str::<crate::config::Config>(
+            "[ui.sidebar.spaces]\nworktree_layout = \"grid\"\n",
+        )
+        .expect_err("unknown worktree_layout");
+        assert!(error.to_string().contains("worktree_layout"));
+    }
+
+    #[test]
+    fn explicit_rows_track_provenance() {
+        let parsed: crate::config::Config =
+            toml::from_str("[ui.sidebar.spaces]\nrows = [[\"workspace\"]]\n").expect("rows");
+        assert!(parsed.ui.sidebar.spaces.rows_explicit);
+        assert_eq!(
+            parsed.ui.sidebar.spaces.rows,
+            vec![vec![SpaceSidebarToken::Workspace]]
+        );
+        let default = SidebarConfig::default();
+        assert!(!default.spaces.rows_explicit);
     }
 
     #[test]
