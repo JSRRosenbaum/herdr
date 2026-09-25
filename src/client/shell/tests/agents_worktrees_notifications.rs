@@ -152,10 +152,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert_eq!(tag_start + "ws_1".len(), usize::from(parent.rect.right()));
     assert_eq!(
         toggle.x,
-        parent
-            .rect
-            .right()
-            .saturating_sub("ws_22".len() as u16 + 1)
+        parent.rect.right().saturating_sub("ws_22".len() as u16 + 1)
     );
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
