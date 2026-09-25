@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn capture_workspace_tag_modes() {
+    let mut snapshot = snapshot();
+    snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    snapshot.workspaces.push(ClientShellWorkspace {
+        workspace_id: "ws_22".into(),
+        active_tab_id: "tab_ws2".into(),
+        new_workspace_cwd: "/repo/feature".into(),
+        number: 2,
+        label: "repo-feature".into(),
+        custom_label: false,
+        branch: Some("worktree/feature".into()),
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: true,
+        }),
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    });
+    let mut out = String::new();
+    for show in [false, true] {
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.spaces.show_workspace_ids = show;
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot.clone()));
+        state.set_pane_surface(surface());
+        let frame = state.compose(106, 20).expect("frame");
+        out.push_str(&format!("\n=== show_workspace_ids = {show} ===\n"));
+        for row in frame.cells.chunks(frame.width as usize) {
+            let line: String = row
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            out.push_str(&line.replace(' ', "·"));
+            out.push('\n');
+        }
+    }
+    std::fs::write("/tmp/sidebar-captures/labels.txt", &out).expect("write capture");
+}
+
 fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
     let config = ClientShellConfig::from_config(&Config::default());
     let mut state = ClientShellState::new(config);
@@ -91,7 +137,8 @@ fn collapsed_workspace_jitter_remains_a_click() {
 
 #[test]
 fn grouped_worktrees_render_parent_branch_and_indented_child() {
-    let config = ClientShellConfig::from_config(&Config::default());
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.show_workspace_ids = true;
     let mut state = ClientShellState::new(config);
     let mut snapshot = snapshot();
     snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
@@ -190,6 +237,59 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
                     if target.workspace_id == "ws_1"
             )
     ));
+}
+
+#[test]
+fn grouped_worktrees_hide_workspace_id_tags_by_default() {
+    let config = ClientShellConfig::from_config(&Config::default());
+    let mut state = ClientShellState::new(config);
+    let mut snapshot = snapshot();
+    snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    snapshot.workspaces.push(ClientShellWorkspace {
+        workspace_id: "ws_22".into(),
+        active_tab_id: "tab_ws2".into(),
+        new_workspace_cwd: "/repo/feature".into(),
+        number: 2,
+        label: "repo-feature".into(),
+        custom_label: false,
+        branch: Some("worktree/feature".into()),
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: true,
+        }),
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    });
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 20).expect("composed frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("ws_1"));
+    assert!(!text.contains("ws_22"));
+    assert!(text.contains("main"));
+    assert!(text.contains("feature"));
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent
+        .group_toggle
+        .as_ref()
+        .expect("parent group toggle at row end without tag column");
+    assert_eq!(toggle.x, parent.rect.right().saturating_sub(1));
 }
 
 #[test]

@@ -461,6 +461,9 @@ pub struct SpacesSidebarConfig {
     #[serde(deserialize_with = "deserialize_sidebar_rows")]
     pub rows: SpaceSidebarRows,
     pub row_gap: u16,
+    /// Right-align stable workspace ID tags (for example `wAB`) on each Space
+    /// row, after the group toggle. Default: false.
+    pub show_workspace_ids: bool,
 }
 
 impl Default for SpacesSidebarConfig {
@@ -471,6 +474,7 @@ impl Default for SpacesSidebarConfig {
                 vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
+            show_workspace_ids: false,
         }
     }
 }
@@ -511,6 +515,7 @@ mod tests {
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);
+        assert!(!config.spaces.show_workspace_ids);
     }
 
     #[test]
@@ -563,6 +568,13 @@ row_gap = 3
             vec![SpaceSidebarToken::Custom("jj_status".into())]
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
+    }
+
+    #[test]
+    fn parses_show_workspace_ids_toggle() {
+        let config: crate::config::Config =
+            toml::from_str("[ui.sidebar.spaces]\nshow_workspace_ids = true\n").expect("toggle");
+        assert!(config.ui.sidebar.spaces.show_workspace_ids);
     }
 
     #[test]

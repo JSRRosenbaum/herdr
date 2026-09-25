@@ -392,6 +392,17 @@ Space rows accept these built-in tokens:
 
 Tokens render in their configured order. Herdr normally separates adjacent values with ` · ` and uses a single space after `state_icon`. Missing values and their separators disappear; a row disappears when none of its tokens have a value. Existing custom rows remain unchanged, so add `machine` explicitly if you want machine identity in a custom multi-machine layout. Each layout may contain at most 16 rows, with at most 16 tokens in each row.
 
+### Workspace ID tags
+
+Set `show_workspace_ids = true` to right-align the stable workspace ID (for example `wAB`) on each Space row, after the group toggle:
+
+```toml
+[ui.sidebar.spaces]
+show_workspace_ids = true
+```
+
+The default is `show_workspace_ids = false`; with it off the sidebar layout and hit targets match the upstream layout exactly. The tags render in a fixed-width column sized to the longest workspace ID in the current view, so rows stay aligned across workspaces.
+
 A token entry can also be an inline style table:
 
 ```toml

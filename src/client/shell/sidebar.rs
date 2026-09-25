@@ -226,12 +226,16 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
-    let workspace_tag_width = snapshot
-        .workspaces
-        .iter()
-        .map(|workspace| display_width(&workspace.workspace_id))
-        .max()
-        .unwrap_or(0);
+    let workspace_tag_width = if config.spaces.show_workspace_ids {
+        snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| display_width(&workspace.workspace_id))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let entries = workspace_entries(snapshot, state.collapsed_groups);
     let body = Rect::new(
         workspace_area.x,
@@ -732,8 +736,9 @@ pub(in crate::client::shell) fn render_workspace_rows(
         let tag_width = display_width(&workspace.workspace_id);
         let tag_right = area.right();
         let available_width = tag_right.saturating_sub(x);
-        let show_workspace_tag =
-            row_index == 0 && available_width > tag_width.saturating_add(1);
+        let show_workspace_tag = row_index == 0
+            && workspace_tag_width > 0
+            && available_width > tag_width.saturating_add(1);
         let reserved_tag_width = if has_group_toggle {
             workspace_tag_width
         } else {
