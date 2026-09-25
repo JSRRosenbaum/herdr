@@ -474,7 +474,7 @@ pub(super) fn render_expanded(
                     status,
                     config.status_indicators,
                     entry,
-                    tokens,
+                    (tokens, config.spaces.worktree_layout),
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),
