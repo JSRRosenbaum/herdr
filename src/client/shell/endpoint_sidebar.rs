@@ -292,14 +292,18 @@ pub(super) fn render_expanded(
             );
         }
     }
-    let workspace_tag_width = state
-        .endpoints
-        .iter()
-        .filter_map(|endpoint| endpoint.snapshot.as_deref())
-        .flat_map(|snapshot| snapshot.workspaces.iter())
-        .map(|workspace| display_width(&workspace.workspace_id))
-        .max()
-        .unwrap_or(0);
+    let workspace_tag_width = if config.spaces.show_workspace_ids {
+        state
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.snapshot.as_deref())
+            .flat_map(|snapshot| snapshot.workspaces.iter())
+            .map(|workspace| display_width(&workspace.workspace_id))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let body = Rect::new(
         workspace_area.x,
         workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),

@@ -508,6 +508,10 @@ pub struct SpacesSidebarConfig {
     /// wins over the compact single-row default.
     #[serde(skip)]
     pub rows_explicit: bool,
+    /// Right-align stable workspace ID tags (for example `wAB`) on each Space
+    /// row, after the group toggle. Default: false.
+    #[serde(default)]
+    pub show_workspace_ids: bool,
 }
 
 #[derive(Deserialize)]
@@ -521,6 +525,8 @@ struct SpacesSidebarConfigInput {
     row_gap: u16,
     #[serde(default, deserialize_with = "deserialize_worktree_layout")]
     worktree_layout: WorktreeLayout,
+    #[serde(default)]
+    show_workspace_ids: bool,
 }
 
 fn deserialize_optional_sidebar_rows<'de, D>(
@@ -552,6 +558,7 @@ impl<'de> Deserialize<'de> for SpacesSidebarConfig {
             rows,
             row_gap: input.row_gap,
             worktree_layout: input.worktree_layout,
+            show_workspace_ids: input.show_workspace_ids,
         })
     }
 }
@@ -565,6 +572,7 @@ impl Default for SpacesSidebarConfig {
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
             worktree_layout: WorktreeLayout::Tree,
             rows_explicit: false,
+            show_workspace_ids: false,
         }
     }
 }
@@ -607,6 +615,7 @@ mod tests {
         assert_eq!(config.spaces.row_gap, 0);
         assert_eq!(config.spaces.worktree_layout, WorktreeLayout::Tree);
         assert!(!config.spaces.rows_explicit);
+        assert!(!config.spaces.show_workspace_ids);
     }
 
     #[test]
@@ -638,6 +647,13 @@ mod tests {
         );
         let default = SidebarConfig::default();
         assert!(!default.spaces.rows_explicit);
+    }
+
+    #[test]
+    fn parses_show_workspace_ids_toggle() {
+        let config: crate::config::Config =
+            toml::from_str("[ui.sidebar.spaces]\nshow_workspace_ids = true\n").expect("toggle");
+        assert!(config.ui.sidebar.spaces.show_workspace_ids);
     }
 
     #[test]
@@ -691,6 +707,7 @@ row_gap = 3
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
     }
+
 
     #[test]
     fn parses_occurrence_styles_without_changing_plain_tokens() {
