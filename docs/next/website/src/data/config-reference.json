@@ -1089,6 +1089,12 @@
           ]
         },
         {
+          "key": "ui.sidebar.spaces.show_workspace_ids",
+          "type": "boolean",
+          "default": "false",
+          "description": "Right-align the stable workspace ID tag (for example wAB) on each expanded Space row, after the group toggle. Off by default; the sidebar layout and hit targets match the upstream layout exactly when off."
+        },
+        {
           "key": "ui.sidebar.spaces.rows",
           "type": "list of token rows",
           "default": "[[\"state_icon\", \"workspace\"], [\"branch\", \"git_status\"]]",

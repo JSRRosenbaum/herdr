@@ -226,6 +226,16 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
+    let workspace_tag_width = if config.spaces.show_workspace_ids {
+        snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| display_width(&workspace.workspace_id))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let entries = workspace_entries(snapshot, state.collapsed_groups);
     let body = Rect::new(
         workspace_area.x,
@@ -321,25 +331,29 @@ pub(crate) fn render_sidebar(
         } else if workspace.focused {
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
+        let group_toggle = render_parent_group_toggle(
+            buffer,
+            rect,
+            workspace_tag_width,
+            snapshot,
+            entry.index,
+            state.collapsed_groups,
+            palette,
+        );
         render_workspace_rows(
             buffer,
             rect,
+            workspace,
             status,
             config.status_indicators,
             entry,
             (rows, config.spaces.worktree_layout),
+            workspace_tag_width,
+            group_toggle.is_some(),
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
             dragged,
-            palette,
-        );
-        let group_toggle = render_parent_group_toggle(
-            buffer,
-            rect,
-            snapshot,
-            entry.index,
-            state.collapsed_groups,
             palette,
         );
         hits.workspaces.push(WorkspaceHit {
@@ -567,6 +581,7 @@ fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<Stri
 pub(in crate::client::shell) fn render_parent_group_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
+    workspace_tag_width: u16,
     snapshot: &ClientShellSnapshot,
     workspace_index: usize,
     collapsed_groups: &HashSet<String>,
@@ -574,7 +589,9 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
 ) -> Option<(Rect, String)> {
     let key = parent_group_key(snapshot, workspace_index)?;
     let toggle = Rect::new(
-        workspace_rect.right().saturating_sub(1),
+        workspace_rect
+            .right()
+            .saturating_sub(workspace_tag_width.saturating_add(1)),
         workspace_rect.y,
         1,
         1,
@@ -681,10 +698,13 @@ pub(in crate::client::shell) fn workspace_rows(
 pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
+    workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
     rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
+    workspace_tag_width: u16,
+    has_group_toggle: bool,
     focused: bool,
     selected: bool,
     navigating: bool,
@@ -745,6 +765,22 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             palette.overlay0
         });
+        let tag_width = display_width(&workspace.workspace_id);
+        let tag_right = area.right();
+        let available_width = tag_right.saturating_sub(x);
+        let show_workspace_tag = row_index == 0
+            && workspace_tag_width > 0
+            && available_width > tag_width.saturating_add(1);
+        let reserved_tag_width = if has_group_toggle {
+            workspace_tag_width
+        } else {
+            tag_width
+        };
+        let content_right = if show_workspace_tag {
+            tag_right.saturating_sub(reserved_tag_width.saturating_add(1))
+        } else {
+            tag_right
+        };
         let spans = crate::ui::resolved_token_spans(
             row,
             (
@@ -756,17 +792,25 @@ pub(in crate::client::shell) fn render_workspace_rows(
             secondary_style,
             Style::default().fg(palette.overlay1),
             palette,
-            area.right().saturating_sub(2).saturating_sub(x) as usize,
+            content_right.saturating_sub(x) as usize,
             if worktree_layout.is_compact() {
                 crate::ui::compact_separator
             } else {
                 crate::ui::separator
             },
         );
-        Paragraph::new(Line::from(spans)).render(
-            Rect::new(x, y, area.right().saturating_sub(2).saturating_sub(x), 1),
-            buffer,
-        );
+        Paragraph::new(Line::from(spans))
+            .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
+        if show_workspace_tag {
+            put_text(
+                buffer,
+                tag_right.saturating_sub(tag_width),
+                y,
+                tag_width,
+                &workspace.workspace_id,
+                Style::default().fg(palette.overlay0),
+            );
+        }
     }
 
     let background = if selected {

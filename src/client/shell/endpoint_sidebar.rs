@@ -292,6 +292,18 @@ pub(super) fn render_expanded(
             );
         }
     }
+    let workspace_tag_width = if config.spaces.show_workspace_ids {
+        state
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.snapshot.as_deref())
+            .flat_map(|snapshot| snapshot.workspaces.iter())
+            .map(|workspace| display_width(&workspace.workspace_id))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let body = Rect::new(
         workspace_area.x,
         workspace_area.y.saturating_add(WORKSPACE_HEADER_ROWS),
@@ -468,13 +480,25 @@ pub(super) fn render_expanded(
                 let selected = state.selected_workspace_id.is_some_and(|target| {
                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
                 });
+                let group_toggle = super::sidebar::render_parent_group_toggle(
+                    buffer,
+                    rect,
+                    workspace_tag_width,
+                    snapshot,
+                    entry.index,
+                    collapsed_groups,
+                    palette,
+                );
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
+                    workspace,
                     status,
                     config.status_indicators,
                     entry,
                     (tokens, config.spaces.worktree_layout),
+                    workspace_tag_width,
+                    group_toggle.is_some(),
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),
@@ -489,14 +513,7 @@ pub(super) fn render_expanded(
                             .add_modifier(Modifier::DIM),
                     );
                 }
-                let group_toggle = super::sidebar::render_parent_group_toggle(
-                    buffer,
-                    rect,
-                    snapshot,
-                    entry.index,
-                    collapsed_groups,
-                    palette,
-                );
+
                 hits.workspaces.push(WorkspaceHit {
                     rect,
                     endpoint_id: endpoint.endpoint_id.clone(),
