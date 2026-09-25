@@ -412,8 +412,7 @@ Worktrees render in the expanded sidebar with the two-line `tree` layout by defa
 worktree_layout = "compact"
 ```
 
-Compact mode shallows the child connectors to `├─`/`└─` and, when you have not set `rows` explicitly, collapses the Space rows to a single line (`state_icon`, `workspace`, `branch`, `git_status`), separating the workspace from its branch with ` - ` instead of ` · `. An explicit `rows` always wins and keeps the ` · ` separator. The default is `worktree_layout = "tree"`, which matches the upstream layout exactly.
-### Workspace ID tags
+Compact mode shallows the child connectors to `├─`/`└─` and, when you have not set `rows` explicitly, collapses the Space rows to a single line (`state_icon`, `workspace`, `branch`, `git_status`), separating the workspace from its branch with ` - ` instead of ` · `. An explicit `rows` always wins and keeps the ` · ` separator. The default is `worktree_layout = "tree"`, which matches the upstream layout exactly. Unknown values are rejected at load with an error naming the accepted values; changes apply through the usual `reload config` action.
 
 Set `show_workspace_ids = true` to right-align the stable workspace ID (for example `wAB`) on each Space row, after the group toggle:
 
