@@ -516,10 +516,7 @@ pub struct SpacesSidebarConfig {
 
 #[derive(Deserialize)]
 struct SpacesSidebarConfigInput {
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_sidebar_rows"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_sidebar_rows")]
     rows: Option<SpaceSidebarRows>,
     #[serde(default)]
     row_gap: u16,
@@ -621,7 +618,8 @@ mod tests {
     #[test]
     fn parses_worktree_layout_and_rejects_unknown_values() {
         let compact: crate::config::Config =
-            toml::from_str("[ui.sidebar.spaces]\nworktree_layout = \"compact\"\n").expect("compact");
+            toml::from_str("[ui.sidebar.spaces]\nworktree_layout = \"compact\"\n")
+                .expect("compact");
         assert_eq!(
             compact.ui.sidebar.spaces.worktree_layout,
             WorktreeLayout::Compact
@@ -707,7 +705,6 @@ row_gap = 3
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
     }
-
 
     #[test]
     fn parses_occurrence_styles_without_changing_plain_tokens() {

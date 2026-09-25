@@ -702,7 +702,10 @@ pub(in crate::client::shell) fn render_workspace_rows(
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
-    rows: (Vec<Vec<crate::ui::ResolvedToken>>, crate::config::WorktreeLayout),
+    rows: (
+        Vec<Vec<crate::ui::ResolvedToken>>,
+        crate::config::WorktreeLayout,
+    ),
     workspace_tag_width: u16,
     has_group_toggle: bool,
     focused: bool,
@@ -722,14 +725,22 @@ pub(in crate::client::shell) fn render_workspace_rows(
             let compact = worktree_layout.is_compact();
             let prefix = if row_index == 0 {
                 if entry.last_child {
-                    if compact { "└─ " } else { "   └─ " }
+                    if compact {
+                        "└─ "
+                    } else {
+                        "   └─ "
+                    }
                 } else if compact {
                     "├─ "
                 } else {
                     "   ├─ "
                 }
             } else if entry.last_child {
-                if compact { "   " } else { "        " }
+                if compact {
+                    "   "
+                } else {
+                    "        "
+                }
             } else if compact {
                 "│  "
             } else {

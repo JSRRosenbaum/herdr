@@ -187,10 +187,7 @@ pub(crate) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
     }
 }
 
-pub(crate) fn compact_separator(
-    previous: &ResolvedToken,
-    current: &ResolvedToken,
-) -> &'static str {
+pub(crate) fn compact_separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
     if matches!(previous.kind, ResolvedTokenKind::StateIcon)
         || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
     {
