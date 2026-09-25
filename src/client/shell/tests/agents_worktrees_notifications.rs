@@ -1,51 +1,6 @@
 use super::*;
 
 #[test]
-fn capture_workspace_tag_modes() {
-    let mut snapshot = snapshot();
-    snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
-        key: "repo".into(),
-        label: "repo".into(),
-        is_linked_worktree: false,
-    });
-    snapshot.workspaces.push(ClientShellWorkspace {
-        workspace_id: "ws_22".into(),
-        active_tab_id: "tab_ws2".into(),
-        new_workspace_cwd: "/repo/feature".into(),
-        number: 2,
-        label: "repo-feature".into(),
-        custom_label: false,
-        branch: Some("worktree/feature".into()),
-        git_ahead_behind: None,
-        tokens: Vec::new(),
-        worktree: Some(ClientShellWorktree {
-            key: "repo".into(),
-            label: "repo".into(),
-            is_linked_worktree: true,
-        }),
-        focused: false,
-        agent_status: AgentStatus::Idle,
-    });
-    let mut out = String::new();
-    for show in [false, true] {
-        let mut config = ClientShellConfig::from_config(&Config::default());
-        config.spaces.show_workspace_ids = show;
-        let mut state = ClientShellState::new(config);
-        state.set_snapshot(Box::new(snapshot.clone()));
-        state.set_pane_surface(surface());
-        let frame = state.compose(106, 20).expect("frame");
-        out.push_str(&format!("\n=== show_workspace_ids = {show} ===\n"));
-        for row in frame.cells.chunks(frame.width as usize) {
-            let line: String = row
-                .iter()
-                .map(|cell| cell.symbol.as_str())
-                .collect::<String>();
-            out.push_str(&line.replace(' ', "·"));
-            out.push('\n');
-        }
-    }
-    std::fs::write("/tmp/sidebar-captures/labels.txt", &out).expect("write capture");
-}
 
 fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
     let config = ClientShellConfig::from_config(&Config::default());
