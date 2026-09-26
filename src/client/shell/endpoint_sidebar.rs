@@ -77,28 +77,28 @@ pub(super) fn render_collapsed(
             } else {
                 (index + 1).to_string()
             };
-            let marker = if collapsed { "▸" } else { "▾" };
-            put_text(
-                buffer,
-                rect.x,
-                rect.y,
-                rect.width.saturating_sub(1),
-                &format!("{marker}{label}"),
+            let label_style =
                 Style::default().fg(if endpoint.status == ClientEndpointStatus::Online {
                     palette.text
                 } else {
                     palette.overlay0
-                }),
-            );
+                });
             let mut status_badge = Rect::default();
-            if !endpoint.endpoint_id.is_local() {
+            if endpoint.endpoint_id.is_local() {
+                put_text(buffer, rect.x, rect.y, rect.width, &label, label_style);
+            } else {
                 let (glyph, _, color) = endpoint_status_presentation(endpoint.status, palette);
                 let width = display_width(glyph).min(rect.width);
-                status_badge = Rect::new(rect.right().saturating_sub(width), rect.y, width, 1);
-                put_right_text(
+                let label_width =
+                    display_width(&label).min(rect.width.saturating_sub(width.saturating_add(1)));
+                put_text(buffer, rect.x, rect.y, label_width, &label, label_style);
+                let badge_x = rect.x.saturating_add(label_width).saturating_add(1);
+                status_badge = Rect::new(badge_x, rect.y, width, 1);
+                put_text(
                     buffer,
-                    rect,
+                    badge_x,
                     rect.y,
+                    width,
                     glyph,
                     state.machine_diagnostics.badge_style(
                         endpoint,
@@ -110,7 +110,7 @@ pub(super) fn render_collapsed(
             hits.machines.push(MachineHit {
                 rect,
                 status_badge,
-                collapse_toggle: Rect::new(rect.x, rect.y, u16::from(rect.width > 1), 1),
+                collapse_toggle: rect,
                 endpoint_id: endpoint.endpoint_id.clone(),
             });
             y = y.saturating_add(1);
@@ -268,6 +268,7 @@ pub(super) fn render_expanded(
 
     enum Row {
         Endpoint(usize),
+        CollapsedEndpointSpacer,
         Workspace {
             endpoint: usize,
             entry: WorkspaceEntry,
@@ -292,6 +293,16 @@ pub(super) fn render_expanded(
             );
         }
     }
+    let mut rows_with_spacers = Vec::with_capacity(rows.len());
+    for row in rows {
+        if matches!(rows_with_spacers.last(), Some(Row::Endpoint(_)))
+            && matches!(&row, Row::Endpoint(_))
+        {
+            rows_with_spacers.push(Row::CollapsedEndpointSpacer);
+        }
+        rows_with_spacers.push(row);
+    }
+    let rows = rows_with_spacers;
     let workspace_tag_width = if config.spaces.show_workspace_ids {
         state
             .endpoints
@@ -316,7 +327,7 @@ pub(super) fn render_expanded(
     let row_heights = rows
         .iter()
         .map(|row| match row {
-            Row::Endpoint(_) => 1,
+            Row::Endpoint(_) | Row::CollapsedEndpointSpacer => 1,
             Row::Workspace { endpoint, entry } => {
                 let endpoint = &state.endpoints[*endpoint];
                 let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
@@ -384,7 +395,7 @@ pub(super) fn render_expanded(
                         }
                     })
             }
-            Row::Endpoint(_) => false,
+            Row::Endpoint(_) | Row::CollapsedEndpointSpacer => false,
         });
         if let Some(selected_row) = selected_row {
             *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
@@ -412,6 +423,22 @@ pub(super) fn render_expanded(
     let mut y = body.y;
     for (row_index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
         match row {
+            Row::CollapsedEndpointSpacer => {
+                if y >= body.bottom() {
+                    break;
+                }
+                let separator_width = content_width / 3;
+                let separator_x = body
+                    .x
+                    .saturating_add(content_width.saturating_sub(separator_width) / 2);
+                let style = Style::default().fg(palette.surface_dim);
+                for x in separator_x..separator_x.saturating_add(separator_width) {
+                    buffer[(x, y)].set_symbol("─").set_style(style);
+                }
+                y = y
+                    .saturating_add(1)
+                    .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
+            }
             Row::Endpoint(index) => {
                 if y >= body.bottom() {
                     break;
@@ -419,11 +446,9 @@ pub(super) fn render_expanded(
                 let endpoint = &state.endpoints[*index];
                 let rect = Rect::new(body.x, y, content_width, 1);
                 let collapsed = state.collapsed_endpoints.contains(&endpoint.endpoint_id);
-                let marker = if collapsed { "▸" } else { "▾" };
                 let status_badge = render_endpoint_row(
                     buffer,
                     rect,
-                    marker,
                     endpoint,
                     collapsed && &endpoint.endpoint_id == state.active_endpoint_id,
                     state.machine_diagnostics,
@@ -432,12 +457,7 @@ pub(super) fn render_expanded(
                 hits.machines.push(MachineHit {
                     rect,
                     status_badge,
-                    collapse_toggle: Rect::new(
-                        rect.x.saturating_add(1),
-                        rect.y,
-                        u16::from(rect.width > 1),
-                        1,
-                    ),
+                    collapse_toggle: rect,
                     endpoint_id: endpoint.endpoint_id.clone(),
                 });
                 y = y
@@ -470,26 +490,26 @@ pub(super) fn render_expanded(
                     break;
                 }
                 let rect = Rect::new(body.x, y, content_width, height);
-                let nested = Rect::new(
-                    rect.x.saturating_add(2),
-                    rect.y,
-                    rect.width.saturating_sub(2),
-                    rect.height,
-                );
+                let nested = rect;
                 let endpoint_active = &endpoint.endpoint_id == state.active_endpoint_id;
                 let selected = state.selected_workspace_id.is_some_and(|target| {
                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
                 });
-                let group_toggle = super::sidebar::render_parent_group_toggle(
-                    buffer,
-                    rect,
-                    workspace_tag_width,
-                    snapshot,
-                    entry.index,
-                    collapsed_groups,
-                    palette,
-                );
-                super::sidebar::render_workspace_rows(
+                let group_key = super::sidebar::parent_group_key(snapshot, entry.index);
+                let group_collapsed = group_key.is_some_and(|key| collapsed_groups.contains(key));
+                let group_toggle = if config.spaces.worktree_layout.is_compact() {
+                    None
+                } else {
+                    super::sidebar::render_parent_group_toggle(
+                        buffer,
+                        rect,
+                        workspace_tag_width,
+                        group_key,
+                        group_collapsed,
+                        palette,
+                    )
+                };
+                let compact_group_toggle = super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
                     workspace,
@@ -498,13 +518,18 @@ pub(super) fn render_expanded(
                     entry,
                     (tokens, config.spaces.worktree_layout),
                     workspace_tag_width,
-                    group_toggle.is_some(),
+                    group_key.map(|_| group_collapsed),
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),
                     false,
                     palette,
                 );
+                let group_toggle = group_toggle.or_else(|| {
+                    compact_group_toggle
+                        .zip(group_key)
+                        .map(|(toggle, key)| (toggle, key.to_owned()))
+                });
                 if endpoint.status != ClientEndpointStatus::Online {
                     buffer.set_style(
                         rect,
@@ -607,7 +632,6 @@ fn active_endpoint_label<'a>(state: &'a ShellRenderState<'_>) -> &'a str {
 fn render_endpoint_row(
     buffer: &mut Buffer,
     rect: Rect,
-    marker: &str,
     endpoint: &ClientShellEndpoint,
     highlighted: bool,
     auth: &super::machine_diagnostics::MachineDiagnostics,
@@ -616,51 +640,59 @@ fn render_endpoint_row(
     if highlighted {
         buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
     }
-    let (glyph, state, color) = endpoint_status_presentation(endpoint.status, palette);
-    let state = if endpoint.status == ClientEndpointStatus::Online {
-        ""
-    } else {
-        state
-    };
-    let signal = if auth.required_for(endpoint) {
-        "! auth".to_owned()
-    } else if endpoint.status == ClientEndpointStatus::Attention {
-        "! error".to_owned()
-    } else if endpoint.endpoint_id.is_local() {
-        String::new()
-    } else if state.is_empty() {
-        glyph.to_owned()
-    } else {
-        format!("{glyph} {state}")
-    };
-    let signal_width = display_width(&signal).min(rect.width);
+    let (_, _, color) = endpoint_status_presentation(endpoint.status, palette);
+    let rail_style = auth.badge_style(endpoint, palette, Style::default().fg(color));
+    let label_style = Style::default()
+        .fg(
+            if matches!(endpoint.status, ClientEndpointStatus::Disabled) {
+                palette.overlay0
+            } else {
+                palette.text
+            },
+        )
+        .add_modifier(Modifier::BOLD);
+    let label_width = display_width(&endpoint.label);
+    let decoration_width = label_width.saturating_add(4);
+    if rect.width < decoration_width {
+        put_right_text(buffer, rect, rect.y, &endpoint.label, label_style);
+        return rect;
+    }
+
+    let rail_width = rect
+        .width
+        .saturating_sub(decoration_width)
+        .saturating_div(2)
+        .saturating_mul(4)
+        / 5;
+    let content_width = rail_width
+        .saturating_mul(2)
+        .saturating_add(decoration_width);
+    let start_x = rect
+        .x
+        .saturating_add(rect.width.saturating_sub(content_width) / 2);
+    let left_cap_x = start_x.saturating_add(rail_width);
+    let label_x = left_cap_x.saturating_add(2);
+    let right_cap_x = label_x.saturating_add(label_width).saturating_add(1);
+    for x in start_x..left_cap_x {
+        buffer[(x, rect.y)].set_symbol("─").set_style(rail_style);
+    }
+    buffer[(left_cap_x, rect.y)]
+        .set_symbol("┤")
+        .set_style(rail_style);
     put_text(
         buffer,
-        rect.x,
+        label_x,
         rect.y,
-        rect.width.saturating_sub(signal_width.saturating_add(1)),
-        &format!(" {marker} {}", endpoint.label),
-        Style::default()
-            .fg(
-                if matches!(endpoint.status, ClientEndpointStatus::Disabled) {
-                    palette.overlay0
-                } else {
-                    palette.text
-                },
-            )
-            .add_modifier(Modifier::BOLD),
+        label_width,
+        &endpoint.label,
+        label_style,
     );
-    put_right_text(
-        buffer,
-        rect,
-        rect.y,
-        &signal,
-        auth.badge_style(endpoint, palette, Style::default().fg(color)),
-    );
-    Rect::new(
-        rect.right().saturating_sub(signal_width),
-        rect.y,
-        signal_width,
-        1,
-    )
+    buffer[(right_cap_x, rect.y)]
+        .set_symbol("├")
+        .set_style(rail_style);
+    for x in right_cap_x.saturating_add(1)..right_cap_x.saturating_add(1).saturating_add(rail_width)
+    {
+        buffer[(x, rect.y)].set_symbol("─").set_style(rail_style);
+    }
+    rect
 }

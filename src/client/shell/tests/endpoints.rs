@@ -560,47 +560,149 @@ fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
     assert!(text.contains("Local"));
     assert!(text.contains("Build"));
     assert!(text.contains("remote-workspace"));
-    let local = state
-        .hits
-        .machines
-        .iter()
-        .find(|hit| hit.endpoint_id.is_local())
-        .expect("local machine row")
-        .rect;
     let remote = state
         .hits
         .machines
         .iter()
         .find(|hit| !hit.endpoint_id.is_local())
-        .expect("remote machine row")
-        .rect;
+        .expect("remote machine row");
     let buffer = frame.to_ratatui_buffer().expect("frame should reconstruct");
-    assert_ne!(buffer[(local.right() - 1, local.y)].symbol(), "●");
-    assert_eq!(buffer[(remote.right() - 1, remote.y)].symbol(), "●");
+    assert!(text.contains("┤ Build ├"), "frame: {text}");
+    assert!(!text.contains("▾ Build"), "frame: {text}");
+    assert!(!text.contains("▸ Build"), "frame: {text}");
+    assert_eq!(remote.status_badge, remote.rect);
+    let left_cap = (remote.rect.x..remote.rect.right())
+        .find(|x| buffer[(*x, remote.rect.y)].symbol() == "┤")
+        .expect("left machine rail cap");
+    let right_cap = (remote.rect.x..remote.rect.right())
+        .find(|x| buffer[(*x, remote.rect.y)].symbol() == "├")
+        .expect("right machine rail cap");
     assert_eq!(
-        buffer[(remote.right() - 1, remote.y)].fg,
+        left_cap.saturating_sub(remote.rect.x),
+        remote
+            .rect
+            .right()
+            .saturating_sub(right_cap.saturating_add(1))
+    );
+    let left_rail_width = (remote.rect.x..left_cap)
+        .filter(|x| buffer[(*x, remote.rect.y)].symbol() == "─")
+        .count() as u16;
+    let right_rail_width = (right_cap.saturating_add(1)..remote.rect.right())
+        .filter(|x| buffer[(*x, remote.rect.y)].symbol() == "─")
+        .count() as u16;
+    let full_rail_width = remote.rect.width.saturating_sub(9) / 2;
+    assert_eq!(left_rail_width, full_rail_width.saturating_mul(4) / 5);
+    assert_eq!(right_rail_width, full_rail_width.saturating_mul(4) / 5);
+    assert_eq!(
+        buffer[(left_cap, remote.rect.y)].fg,
+        state.config.palette.green
+    );
+    assert_eq!(
+        buffer[(right_cap, remote.rect.y)].fg,
         state.config.palette.green
     );
 
     state.sidebar_collapsed = true;
     let frame = state.compose(100, 28).expect("collapsed endpoint frame");
-    let local = state
-        .hits
-        .machines
-        .iter()
-        .find(|hit| hit.endpoint_id.is_local())
-        .expect("collapsed local machine row")
-        .rect;
     let remote = state
         .hits
         .machines
         .iter()
         .find(|hit| !hit.endpoint_id.is_local())
-        .expect("collapsed remote machine row")
-        .rect;
+        .expect("collapsed remote machine row");
     let buffer = frame.to_ratatui_buffer().expect("frame should reconstruct");
-    assert_ne!(buffer[(local.right() - 1, local.y)].symbol(), "●");
-    assert_eq!(buffer[(remote.right() - 1, remote.y)].symbol(), "●");
+    let row = (remote.rect.x..remote.rect.right())
+        .map(|x| buffer[(x, remote.rect.y)].symbol())
+        .collect::<String>();
+    assert!(!row.contains('▾'));
+    assert!(!row.contains('▸'));
+    assert_eq!(
+        buffer[(remote.status_badge.x, remote.status_badge.y)].symbol(),
+        "●"
+    );
+}
+
+#[test]
+fn expanded_sidebar_separates_adjacent_machine_labels() {
+    let (mut state, remote_id) = state_with_remote();
+    state.collapsed_endpoints.insert(ClientEndpointId::Local);
+    state.collapsed_endpoints.insert(remote_id.clone());
+
+    let frame = state
+        .compose(100, 28)
+        .expect("adjacent collapsed machine frame");
+    let local = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id.is_local())
+        .expect("local machine")
+        .rect;
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    assert_eq!(remote.y, local.y.saturating_add(2));
+    let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+    let separator_width = local.width / 3;
+    let separator_x = local
+        .x
+        .saturating_add(local.width.saturating_sub(separator_width) / 2);
+    for x in separator_x..separator_x.saturating_add(separator_width) {
+        assert_eq!(buffer[(x, local.y.saturating_add(1))].symbol(), "─");
+        assert_eq!(
+            buffer[(x, local.y.saturating_add(1))].fg,
+            state.config.palette.surface_dim
+        );
+    }
+    assert_ne!(
+        buffer[(separator_x.saturating_sub(1), local.y.saturating_add(1))].symbol(),
+        "─"
+    );
+
+    state.collapsed_endpoints.clear();
+    for endpoint in &mut state.endpoints {
+        endpoint
+            .snapshot
+            .as_mut()
+            .expect("machine snapshot")
+            .workspaces
+            .clear();
+    }
+    let frame = state
+        .compose(100, 28)
+        .expect("adjacent empty machine frame");
+    let local = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id.is_local())
+        .expect("local machine")
+        .rect;
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    assert_eq!(remote.y, local.y.saturating_add(2));
+    let buffer = frame
+        .to_ratatui_buffer()
+        .expect("empty machine frame buffer");
+    let separator_width = local.width / 3;
+    let separator_x = local
+        .x
+        .saturating_add(local.width.saturating_sub(separator_width) / 2);
+    assert!(
+        (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
+            buffer[(x, local.y.saturating_add(1))].symbol() == "─"
+                && buffer[(x, local.y.saturating_add(1))].fg == state.config.palette.surface_dim
+        })
+    );
 }
 
 #[test]
@@ -1681,7 +1783,7 @@ fn reconnecting_local_selection_still_reaches_the_runtime() {
 }
 
 #[test]
-fn machine_arrow_toggles_inactive_machine_without_switching() {
+fn machine_label_toggles_inactive_machine_without_switching() {
     for sidebar_collapsed in [false, true] {
         for status in [
             ClientEndpointStatus::Online,
@@ -1704,18 +1806,33 @@ fn machine_arrow_toggles_inactive_machine_without_switching() {
                     .machines
                     .iter()
                     .find(|hit| hit.endpoint_id == remote_id)
-                    .expect("remote machine")
-                    .rect;
-                let column = machine.x + u16::from(!sidebar_collapsed);
+                    .expect("remote machine");
+                let column = machine
+                    .collapse_toggle
+                    .x
+                    .saturating_add(machine.collapse_toggle.width / 2);
                 let buffer = frame.to_ratatui_buffer().expect("frame buffer");
-                assert_eq!(
-                    buffer[(column, machine.y)].symbol(),
-                    if collapsed { "▾" } else { "▸" }
-                );
+                let header = (machine.rect.x..machine.rect.right())
+                    .map(|x| buffer[(x, machine.rect.y)].symbol())
+                    .collect::<String>();
+                assert!(!header.contains('▾'));
+                assert!(!header.contains('▸'));
+                if !sidebar_collapsed {
+                    assert!(header.contains("┤ Build ├"), "header: {header}");
+                    let expected_color = if status == ClientEndpointStatus::Online {
+                        state.config.palette.green
+                    } else {
+                        state.config.palette.yellow
+                    };
+                    assert!((machine.rect.x..machine.rect.right()).any(|x| {
+                        buffer[(x, machine.rect.y)].symbol() == "─"
+                            && buffer[(x, machine.rect.y)].fg == expected_color
+                    }));
+                }
                 let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column,
-                    row: machine.y,
+                    row: machine.rect.y,
                     modifiers: KeyModifiers::empty(),
                 })]);
                 assert!(

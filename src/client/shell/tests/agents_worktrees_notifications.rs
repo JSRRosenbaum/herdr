@@ -3,7 +3,6 @@ use crate::config::WorktreeLayout;
 
 #[test]
 
-
 fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
     let config = ClientShellConfig::from_config(&Config::default());
     let mut state = ClientShellState::new(config);
@@ -229,6 +228,7 @@ fn compact_grouped_snapshot() -> ClientShellSnapshot {
 fn compact_layout_renders_shallow_connectors_and_inline_branch() {
     let mut config = ClientShellConfig::from_config(&Config::default());
     config.spaces.worktree_layout = WorktreeLayout::Compact;
+    config.spaces.show_workspace_ids = true;
     let mut state = ClientShellState::new(config);
     state.set_snapshot(Box::new(compact_grouped_snapshot()));
     state.set_pane_surface(surface());
@@ -243,16 +243,43 @@ fn compact_layout_renders_shallow_connectors_and_inline_branch() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("└─ "));
+    assert!(text.contains("┬○ client-"));
+    assert!(text.contains("└○ feature"));
+    assert!(!text.contains("└─"));
     assert!(!text.contains("   ├─ "));
     assert!(!text.contains("   └─ "));
     assert!(text.contains("main"));
     assert!(text.contains("feature"));
     assert!(text.contains(" - "));
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent
+        .group_toggle
+        .as_ref()
+        .expect("compact parent group toggle");
+    let toggle_index = usize::from(toggle.y) * usize::from(frame.width) + usize::from(toggle.x);
+    assert_eq!(frame.cells[toggle_index].symbol, "┬");
     let child = &state.hits.workspaces[1];
-    let child_status = usize::from(child.rect.y) * usize::from(frame.width)
-        + usize::from(child.rect.x.saturating_add(4));
-    assert_eq!(frame.cells[child_status].symbol, "○");
+    for workspace in [parent, child] {
+        let status_index = usize::from(workspace.rect.y) * usize::from(frame.width)
+            + usize::from(workspace.rect.x.saturating_add(1));
+        assert_eq!(frame.cells[status_index].symbol, "○");
+    }
+    state.collapsed_groups.insert("repo".into());
+    let collapsed_frame = state
+        .compose(106, 20)
+        .expect("collapsed compact worktree group");
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent
+        .group_toggle
+        .as_ref()
+        .expect("collapsed compact parent group toggle");
+    let toggle_index =
+        usize::from(toggle.y) * usize::from(collapsed_frame.width) + usize::from(toggle.x);
+    assert_eq!(collapsed_frame.cells[toggle_index].symbol, "▸");
+    assert_eq!(
+        collapsed_frame.cells[toggle_index.saturating_add(1)].symbol,
+        "○"
+    );
 }
 
 #[test]

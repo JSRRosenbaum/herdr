@@ -9,6 +9,7 @@ pub(super) struct MachineDiagnostics {
 }
 
 impl MachineDiagnostics {
+    #[cfg(test)]
     pub(super) fn required_for(&self, endpoint: &ClientShellEndpoint) -> bool {
         self.errors
             .get(&endpoint.endpoint_id)

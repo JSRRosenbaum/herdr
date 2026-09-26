@@ -331,16 +331,21 @@ pub(crate) fn render_sidebar(
         } else if workspace.focused {
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
-        let group_toggle = render_parent_group_toggle(
-            buffer,
-            rect,
-            workspace_tag_width,
-            snapshot,
-            entry.index,
-            state.collapsed_groups,
-            palette,
-        );
-        render_workspace_rows(
+        let group_key = parent_group_key(snapshot, entry.index);
+        let group_collapsed = group_key.is_some_and(|key| state.collapsed_groups.contains(key));
+        let group_toggle = if config.spaces.worktree_layout.is_compact() {
+            None
+        } else {
+            render_parent_group_toggle(
+                buffer,
+                rect,
+                workspace_tag_width,
+                group_key,
+                group_collapsed,
+                palette,
+            )
+        };
+        let compact_group_toggle = render_workspace_rows(
             buffer,
             rect,
             workspace,
@@ -349,13 +354,18 @@ pub(crate) fn render_sidebar(
             entry,
             (rows, config.spaces.worktree_layout),
             workspace_tag_width,
-            group_toggle.is_some(),
+            group_key.map(|_| group_collapsed),
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
             dragged,
             palette,
         );
+        let group_toggle = group_toggle.or_else(|| {
+            compact_group_toggle
+                .zip(group_key)
+                .map(|(toggle, key)| (toggle, key.to_owned()))
+        });
         hits.workspaces.push(WorkspaceHit {
             rect,
             endpoint_id: ClientEndpointId::Local,
@@ -558,7 +568,10 @@ pub(crate) fn workspace_entries(
     entries
 }
 
-fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<String> {
+pub(in crate::client::shell) fn parent_group_key(
+    snapshot: &ClientShellSnapshot,
+    index: usize,
+) -> Option<&str> {
     let workspace = snapshot.workspaces.get(index)?;
     let worktree = workspace.worktree.as_ref()?;
     if worktree.is_linked_worktree {
@@ -575,19 +588,18 @@ fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<Stri
         })
         .count()
         >= 2)
-        .then(|| worktree.key.clone())
+        .then_some(worktree.key.as_str())
 }
 
 pub(in crate::client::shell) fn render_parent_group_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
     workspace_tag_width: u16,
-    snapshot: &ClientShellSnapshot,
-    workspace_index: usize,
-    collapsed_groups: &HashSet<String>,
+    group_key: Option<&str>,
+    collapsed: bool,
     palette: &Palette,
 ) -> Option<(Rect, String)> {
-    let key = parent_group_key(snapshot, workspace_index)?;
+    let key = group_key?;
     let toggle = Rect::new(
         workspace_rect
             .right()
@@ -601,14 +613,10 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
         toggle.x,
         toggle.y,
         toggle.width,
-        if collapsed_groups.contains(&key) {
-            "▸"
-        } else {
-            "▾"
-        },
+        if collapsed { "▸" } else { "▾" },
         Style::default().fg(palette.accent),
     );
-    Some((toggle, key))
+    Some((toggle, key.to_owned()))
 }
 
 pub(in crate::client::shell) fn displayed_workspace_status(
@@ -707,13 +715,15 @@ pub(in crate::client::shell) fn render_workspace_rows(
         crate::config::WorktreeLayout,
     ),
     workspace_tag_width: u16,
-    has_group_toggle: bool,
+    group_collapsed: Option<bool>,
     focused: bool,
     selected: bool,
     navigating: bool,
     dragged: bool,
     palette: &Palette,
-) {
+) -> Option<Rect> {
+    let has_group_toggle = group_collapsed.is_some();
+    let mut compact_group_toggle = None;
     let (rows, worktree_layout) = rows;
     for (row_index, row) in rows.iter().enumerate() {
         let y = area.y + row_index as u16;
@@ -723,26 +733,26 @@ pub(in crate::client::shell) fn render_workspace_rows(
         let mut x = area.x;
         if entry.indented {
             let compact = worktree_layout.is_compact();
-            let prefix = if row_index == 0 {
-                if entry.last_child {
-                    if compact {
-                        "└─ "
+            let prefix = if compact {
+                if row_index == 0 {
+                    if entry.last_child {
+                        "└"
                     } else {
-                        "   └─ "
+                        "├"
                     }
-                } else if compact {
-                    "├─ "
+                } else if entry.last_child {
+                    " "
+                } else {
+                    "│"
+                }
+            } else if row_index == 0 {
+                if entry.last_child {
+                    "   └─ "
                 } else {
                     "   ├─ "
                 }
             } else if entry.last_child {
-                if compact {
-                    "   "
-                } else {
-                    "        "
-                }
-            } else if compact {
-                "│  "
+                "        "
             } else {
                 "   │    "
             };
@@ -813,6 +823,20 @@ pub(in crate::client::shell) fn render_workspace_rows(
 
         Paragraph::new(Line::from(spans))
             .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
+        if row_index == 0 && worktree_layout.is_compact() {
+            if let Some(collapsed) = group_collapsed {
+                let toggle = Rect::new(area.x, y, u16::from(!area.is_empty()), 1);
+                put_text(
+                    buffer,
+                    toggle.x,
+                    toggle.y,
+                    toggle.width,
+                    if collapsed { "▸" } else { "┬" },
+                    Style::default().fg(palette.accent),
+                );
+                compact_group_toggle = Some(toggle);
+            }
+        }
         if show_workspace_tag {
             put_text(
                 buffer,
@@ -841,4 +865,5 @@ pub(in crate::client::shell) fn render_workspace_rows(
             }
         }
     }
+    compact_group_toggle
 }
