@@ -138,7 +138,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert!(text.contains("feature"));
     let child = &state.hits.workspaces[1];
     let child_status = usize::from(child.rect.y) * usize::from(frame.width)
-        + usize::from(child.rect.x.saturating_add(4));
+        + usize::from(child.rect.x.saturating_add(6));
     assert_eq!(frame.cells[child_status].symbol, "○");
     assert!(text.contains("ws_1"));
     assert!(text.contains("ws_22"));
@@ -283,7 +283,7 @@ fn compact_layout_renders_shallow_connectors_and_inline_branch() {
 }
 
 #[test]
-fn explicit_rows_keep_upstream_connectors_in_compact_layout() {
+fn explicit_rows_keep_configured_rows_in_compact_layout() {
     let mut config = ClientShellConfig::from_config(&Config::default());
     config.spaces.worktree_layout = WorktreeLayout::Compact;
     config.spaces.rows_explicit = true;
@@ -301,7 +301,11 @@ fn explicit_rows_keep_upstream_connectors_in_compact_layout() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("   └─ ") || text.contains("   ├─ "));
+    assert_eq!(state.hits.workspaces[0].rect.height, 2);
+    let child = &state.hits.workspaces[1];
+    let child_connector =
+        usize::from(child.rect.y) * usize::from(frame.width) + usize::from(child.rect.x);
+    assert_eq!(frame.cells[child_connector].symbol, "└");
     assert!(!text.contains(" - "));
 }
 

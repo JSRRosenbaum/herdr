@@ -486,7 +486,7 @@ fn live_catalog_active_removal_does_not_retain_remote_projection_or_input() {
 }
 
 #[test]
-fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
+fn machine_collapse_does_not_require_a_local_snapshot_or_surface() {
     for (cols, rows) in [(100, 28), (36, 18)] {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         let profile = remote_profile();
@@ -533,9 +533,8 @@ fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
             },
             &mut outcome,
         );
-        assert!(
-            matches!(outcome.actions.as_slice(), [ClientShellAction::ActivateEndpoint { endpoint_id, .. }] if endpoint_id == &remote)
-        );
+        assert!(outcome.actions.is_empty());
+        assert!(state.collapsed_endpoints.contains(&remote));
         assert!(
             state.snapshot.is_none(),
             "selection is committed only by coherent activation"
@@ -625,6 +624,42 @@ fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
 #[test]
 fn expanded_sidebar_separates_adjacent_machine_labels() {
     let (mut state, remote_id) = state_with_remote();
+    let frame = state.compose(100, 28).expect("machine workspace frame");
+    let local = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id.is_local())
+        .expect("local machine")
+        .rect;
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    let last_local_workspace = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.endpoint_id.is_local())
+        .map(|hit| hit.rect.bottom())
+        .max()
+        .expect("local workspace");
+    assert_eq!(remote.y, last_local_workspace.saturating_add(1));
+    let buffer = frame.to_ratatui_buffer().expect("workspace frame buffer");
+    let separator_width = local.width / 3;
+    let separator_x = local
+        .x
+        .saturating_add(local.width.saturating_sub(separator_width) / 2);
+    assert!(
+        (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
+            buffer[(x, remote.y.saturating_sub(1))].symbol() == "─"
+                && buffer[(x, remote.y.saturating_sub(1))].fg == state.config.palette.surface_dim
+        })
+    );
+
     state.collapsed_endpoints.insert(ClientEndpointId::Local);
     state.collapsed_endpoints.insert(remote_id.clone());
 
@@ -701,6 +736,53 @@ fn expanded_sidebar_separates_adjacent_machine_labels() {
         (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
             buffer[(x, local.y.saturating_add(1))].symbol() == "─"
                 && buffer[(x, local.y.saturating_add(1))].fg == state.config.palette.surface_dim
+        })
+    );
+}
+
+#[test]
+fn expanded_sidebar_ends_machine_workspace_lists_with_a_separator() {
+    let (mut state, remote_id) = state_with_remote();
+    let mut other_profile = remote_profile();
+    other_profile.id = ProfileId::parse("1123456789abcdef0123456789abcdef").unwrap();
+    let other_id = ClientEndpointId::Ssh(other_profile.id.clone());
+    state.set_endpoint_catalog(&[remote_profile(), other_profile]);
+    state.set_endpoint_status(&other_id, ClientEndpointStatus::Online);
+    state.set_endpoint_snapshot(&other_id, Box::new(snapshot()));
+
+    let frame = state.compose(100, 28).expect("machine workspace frame");
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    let other = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == other_id)
+        .expect("following machine")
+        .rect;
+    let last_remote_workspace = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.endpoint_id == remote_id)
+        .map(|hit| hit.rect.bottom())
+        .max()
+        .expect("remote workspace");
+    assert_eq!(other.y, last_remote_workspace.saturating_add(1));
+    let buffer = frame.to_ratatui_buffer().expect("machine workspace buffer");
+    let separator_width = remote.width / 3;
+    let separator_x = remote
+        .x
+        .saturating_add(remote.width.saturating_sub(separator_width) / 2);
+    assert!(
+        (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
+            buffer[(x, other.y.saturating_sub(1))].symbol() == "─"
+                && buffer[(x, other.y.saturating_sub(1))].fg == state.config.palette.surface_dim
         })
     );
 }
@@ -1017,7 +1099,7 @@ fn expanded_machine_sidebar_applies_space_row_gap_within_each_machine() {
         .find(|hit| hit.endpoint_id == remote_id)
         .expect("remote machine");
     assert_eq!(local_workspaces[0].rect.y, local_machine.rect.bottom());
-    assert_eq!(remote_machine.rect.y, local_workspaces[1].rect.bottom());
+    assert_eq!(remote_machine.rect.y, local_workspaces[1].rect.bottom() + 1);
 
     let remote_workspaces = state
         .hits
@@ -1684,84 +1766,40 @@ fn unselected_endpoint_completion_projects_done_client_side() {
 }
 
 #[test]
-fn clicking_remote_machine_name_requests_activation_without_mutating_projection() {
-    let (mut state, endpoint_id) = state_with_remote();
-    state.compose(100, 28).expect("combined endpoint frame");
-    let hit = state
+fn clicking_local_workspace_can_cancel_a_remote_switch_while_local_is_displayed() {
+    let (mut state, remote) = state_with_remote();
+    state.compose(100, 28).unwrap();
+    let mut pending = ClientShellInput::default();
+    assert!(state.activate_endpoint(remote, &mut pending));
+    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    let rect = state
         .hits
-        .machines
+        .workspaces
         .iter()
-        .find(|hit| hit.endpoint_id == endpoint_id)
-        .expect("remote endpoint hit")
+        .find(|hit| hit.endpoint_id.is_local())
+        .unwrap()
         .rect;
-    let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: hit.x + 3,
-        row: hit.y,
-        modifiers: KeyModifiers::empty(),
-    })]);
+    let outcome = state.handle_raw_events(vec![
+        RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 5,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: rect.x + 5,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+    ]);
     assert!(matches!(
         outcome.actions.as_slice(),
         [ClientShellAction::ActivateEndpoint {
-            endpoint_id: activated,
-            target: None,
-        }] if activated == &endpoint_id
+            endpoint_id: ClientEndpointId::Local,
+            target: Some(_),
+        }]
     ));
-    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
-    assert_eq!(
-        state
-            .snapshot
-            .as_deref()
-            .map(|snapshot| snapshot.boot_id.as_str()),
-        Some("boot-1")
-    );
-}
-
-#[test]
-fn clicking_local_can_cancel_a_remote_switch_while_local_is_still_displayed() {
-    for workspace in [false, true] {
-        let (mut state, remote) = state_with_remote();
-        state.compose(100, 28).unwrap();
-        let mut pending = ClientShellInput::default();
-        assert!(state.activate_endpoint(remote, &mut pending));
-        assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
-        let rect = if workspace {
-            state
-                .hits
-                .workspaces
-                .iter()
-                .find(|hit| hit.endpoint_id.is_local())
-                .unwrap()
-                .rect
-        } else {
-            state
-                .hits
-                .machines
-                .iter()
-                .find(|hit| hit.endpoint_id.is_local())
-                .unwrap()
-                .rect
-        };
-        let outcome = state.handle_raw_events(vec![
-            RawInputEvent::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: rect.x + 5,
-                row: rect.y,
-                modifiers: KeyModifiers::empty(),
-            }),
-            RawInputEvent::Mouse(MouseEvent {
-                kind: MouseEventKind::Up(MouseButton::Left),
-                column: rect.x + 5,
-                row: rect.y,
-                modifiers: KeyModifiers::empty(),
-            }),
-        ]);
-        assert!(
-            matches!(outcome.actions.as_slice(), [ClientShellAction::ActivateEndpoint {
-            endpoint_id: ClientEndpointId::Local, target,
-        }] if target.is_some() == workspace)
-        );
-    }
 }
 
 #[test]
@@ -2107,7 +2145,7 @@ fn disconnected_active_endpoint_freezes_surface_and_marks_cached_ui_stale() {
         state.endpoint_status(&endpoint_id),
         Some(ClientEndpointStatus::Reconnecting)
     );
-    assert!(text.contains("◐ reconnecting"), "frame: {text}");
+    assert!(text.contains("Build · reconnecting"), "frame: {text}");
     assert!(text.contains("Build · remote agent"), "frame: {text}");
     assert!(
         text.contains("LIVE"),

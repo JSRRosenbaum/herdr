@@ -268,7 +268,7 @@ pub(super) fn render_expanded(
 
     enum Row {
         Endpoint(usize),
-        CollapsedEndpointSpacer,
+        MachineSeparator,
         Workspace {
             endpoint: usize,
             entry: WorkspaceEntry,
@@ -276,6 +276,9 @@ pub(super) fn render_expanded(
     }
     let mut rows = Vec::new();
     for (endpoint_index, endpoint) in state.endpoints.iter().enumerate() {
+        if endpoint_index > 0 {
+            rows.push(Row::MachineSeparator);
+        }
         rows.push(Row::Endpoint(endpoint_index));
         if state.collapsed_endpoints.contains(&endpoint.endpoint_id) {
             continue;
@@ -293,16 +296,6 @@ pub(super) fn render_expanded(
             );
         }
     }
-    let mut rows_with_spacers = Vec::with_capacity(rows.len());
-    for row in rows {
-        if matches!(rows_with_spacers.last(), Some(Row::Endpoint(_)))
-            && matches!(&row, Row::Endpoint(_))
-        {
-            rows_with_spacers.push(Row::CollapsedEndpointSpacer);
-        }
-        rows_with_spacers.push(row);
-    }
-    let rows = rows_with_spacers;
     let workspace_tag_width = if config.spaces.show_workspace_ids {
         state
             .endpoints
@@ -327,7 +320,7 @@ pub(super) fn render_expanded(
     let row_heights = rows
         .iter()
         .map(|row| match row {
-            Row::Endpoint(_) | Row::CollapsedEndpointSpacer => 1,
+            Row::Endpoint(_) | Row::MachineSeparator => 1,
             Row::Workspace { endpoint, entry } => {
                 let endpoint = &state.endpoints[*endpoint];
                 let collapsed_groups = collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
@@ -395,7 +388,7 @@ pub(super) fn render_expanded(
                         }
                     })
             }
-            Row::Endpoint(_) | Row::CollapsedEndpointSpacer => false,
+            Row::Endpoint(_) | Row::MachineSeparator => false,
         });
         if let Some(selected_row) = selected_row {
             *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
@@ -423,7 +416,7 @@ pub(super) fn render_expanded(
     let mut y = body.y;
     for (row_index, row) in rows.iter().enumerate().skip(*state.workspace_scroll) {
         match row {
-            Row::CollapsedEndpointSpacer => {
+            Row::MachineSeparator => {
                 if y >= body.bottom() {
                     break;
                 }
