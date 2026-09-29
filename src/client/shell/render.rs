@@ -229,6 +229,73 @@ pub(super) fn render_mode_bar(
     Some(bar)
 }
 
+pub(super) fn render_herd_header(
+    buffer: &mut Buffer,
+    area: Rect,
+    config: &ClientShellConfig,
+    selected: u16,
+    count: u16,
+    collapsed: bool,
+    hits: &mut ShellHitMap,
+) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let header = Rect::new(area.x, area.y, area.width, 1);
+    buffer.set_style(header, Style::default().bg(config.palette.sidebar_bg));
+    let add_x = area.right() - 1;
+    hits.add_herd = Rect::new(add_x, area.y, 1, 1);
+    put_text(
+        buffer,
+        add_x,
+        area.y,
+        1,
+        "+",
+        Style::default().fg(config.palette.accent),
+    );
+    let tab_width = if collapsed { 1 } else { 3 };
+    let slots = usize::from(area.width.saturating_sub(1) / tab_width);
+    let count = usize::from(count);
+    for offset in 0..count.min(slots) {
+        let index = if count > slots {
+            (usize::from(selected) + offset) % count
+        } else {
+            offset
+        };
+        let x = area.x + (offset as u16) * tab_width;
+        let rect = Rect::new(x, area.y, tab_width, 1);
+        let selected_style = Style::default()
+            .fg(config.palette.text)
+            .bg(config.palette.active_row_bg);
+        let style = if index == usize::from(selected) {
+            selected_style
+        } else {
+            Style::default().fg(config.palette.overlay0)
+        };
+        buffer.set_style(rect, style);
+        let mut digits = [b'0'; 5];
+        let mut number = index as u16;
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (number % 10) as u8;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
+        let label = std::str::from_utf8(&digits[start..]).expect("ASCII decimal digits");
+        put_text(buffer, x, area.y, tab_width, label, style);
+        hits.herd_tabs.push((rect, index as u16));
+    }
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
+}
+
 pub(super) struct ShellRenderState<'a> {
     pub(super) machine_diagnostics: &'a super::machine_diagnostics::MachineDiagnostics,
     pub(super) endpoints: &'a [ClientShellEndpoint],
@@ -236,6 +303,9 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) collapsed_endpoints: &'a HashSet<ClientEndpointId>,
     pub(super) collapsed_groups: &'a HashSet<String>,
     pub(super) remote_collapsed_groups: &'a HashMap<ClientEndpointId, HashSet<String>>,
+    pub(super) herd_count: u16,
+    pub(super) selected_herd: u16,
+    pub(super) machine_herds: &'a HashMap<ClientEndpointId, u16>,
     pub(super) workspace_scroll: &'a mut usize,
     pub(super) agent_scroll: &'a mut usize,
     pub(super) tab_scroll: &'a mut usize,
@@ -268,19 +338,24 @@ pub(super) fn render_shell(
         );
     }
     if layout.sidebar.width > 0 {
-        if state.endpoints.len() > 1 {
+        let sidebar = render_herd_header(
+            buffer,
+            layout.sidebar,
+            config,
+            state.selected_herd,
+            state.herd_count,
+            state.sidebar_collapsed,
+            &mut hits,
+        );
+        if state.endpoints.len() > 1 || state.herd_count > 1 {
             if state.sidebar_collapsed {
                 super::endpoint_sidebar::render_collapsed(
-                    buffer,
-                    layout.sidebar,
-                    config,
-                    &mut state,
-                    &mut hits,
+                    buffer, sidebar, config, &mut state, &mut hits,
                 );
             } else {
                 super::endpoint_sidebar::render_expanded(
                     buffer,
-                    layout.sidebar,
+                    sidebar,
                     Some(snapshot),
                     config,
                     &mut state,
@@ -290,7 +365,7 @@ pub(super) fn render_shell(
         } else if state.sidebar_collapsed {
             render_collapsed_sidebar(
                 buffer,
-                layout.sidebar,
+                sidebar,
                 snapshot,
                 config,
                 state
@@ -299,14 +374,7 @@ pub(super) fn render_shell(
                 &mut hits,
             );
         } else {
-            render_sidebar(
-                buffer,
-                layout.sidebar,
-                snapshot,
-                config,
-                &mut state,
-                &mut hits,
-            );
+            render_sidebar(buffer, sidebar, snapshot, config, &mut state, &mut hits);
         }
     }
     if layout.tab_bar.height > 0 {
@@ -322,6 +390,8 @@ pub(super) fn render_shell(
         );
     }
     if !config.mouse_capture {
+        hits.herd_tabs.clear();
+        hits.add_herd = Rect::default();
         hits.sidebar_divider = Rect::default();
         hits.sidebar_section_divider = Rect::default();
         hits.workspace_scrollbar = Rect::default();

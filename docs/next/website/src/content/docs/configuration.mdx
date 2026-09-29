@@ -108,6 +108,8 @@ Worktree actions are available from Git workspace rows. `New worktree` creates a
 
 Grouped worktrees still behave like normal Herdr workspaces: they can be focused, renamed, closed, and contain their own tabs and panes. The parent row is the original workspace. Closing the parent row closes the whole Herdr group, but it does not delete checkout folders or branches.
 
+Drag a linked worktree row to reorder it among the other worktrees under the same parent. Drag the parent row to move the entire group in the workspace list. A child cannot be dragged into a different group or out to the top level; this changes sidebar order, not Git worktree checkout paths.
+
 To delete a worktree checkout, use `Delete worktree checkout...` on a grouped child workspace. Herdr runs `git worktree remove`, first asking Git to remove safely. If Git refuses because the checkout has modified or untracked files, Herdr asks again before running the forced remove. Branches are not deleted.
 
 ## Remote attach
@@ -402,6 +404,28 @@ Space rows accept these built-in tokens:
 - `$name` — custom workspace metadata named `name`.
 
 Tokens render in their configured order. Herdr normally separates adjacent values with ` · ` and uses a single space after `state_icon`. Missing values and their separators disappear; a row disappears when none of its tokens have a value. Existing custom rows remain unchanged, so add `machine` explicitly if you want machine identity in a custom multi-machine layout. Each layout may contain at most 16 rows, with at most 16 tokens in each row.
+
+### Worktree layout
+
+Worktrees render in the expanded sidebar with the two-line `tree` layout by default: parents sit flush and children indent with deep `   ├─`/`   └─` connectors. Set `worktree_layout = "compact"` to compress the presentation:
+
+```toml
+[ui.sidebar.spaces]
+worktree_layout = "compact"
+```
+
+Compact mode shallows the child connectors to `├─`/`└─` and, when you have not set `rows` explicitly, collapses the Space rows to a single line (`state_icon`, `workspace`, `branch`, `git_status`), separating the workspace from its branch with ` - ` instead of ` · `. An explicit `rows` always wins and keeps the ` · ` separator. The default is `worktree_layout = "tree"`, which matches the upstream layout exactly. Unknown values are rejected at load with an error naming the accepted values; changes apply through the usual `reload config` action.
+
+Compact mode also draws a muted separator after the last visible Space in a worktree group when another Space follows on the same machine. No extra separator appears at a machine boundary.
+
+Set `show_workspace_ids = true` to right-align the stable workspace ID (for example `wAB`) on each Space row, after the group toggle:
+
+```toml
+[ui.sidebar.spaces]
+show_workspace_ids = true
+```
+
+The default is `show_workspace_ids = false`; with it off the sidebar layout and hit targets match the upstream layout exactly. The tags render in a fixed-width column sized to the longest workspace ID in the current view, so rows stay aligned across workspaces.
 
 A token entry can also be an inline style table:
 

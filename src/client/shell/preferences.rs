@@ -14,7 +14,14 @@ pub(super) struct ClientRemoteCollapsedGroups {
     pub(super) collapsed_groups: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ClientMachineHerd {
+    /// None identifies the local machine; remote machines use the stable SSH profile ID.
+    pub(super) profile_id: Option<String>,
+    pub(super) herd: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) sidebar_width: Option<u16>,
@@ -28,6 +35,32 @@ pub(super) struct ClientChromePreferences {
     pub(super) collapsed_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) remote_collapsed_groups: Vec<ClientRemoteCollapsedGroups>,
+    #[serde(default = "default_herd_count")]
+    pub(super) herd_count: u16,
+    #[serde(default)]
+    pub(super) selected_herd: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) machine_herds: Vec<ClientMachineHerd>,
+}
+
+impl Default for ClientChromePreferences {
+    fn default() -> Self {
+        Self {
+            sidebar_width: None,
+            sidebar_section_split: None,
+            sidebar_collapsed: None,
+            agent_panel_sort: None,
+            collapsed_groups: Vec::new(),
+            remote_collapsed_groups: Vec::new(),
+            herd_count: 1,
+            selected_herd: 0,
+            machine_herds: Vec::new(),
+        }
+    }
+}
+
+fn default_herd_count() -> u16 {
+    1
 }
 
 pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {

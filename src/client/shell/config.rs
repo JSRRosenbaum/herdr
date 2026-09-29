@@ -48,6 +48,18 @@ impl ClientShellState {
             })
             .collect::<Vec<_>>();
         remote_collapsed_groups.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        let mut machine_herds = self
+            .machine_herds
+            .iter()
+            .map(|(endpoint_id, &herd)| preferences::ClientMachineHerd {
+                profile_id: match endpoint_id {
+                    ClientEndpointId::Local => None,
+                    ClientEndpointId::Ssh(id) => Some(id.to_string()),
+                },
+                herd,
+            })
+            .collect::<Vec<_>>();
+        machine_herds.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
         let preferences = preferences::ClientChromePreferences {
             sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
             sidebar_section_split: self
@@ -61,6 +73,9 @@ impl ClientShellState {
                 .then_some(self.config.agent_panel_sort),
             collapsed_groups,
             remote_collapsed_groups,
+            herd_count: self.herd_count,
+            selected_herd: self.selected_herd,
+            machine_herds,
         };
         if let Err(error) = preferences::store(path, preferences) {
             self.set_endpoint_error(error);

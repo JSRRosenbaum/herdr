@@ -13,21 +13,20 @@ impl ClientShellState {
 
     pub(super) fn endpoint_workspace_is_draggable(&self, press: &ClientWorkspacePress) -> bool {
         press.endpoint_id == self.active_endpoint_id
-            && self
-                .snapshot
-                .as_deref()
-                .and_then(|snapshot| {
-                    snapshot
-                        .workspaces
-                        .iter()
-                        .find(|workspace| workspace.workspace_id == press.workspace_id)
-                })
-                .is_some_and(|workspace| {
-                    !workspace
-                        .worktree
-                        .as_ref()
-                        .is_some_and(|worktree| worktree.is_linked_worktree)
-                })
+            && self.snapshot.as_deref().is_some_and(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == press.workspace_id)
+                    .is_some_and(|workspace| {
+                        !workspace.worktree.as_ref().is_some_and(|worktree| {
+                            worktree.is_linked_worktree
+                                && self
+                                    .collapsed_groups_for_endpoint(&press.endpoint_id)
+                                    .is_some_and(|groups| groups.contains(&worktree.key))
+                        })
+                    })
+            })
     }
 
     pub(super) fn finish_endpoint_workspace_press(
