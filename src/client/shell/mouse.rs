@@ -508,6 +508,131 @@ impl ClientShellState {
         Some(last_index + 1)
     }
 
+    fn linked_worktree_drop_target_at(
+        &self,
+        source_workspace_id: &str,
+        point: (u16, u16),
+    ) -> Option<(Option<String>, u16)> {
+        let snapshot = self.snapshot.as_deref()?;
+        let source = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == source_workspace_id)?;
+        let source_worktree = source.worktree.as_ref()?;
+        let key = &source_worktree.key;
+        if !source_worktree.is_linked_worktree
+            || self
+                .collapsed_groups_for_endpoint(&self.active_endpoint_id)
+                .is_some_and(|groups| groups.contains(key))
+            || !snapshot.workspaces.iter().any(|workspace| {
+                workspace
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.key == *key && !worktree.is_linked_worktree)
+            })
+            || !super::contains(self.hits.workspace_body, point)
+            || self.hits.workspaces.iter().any(|hit| {
+                super::contains(hit.rect, point)
+                    && (hit.endpoint_id != self.active_endpoint_id
+                        || !hit.indented
+                        || !snapshot.workspaces.iter().any(|workspace| {
+                            workspace.workspace_id == hit.workspace_id
+                                && workspace.worktree.as_ref().is_some_and(|worktree| {
+                                    worktree.key == *key && worktree.is_linked_worktree
+                                })
+                        }))
+            })
+        {
+            return None;
+        }
+        let last_index = snapshot.workspaces.iter().rposition(|workspace| {
+            workspace
+                .worktree
+                .as_ref()
+                .is_some_and(|worktree| worktree.key == *key && worktree.is_linked_worktree)
+        })?;
+        let last_workspace = &snapshot.workspaces[last_index];
+        let mut first_row = None;
+        let mut last_row = None;
+        let mut nearest = None;
+        for workspace in snapshot.workspaces.iter().filter(|workspace| {
+            workspace
+                .worktree
+                .as_ref()
+                .is_some_and(|worktree| worktree.key == *key && worktree.is_linked_worktree)
+        }) {
+            let Some(hit) = self.hits.workspaces.iter().find(|hit| {
+                hit.endpoint_id == self.active_endpoint_id
+                    && hit.indented
+                    && hit.workspace_id == workspace.workspace_id
+            }) else {
+                continue;
+            };
+            let row = hit.rect.y;
+            first_row.get_or_insert(row);
+            last_row = Some(row);
+            if nearest.as_ref().is_none_or(|(_, previous_row)| {
+                point.1.abs_diff(row) < point.1.abs_diff(*previous_row)
+            }) {
+                nearest = Some((Some(workspace.workspace_id.as_str()), row));
+            }
+        }
+        let first_row = first_row?;
+        let last_hit = self.hits.workspaces.iter().find(|hit| {
+            hit.endpoint_id == self.active_endpoint_id
+                && hit.indented
+                && hit.workspace_id == last_workspace.workspace_id
+        });
+        let end_row = last_hit.map(|hit| hit.rect.bottom()).unwrap_or(last_row?);
+        if point.1 < first_row.saturating_sub(1) || point.1 > end_row {
+            return None;
+        }
+        if let Some(last_hit) = last_hit {
+            if end_row < self.hits.workspace_body.bottom() {
+                let boundary = snapshot
+                    .workspaces
+                    .get(last_index + 1)
+                    .map(|workspace| workspace.workspace_id.as_str());
+                // On a one-row child, its right half selects the slot after it.
+                if point.1 == end_row.saturating_sub(1)
+                    && (last_hit.rect.height > 1
+                        || point.0 >= last_hit.rect.x + last_hit.rect.width / 2)
+                {
+                    return Some((boundary.map(str::to_owned), end_row.saturating_sub(1)));
+                }
+                if nearest
+                    .as_ref()
+                    .is_some_and(|(_, row)| point.1.abs_diff(end_row) < point.1.abs_diff(*row))
+                {
+                    nearest = Some((boundary, end_row));
+                }
+            }
+        }
+        nearest.map(|(before, row)| (before.map(str::to_owned), row.saturating_sub(1)))
+    }
+
+    fn workspace_drop_target_for(
+        &self,
+        source_workspace_id: &str,
+        point: (u16, u16),
+    ) -> Option<(Option<String>, u16)> {
+        let source = self
+            .snapshot
+            .as_deref()?
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == source_workspace_id)?;
+        if source
+            .worktree
+            .as_ref()
+            .is_some_and(|worktree| worktree.is_linked_worktree)
+        {
+            self.linked_worktree_drop_target_at(source_workspace_id, point)
+        } else {
+            self.workspace_drop_target_at(point)
+        }
+    }
+
     fn workspace_drop_target_at(&self, point: (u16, u16)) -> Option<(Option<String>, u16)> {
         if self.hits.workspace_body.height == 0
             || point.1 < self.hits.workspace_body.y.saturating_sub(1)
@@ -573,12 +698,63 @@ impl ClientShellState {
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == source_workspace_id)?;
-        if source
+        if let Some(worktree) = source
             .worktree
             .as_ref()
-            .is_some_and(|worktree| worktree.is_linked_worktree)
+            .filter(|worktree| worktree.is_linked_worktree)
         {
-            return None;
+            if self
+                .collapsed_groups_for_endpoint(&self.active_endpoint_id)
+                .is_some_and(|groups| groups.contains(&worktree.key))
+                || !snapshot.workspaces.iter().any(|workspace| {
+                    workspace.worktree.as_ref().is_some_and(|candidate| {
+                        candidate.key == worktree.key && !candidate.is_linked_worktree
+                    })
+                })
+            {
+                return None;
+            }
+            let is_sibling = |workspace: &ClientShellWorkspace| {
+                workspace.worktree.as_ref().is_some_and(|candidate| {
+                    candidate.key == worktree.key && candidate.is_linked_worktree
+                })
+            };
+            let sibling_count = snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| is_sibling(workspace))
+                .count();
+            let source_position = snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| is_sibling(workspace))
+                .position(|workspace| workspace.workspace_id == source_workspace_id)?;
+            let last_index = snapshot.workspaces.iter().rposition(&is_sibling)?;
+            let boundary = snapshot
+                .workspaces
+                .get(last_index + 1)
+                .map(|workspace| workspace.workspace_id.as_str());
+            let insert_position = match before_workspace_id {
+                Some(target) if Some(target) == boundary => sibling_count - 1,
+                Some(target) => snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| {
+                        is_sibling(workspace) && workspace.workspace_id != source_workspace_id
+                    })
+                    .position(|workspace| workspace.workspace_id == target)?,
+                None if boundary.is_none() => sibling_count - 1,
+                _ => return None,
+            };
+            if source_position == insert_position {
+                return None;
+            }
+            return Some(crate::api::schema::Method::WorkspaceMoveBlock(
+                crate::api::schema::WorkspaceMoveBlockParams {
+                    workspace_ids: vec![source.workspace_id.clone()],
+                    before_workspace_id: before_workspace_id.map(str::to_owned),
+                },
+            ));
         }
         if before_workspace_id == Some(source_workspace_id) {
             return None;
@@ -1174,8 +1350,11 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
-                Some(ClientChromeDrag::Workspace { .. }) => {
-                    let target = self.workspace_drop_target_at(point);
+                Some(ClientChromeDrag::Workspace {
+                    source_workspace_id,
+                    ..
+                }) => {
+                    let target = self.workspace_drop_target_for(source_workspace_id, point);
                     if let Some(ClientChromeDrag::Workspace {
                         target: current, ..
                     }) = self.chrome_drag.as_mut()
@@ -1196,10 +1375,20 @@ impl ClientShellState {
                     let source_workspace_id = press.workspace_id.clone();
                     let draggable = self.endpoint_workspace_is_draggable(press);
                     if draggable {
-                        if let Some(target) = self.workspace_drop_target_at(point) {
+                        let target = self.workspace_drop_target_for(&source_workspace_id, point);
+                        let linked_child = self.snapshot.as_deref().is_some_and(|snapshot| {
+                            snapshot.workspaces.iter().any(|workspace| {
+                                workspace.workspace_id == source_workspace_id
+                                    && workspace
+                                        .worktree
+                                        .as_ref()
+                                        .is_some_and(|worktree| worktree.is_linked_worktree)
+                            })
+                        });
+                        if target.is_some() || linked_child {
                             self.chrome_drag = Some(ClientChromeDrag::Workspace {
                                 source_workspace_id,
-                                target: Some(target),
+                                target,
                             });
                             outcome.repaint = true;
                         }
@@ -1265,9 +1454,11 @@ impl ClientShellState {
                     }
                     ClientChromeDrag::Workspace {
                         source_workspace_id,
-                        target,
+                        ..
                     } => {
-                        if let Some((before_workspace_id, _)) = target {
+                        if let Some((before_workspace_id, _)) =
+                            self.workspace_drop_target_for(&source_workspace_id, point)
+                        {
                             if let Some(method) = self.workspace_move_method(
                                 &source_workspace_id,
                                 before_workspace_id.as_deref(),
@@ -1813,6 +2004,17 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                if let Some(endpoint_id) = self
+                    .hits
+                    .machines
+                    .iter()
+                    .find(|hit| super::contains(hit.rect, point))
+                    .map(|hit| hit.endpoint_id.clone())
+                {
+                    self.open_machine_context_menu(endpoint_id, mouse.column, mouse.row);
+                    outcome.repaint = true;
+                    return;
+                }
                 let tab_id = self
                     .hits
                     .tabs
@@ -1998,6 +2200,20 @@ impl ClientShellState {
                     self.agent_scroll = 0;
                     self.persist_chrome_preferences(outcome);
                     outcome.repaint = true;
+                    return;
+                }
+                if let Some((_, index)) = self
+                    .hits
+                    .herd_tabs
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .copied()
+                {
+                    self.select_herd(index, outcome);
+                    return;
+                }
+                if super::contains(self.hits.add_herd, point) {
+                    self.add_herd(outcome);
                     return;
                 }
                 if self.handle_endpoint_machine_click(point, outcome) {

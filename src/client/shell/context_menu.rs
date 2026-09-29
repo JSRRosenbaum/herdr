@@ -4,8 +4,22 @@ impl ClientContextMenuOverlay {
     pub(super) fn items(&self) -> Vec<ClientContextMenuItem> {
         use ClientContextMenuAction as Action;
 
-        let item = |label, action| ClientContextMenuItem { label, action };
+        let item = |label: &'static str, action| ClientContextMenuItem {
+            label: label.into(),
+            action,
+        };
         match &self.target {
+            ClientContextMenuTarget::Machine {
+                herd_count,
+                current_herd,
+                ..
+            } => (0..*herd_count)
+                .filter(|index| index != current_herd)
+                .map(|index| ClientContextMenuItem {
+                    label: format!("Move to herd {index}").into(),
+                    action: Action::MoveToHerd(index),
+                })
+                .collect(),
             ClientContextMenuTarget::Workspace { is_git: false, .. } => {
                 vec![item("Rename", Action::Rename), item("Close", Action::Close)]
             }
@@ -80,6 +94,32 @@ impl ClientContextMenuOverlay {
 }
 
 impl ClientShellState {
+    pub(super) fn open_machine_context_menu(
+        &mut self,
+        endpoint_id: ClientEndpointId,
+        x: u16,
+        y: u16,
+    ) {
+        if self.herd_count < 2
+            || !self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.endpoint_id == endpoint_id)
+        {
+            return;
+        }
+        self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+            target: ClientContextMenuTarget::Machine {
+                current_herd: self.herd_for(&endpoint_id),
+                endpoint_id,
+                herd_count: self.herd_count,
+            },
+            x,
+            y,
+            highlighted: 0,
+        }));
+    }
+
     pub(super) fn open_workspace_context_menu(&mut self, workspace_id: String, x: u16, y: u16) {
         let Some(snapshot) = self.snapshot.as_deref() else {
             return;
@@ -192,6 +232,11 @@ impl ClientShellState {
             return;
         };
         match menu.target {
+            ClientContextMenuTarget::Machine { endpoint_id, .. } => {
+                if let ClientContextMenuAction::MoveToHerd(index) = action {
+                    self.move_machine_to_herd(&endpoint_id, index, outcome);
+                }
+            }
             ClientContextMenuTarget::Workspace { workspace_id, .. } => {
                 self.activate_workspace_context_action(workspace_id, action, outcome)
             }

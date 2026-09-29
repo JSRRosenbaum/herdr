@@ -596,6 +596,18 @@
           "description": "Focus the currently visible notification target."
         },
         {
+          "key": "keys.previous_herd",
+          "type": "keybinding",
+          "default": "\"prefix+,\"",
+          "description": "Show the previous herd without changing the active pane."
+        },
+        {
+          "key": "keys.next_herd",
+          "type": "keybinding",
+          "default": "\"prefix+.\"",
+          "description": "Show the next herd without changing the active pane."
+        },
+        {
           "key": "keys.previous_workspace",
           "type": "keybinding",
           "default": "unset",
@@ -1077,6 +1089,22 @@
           "type": "integer",
           "default": "0",
           "description": "Blank terminal rows between worktree groups and unrelated top-level Spaces. Worktree parents and their indented children remain packed."
+        },
+        {
+          "key": "ui.sidebar.spaces.worktree_layout",
+          "type": "enum",
+          "default": "\"tree\"",
+          "description": "Worktree presentation in the expanded sidebar. tree keeps the upstream deep-indented two-line layout. compact shallows the child connectors and collapses the default Space rows to a single line with a workspace - branch separator, only when rows is not set explicitly.",
+          "values": [
+            "tree",
+            "compact"
+          ]
+        },
+        {
+          "key": "ui.sidebar.spaces.show_workspace_ids",
+          "type": "boolean",
+          "default": "false",
+          "description": "Right-align the stable workspace ID tag (for example wAB) on each expanded Space row, after the group toggle. Off by default; the sidebar layout and hit targets match the upstream layout exactly when off."
         },
         {
           "key": "ui.sidebar.spaces.rows",

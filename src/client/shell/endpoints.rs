@@ -39,6 +39,59 @@ pub(crate) enum ClientEndpointFocusTarget {
 }
 
 impl ClientShellState {
+    pub(super) fn herd_for(&self, endpoint_id: &ClientEndpointId) -> u16 {
+        self.machine_herds.get(endpoint_id).copied().unwrap_or(0)
+    }
+
+    pub(super) fn select_herd(&mut self, index: u16, outcome: &mut ClientShellInput) {
+        if index >= self.herd_count || index == self.selected_herd {
+            return;
+        }
+        self.selected_herd = index;
+        self.workspace_scroll = 0;
+        self.agent_scroll = 0;
+        self.reveal_focused_workspace = false;
+        self.reveal_navigation_workspace = false;
+        self.hits = ShellHitMap::default();
+        outcome.repaint = true;
+        self.persist_chrome_preferences(outcome);
+    }
+
+    pub(super) fn add_herd(&mut self, outcome: &mut ClientShellInput) {
+        let Some(count) = self.herd_count.checked_add(1) else {
+            return;
+        };
+        self.herd_count = count;
+        self.select_herd(count - 1, outcome);
+    }
+
+    pub(super) fn move_machine_to_herd(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        index: u16,
+        outcome: &mut ClientShellInput,
+    ) {
+        if index >= self.herd_count
+            || self.herd_for(endpoint_id) == index
+            || !self
+                .endpoints
+                .iter()
+                .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        {
+            return;
+        }
+        if index == 0 {
+            self.machine_herds.remove(endpoint_id);
+        } else {
+            self.machine_herds.insert(endpoint_id.clone(), index);
+        }
+        self.workspace_scroll = 0;
+        self.agent_scroll = 0;
+        self.hits = ShellHitMap::default();
+        outcome.repaint = true;
+        self.persist_chrome_preferences(outcome);
+    }
+
     pub(crate) fn set_endpoint_catalog(&mut self, profiles: &[SavedSshEndpoint]) {
         let mut next = Vec::with_capacity(profiles.len().saturating_add(1));
         let local = self
@@ -97,11 +150,20 @@ impl ClientShellState {
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
         self.endpoints = next;
+        self.machine_herds.retain(|endpoint_id, _| {
+            self.endpoints
+                .iter()
+                .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        });
     }
 
     pub(crate) fn select_unavailable_local(&mut self) {
         self.reset_endpoint_projection();
         self.active_endpoint_id = ClientEndpointId::Local;
+        let local_herd = self.herd_for(&ClientEndpointId::Local);
+        if local_herd != self.selected_herd {
+            self.select_herd(local_herd, &mut ClientShellInput::default());
+        }
         self.mode = ClientShellMode::Terminal;
         self.snapshot = None;
         self.graphics.set_scope("local:unavailable");
@@ -227,6 +289,11 @@ impl ClientShellState {
             return false;
         };
         let generation = endpoint.snapshot_generation;
+        let herd = self.herd_for(endpoint_id);
+        if herd != self.selected_herd {
+            let mut outcome = ClientShellInput::default();
+            self.select_herd(herd, &mut outcome);
+        }
         let switching_endpoint = endpoint_id != &self.active_endpoint_id;
         let agent_scroll = self.agent_scroll;
         if switching_endpoint {

@@ -19,6 +19,21 @@ impl ClientShellState {
                 outcome.resize = true;
                 self.persist_chrome_preferences(outcome);
             }
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::PreviousHerd) => {
+                let previous = self
+                    .selected_herd
+                    .checked_sub(1)
+                    .unwrap_or(self.herd_count - 1);
+                self.select_herd(previous, outcome);
+            }
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::NextHerd) => {
+                let next = if self.selected_herd + 1 == self.herd_count {
+                    0
+                } else {
+                    self.selected_herd + 1
+                };
+                self.select_herd(next, outcome);
+            }
             crate::input::KeybindMatch::Action(action) => {
                 if self.workspace_preview_action_blocked()
                     && matches!(

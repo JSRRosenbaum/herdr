@@ -35,6 +35,15 @@ impl ClientShellState {
         } else {
             Rect::new(0, 1, cols, rows.saturating_sub(2))
         };
+        let sidebar_content = render::render_herd_header(
+            &mut buffer,
+            sidebar,
+            &self.config,
+            self.selected_herd,
+            self.herd_count,
+            self.sidebar_collapsed && layout.sidebar.width > 0,
+            &mut self.hits,
+        );
         let valid_navigation_target = self.mode == ClientShellMode::Navigate
             && self
                 .navigate_workspace_id
@@ -49,7 +58,7 @@ impl ClientShellState {
         // A resize invalidates pane geometry, not the healthy Local workspace chrome.
         let local_snapshot = self.snapshot.as_deref().filter(|_| {
             self.endpoints.len() == 1
-                && !self.sidebar_collapsed
+                && self.herd_count == 1
                 && layout.sidebar.width > 0
                 && self.endpoint_status(&self.active_endpoint_id)
                     == Some(ClientEndpointStatus::Online)
@@ -61,12 +70,15 @@ impl ClientShellState {
             collapsed_endpoints: &self.collapsed_endpoints,
             collapsed_groups: &self.collapsed_groups,
             remote_collapsed_groups: &self.remote_collapsed_groups,
+            herd_count: self.herd_count,
+            selected_herd: self.selected_herd,
+            machine_herds: &self.machine_herds,
             workspace_scroll: &mut self.workspace_scroll,
             agent_scroll: &mut self.agent_scroll,
             tab_scroll: &mut self.tab_scroll,
             reveal_focused_workspace: &mut self.reveal_focused_workspace,
             reveal_focused_tab: &mut self.reveal_focused_tab,
-            sidebar_collapsed: false,
+            sidebar_collapsed: self.sidebar_collapsed,
             sidebar_section_split: self.sidebar_section_split,
             tab_drag_insert_index: None,
             selected_workspace_id: self
@@ -79,10 +91,31 @@ impl ClientShellState {
             workspace_drop_indicator_row: None,
         };
         if let Some(snapshot) = local_snapshot {
-            render::render_sidebar(
+            if self.sidebar_collapsed {
+                render::render_collapsed_sidebar(
+                    &mut buffer,
+                    sidebar_content,
+                    snapshot,
+                    &self.config,
+                    render_state
+                        .selected_workspace_id
+                        .map(|target| target.workspace_id.as_str()),
+                    &mut self.hits,
+                );
+            } else {
+                render::render_sidebar(
+                    &mut buffer,
+                    sidebar_content,
+                    snapshot,
+                    &self.config,
+                    &mut render_state,
+                    &mut self.hits,
+                );
+            }
+        } else if self.sidebar_collapsed && layout.sidebar.width > 0 {
+            super::endpoint_sidebar::render_collapsed(
                 &mut buffer,
-                sidebar,
-                snapshot,
+                sidebar_content,
                 &self.config,
                 &mut render_state,
                 &mut self.hits,
@@ -90,7 +123,7 @@ impl ClientShellState {
         } else {
             super::endpoint_sidebar::render_expanded(
                 &mut buffer,
-                sidebar,
+                sidebar_content,
                 self.snapshot.as_deref(),
                 &self.config,
                 &mut render_state,
@@ -217,6 +250,9 @@ impl ClientShellState {
                 collapsed_endpoints: &self.collapsed_endpoints,
                 collapsed_groups: &self.collapsed_groups,
                 remote_collapsed_groups: &self.remote_collapsed_groups,
+                herd_count: self.herd_count,
+                selected_herd: self.selected_herd,
+                machine_herds: &self.machine_herds,
                 workspace_scroll: &mut self.workspace_scroll,
                 agent_scroll: &mut self.agent_scroll,
                 tab_scroll: &mut self.tab_scroll,

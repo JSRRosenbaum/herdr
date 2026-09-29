@@ -486,7 +486,7 @@ fn live_catalog_active_removal_does_not_retain_remote_projection_or_input() {
 }
 
 #[test]
-fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
+fn machine_collapse_does_not_require_a_local_snapshot_or_surface() {
     for (cols, rows) in [(100, 28), (36, 18)] {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         let profile = remote_profile();
@@ -533,9 +533,8 @@ fn machine_navigation_does_not_require_a_local_snapshot_or_surface() {
             },
             &mut outcome,
         );
-        assert!(
-            matches!(outcome.actions.as_slice(), [ClientShellAction::ActivateEndpoint { endpoint_id, .. }] if endpoint_id == &remote)
-        );
+        assert!(outcome.actions.is_empty());
+        assert!(state.collapsed_endpoints.contains(&remote));
         assert!(
             state.snapshot.is_none(),
             "selection is committed only by coherent activation"
@@ -560,47 +559,285 @@ fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
     assert!(text.contains("Local"));
     assert!(text.contains("Build"));
     assert!(text.contains("remote-workspace"));
-    let local = state
-        .hits
-        .machines
-        .iter()
-        .find(|hit| hit.endpoint_id.is_local())
-        .expect("local machine row")
-        .rect;
     let remote = state
         .hits
         .machines
         .iter()
         .find(|hit| !hit.endpoint_id.is_local())
-        .expect("remote machine row")
-        .rect;
+        .expect("remote machine row");
     let buffer = frame.to_ratatui_buffer().expect("frame should reconstruct");
-    assert_ne!(buffer[(local.right() - 1, local.y)].symbol(), "●");
-    assert_eq!(buffer[(remote.right() - 1, remote.y)].symbol(), "●");
+    assert!(text.contains("┤ Build ├"), "frame: {text}");
+    assert!(!text.contains("▾ Build"), "frame: {text}");
+    assert!(!text.contains("▸ Build"), "frame: {text}");
+    assert_eq!(remote.status_badge, remote.rect);
+    let left_cap = (remote.rect.x..remote.rect.right())
+        .find(|x| buffer[(*x, remote.rect.y)].symbol() == "┤")
+        .expect("left machine rail cap");
+    let right_cap = (remote.rect.x..remote.rect.right())
+        .find(|x| buffer[(*x, remote.rect.y)].symbol() == "├")
+        .expect("right machine rail cap");
     assert_eq!(
-        buffer[(remote.right() - 1, remote.y)].fg,
+        left_cap.saturating_sub(remote.rect.x),
+        remote
+            .rect
+            .right()
+            .saturating_sub(right_cap.saturating_add(1))
+    );
+    let left_rail_width = (remote.rect.x..left_cap)
+        .filter(|x| buffer[(*x, remote.rect.y)].symbol() == "─")
+        .count() as u16;
+    let right_rail_width = (right_cap.saturating_add(1)..remote.rect.right())
+        .filter(|x| buffer[(*x, remote.rect.y)].symbol() == "─")
+        .count() as u16;
+    let full_rail_width = remote.rect.width.saturating_sub(9) / 2;
+    assert_eq!(left_rail_width, full_rail_width.saturating_mul(4) / 5);
+    assert_eq!(right_rail_width, full_rail_width.saturating_mul(4) / 5);
+    assert_eq!(
+        buffer[(left_cap, remote.rect.y)].fg,
+        state.config.palette.green
+    );
+    assert_eq!(
+        buffer[(right_cap, remote.rect.y)].fg,
         state.config.palette.green
     );
 
     state.sidebar_collapsed = true;
     let frame = state.compose(100, 28).expect("collapsed endpoint frame");
-    let local = state
-        .hits
-        .machines
-        .iter()
-        .find(|hit| hit.endpoint_id.is_local())
-        .expect("collapsed local machine row")
-        .rect;
     let remote = state
         .hits
         .machines
         .iter()
         .find(|hit| !hit.endpoint_id.is_local())
-        .expect("collapsed remote machine row")
-        .rect;
+        .expect("collapsed remote machine row");
     let buffer = frame.to_ratatui_buffer().expect("frame should reconstruct");
-    assert_ne!(buffer[(local.right() - 1, local.y)].symbol(), "●");
-    assert_eq!(buffer[(remote.right() - 1, remote.y)].symbol(), "●");
+    let row = (remote.rect.x..remote.rect.right())
+        .map(|x| buffer[(x, remote.rect.y)].symbol())
+        .collect::<String>();
+    assert!(!row.contains('▾'));
+    assert!(!row.contains('▸'));
+    assert_eq!(
+        buffer[(remote.status_badge.x, remote.status_badge.y)].symbol(),
+        "●"
+    );
+}
+
+#[test]
+fn expanded_sidebar_separates_adjacent_machine_labels() {
+    let (mut state, remote_id) = state_with_remote();
+    let frame = state.compose(100, 28).expect("machine workspace frame");
+    let local = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id.is_local())
+        .expect("local machine")
+        .rect;
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    let last_local_workspace = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.endpoint_id.is_local())
+        .map(|hit| hit.rect.bottom())
+        .max()
+        .expect("local workspace");
+    assert_eq!(remote.y, last_local_workspace.saturating_add(1));
+    let buffer = frame.to_ratatui_buffer().expect("workspace frame buffer");
+    let separator_width = local.width / 3;
+    let separator_x = local
+        .x
+        .saturating_add(local.width.saturating_sub(separator_width) / 2);
+    assert!(
+        (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
+            buffer[(x, remote.y.saturating_sub(1))].symbol() == "─"
+                && buffer[(x, remote.y.saturating_sub(1))].fg == state.config.palette.surface_dim
+        })
+    );
+
+    state.collapsed_endpoints.insert(ClientEndpointId::Local);
+    state.collapsed_endpoints.insert(remote_id.clone());
+
+    let frame = state
+        .compose(100, 28)
+        .expect("adjacent collapsed machine frame");
+    let local = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id.is_local())
+        .expect("local machine")
+        .rect;
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    assert_eq!(remote.y, local.y.saturating_add(2));
+    let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+    let separator_width = local.width / 3;
+    let separator_x = local
+        .x
+        .saturating_add(local.width.saturating_sub(separator_width) / 2);
+    for x in separator_x..separator_x.saturating_add(separator_width) {
+        assert_eq!(buffer[(x, local.y.saturating_add(1))].symbol(), "─");
+        assert_eq!(
+            buffer[(x, local.y.saturating_add(1))].fg,
+            state.config.palette.surface_dim
+        );
+    }
+    assert_ne!(
+        buffer[(separator_x.saturating_sub(1), local.y.saturating_add(1))].symbol(),
+        "─"
+    );
+
+    state.collapsed_endpoints.clear();
+    for endpoint in &mut state.endpoints {
+        endpoint
+            .snapshot
+            .as_mut()
+            .expect("machine snapshot")
+            .workspaces
+            .clear();
+    }
+    let frame = state
+        .compose(100, 28)
+        .expect("adjacent empty machine frame");
+    let local = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id.is_local())
+        .expect("local machine")
+        .rect;
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    assert_eq!(remote.y, local.y.saturating_add(2));
+    let buffer = frame
+        .to_ratatui_buffer()
+        .expect("empty machine frame buffer");
+    let separator_width = local.width / 3;
+    let separator_x = local
+        .x
+        .saturating_add(local.width.saturating_sub(separator_width) / 2);
+    assert!(
+        (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
+            buffer[(x, local.y.saturating_add(1))].symbol() == "─"
+                && buffer[(x, local.y.saturating_add(1))].fg == state.config.palette.surface_dim
+        })
+    );
+}
+
+#[test]
+fn expanded_sidebar_ends_machine_workspace_lists_with_a_separator() {
+    let (mut state, remote_id) = state_with_remote();
+    let mut other_profile = remote_profile();
+    other_profile.id = ProfileId::parse("1123456789abcdef0123456789abcdef").unwrap();
+    let other_id = ClientEndpointId::Ssh(other_profile.id.clone());
+    state.set_endpoint_catalog(&[remote_profile(), other_profile]);
+    state.set_endpoint_status(&other_id, ClientEndpointStatus::Online);
+    state.set_endpoint_snapshot(&other_id, Box::new(snapshot()));
+
+    let frame = state.compose(100, 28).expect("machine workspace frame");
+    let remote = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id)
+        .expect("remote machine")
+        .rect;
+    let other = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == other_id)
+        .expect("following machine")
+        .rect;
+    let last_remote_workspace = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.endpoint_id == remote_id)
+        .map(|hit| hit.rect.bottom())
+        .max()
+        .expect("remote workspace");
+    assert_eq!(other.y, last_remote_workspace.saturating_add(1));
+    let buffer = frame.to_ratatui_buffer().expect("machine workspace buffer");
+    let separator_width = remote.width / 3;
+    let separator_x = remote
+        .x
+        .saturating_add(remote.width.saturating_sub(separator_width) / 2);
+    assert!(
+        (separator_x..separator_x.saturating_add(separator_width)).all(|x| {
+            buffer[(x, other.y.saturating_sub(1))].symbol() == "─"
+                && buffer[(x, other.y.saturating_sub(1))].fg == state.config.palette.surface_dim
+        })
+    );
+}
+
+#[test]
+fn remote_compact_worktree_group_separator_stays_inside_its_machine() {
+    let (mut state, remote_id) = state_with_remote();
+    state.config.spaces.worktree_layout = crate::config::WorktreeLayout::Compact;
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    remote.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "remote-repo".into(),
+        label: "remote-repo".into(),
+        is_linked_worktree: false,
+    });
+    let mut child = remote.workspaces[0].clone();
+    child.workspace_id = "remote-child".into();
+    child.active_tab_id = "tab_remote-child".into();
+    child.number = 2;
+    child.focused = false;
+    child.worktree = Some(ClientShellWorktree {
+        key: "remote-repo".into(),
+        label: "remote-repo".into(),
+        is_linked_worktree: true,
+    });
+    let mut next = child.clone();
+    next.workspace_id = "remote-next".into();
+    next.active_tab_id = "tab_remote-next".into();
+    next.number = 3;
+    next.label = "another-repo".into();
+    next.worktree = None;
+    remote.workspaces.extend([child, next]);
+    state.set_endpoint_snapshot(&remote_id, Box::new(remote));
+
+    let frame = state
+        .compose(100, 40)
+        .expect("remote grouped workspace frame");
+    let workspaces = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.endpoint_id == remote_id)
+        .map(|hit| hit.rect)
+        .collect::<Vec<_>>();
+    assert_eq!(workspaces.len(), 3);
+    assert_eq!(workspaces[1].y, workspaces[0].bottom());
+    assert_eq!(workspaces[2].y, workspaces[1].bottom() + 1);
+    let buffer = frame.to_ratatui_buffer().expect("remote workspace buffer");
+    for x in workspaces[1].x + 1..workspaces[1].right() - 1 {
+        assert_eq!(buffer[(x, workspaces[1].bottom())].symbol(), "─");
+        assert_eq!(
+            buffer[(x, workspaces[1].bottom())].fg,
+            state.config.palette.surface_dim
+        );
+    }
 }
 
 #[test]
@@ -698,41 +935,6 @@ fn saved_machine_preserves_endpoint_scoped_worktree_collapses() {
                     if target.workspace_id == "remote_ws_2"
             )
     ));
-    let remote_parent = state
-        .hits
-        .workspaces
-        .iter()
-        .find(|hit| hit.endpoint_id == remote_id && hit.workspace_id == "remote_ws_1")
-        .expect("visible remote worktree parent")
-        .rect;
-    let remote_child = state
-        .hits
-        .workspaces
-        .iter()
-        .find(|hit| hit.endpoint_id == remote_id && hit.workspace_id == "remote_ws_2")
-        .expect("visible remote worktree child")
-        .rect;
-    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: remote_parent.x + 3,
-        row: remote_parent.y,
-        modifiers: KeyModifiers::empty(),
-    })]);
-    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-        kind: MouseEventKind::Drag(MouseButton::Left),
-        column: remote_child.x + 3,
-        row: remote_child.bottom(),
-        modifiers: KeyModifiers::empty(),
-    })]);
-    assert!(matches!(
-        state.chrome_drag,
-        Some(ClientChromeDrag::Workspace {
-            target: Some(_),
-            ..
-        })
-    ));
-    state.chrome_drag = None;
-    state.workspace_press = None;
 
     let remote_toggle = state
         .hits
@@ -915,7 +1117,7 @@ fn expanded_machine_sidebar_applies_space_row_gap_within_each_machine() {
         .find(|hit| hit.endpoint_id == remote_id)
         .expect("remote machine");
     assert_eq!(local_workspaces[0].rect.y, local_machine.rect.bottom());
-    assert_eq!(remote_machine.rect.y, local_workspaces[1].rect.bottom());
+    assert_eq!(remote_machine.rect.y, local_workspaces[1].rect.bottom() + 1);
 
     let remote_workspaces = state
         .hits
@@ -1582,84 +1784,40 @@ fn unselected_endpoint_completion_projects_done_client_side() {
 }
 
 #[test]
-fn clicking_remote_machine_name_requests_activation_without_mutating_projection() {
-    let (mut state, endpoint_id) = state_with_remote();
-    state.compose(100, 28).expect("combined endpoint frame");
-    let hit = state
+fn clicking_local_workspace_can_cancel_a_remote_switch_while_local_is_displayed() {
+    let (mut state, remote) = state_with_remote();
+    state.compose(100, 28).unwrap();
+    let mut pending = ClientShellInput::default();
+    assert!(state.activate_endpoint(remote, &mut pending));
+    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    let rect = state
         .hits
-        .machines
+        .workspaces
         .iter()
-        .find(|hit| hit.endpoint_id == endpoint_id)
-        .expect("remote endpoint hit")
+        .find(|hit| hit.endpoint_id.is_local())
+        .unwrap()
         .rect;
-    let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: hit.x + 3,
-        row: hit.y,
-        modifiers: KeyModifiers::empty(),
-    })]);
+    let outcome = state.handle_raw_events(vec![
+        RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 5,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+        RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: rect.x + 5,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        }),
+    ]);
     assert!(matches!(
         outcome.actions.as_slice(),
         [ClientShellAction::ActivateEndpoint {
-            endpoint_id: activated,
-            target: None,
-        }] if activated == &endpoint_id
+            endpoint_id: ClientEndpointId::Local,
+            target: Some(_),
+        }]
     ));
-    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
-    assert_eq!(
-        state
-            .snapshot
-            .as_deref()
-            .map(|snapshot| snapshot.boot_id.as_str()),
-        Some("boot-1")
-    );
-}
-
-#[test]
-fn clicking_local_can_cancel_a_remote_switch_while_local_is_still_displayed() {
-    for workspace in [false, true] {
-        let (mut state, remote) = state_with_remote();
-        state.compose(100, 28).unwrap();
-        let mut pending = ClientShellInput::default();
-        assert!(state.activate_endpoint(remote, &mut pending));
-        assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
-        let rect = if workspace {
-            state
-                .hits
-                .workspaces
-                .iter()
-                .find(|hit| hit.endpoint_id.is_local())
-                .unwrap()
-                .rect
-        } else {
-            state
-                .hits
-                .machines
-                .iter()
-                .find(|hit| hit.endpoint_id.is_local())
-                .unwrap()
-                .rect
-        };
-        let outcome = state.handle_raw_events(vec![
-            RawInputEvent::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: rect.x + 5,
-                row: rect.y,
-                modifiers: KeyModifiers::empty(),
-            }),
-            RawInputEvent::Mouse(MouseEvent {
-                kind: MouseEventKind::Up(MouseButton::Left),
-                column: rect.x + 5,
-                row: rect.y,
-                modifiers: KeyModifiers::empty(),
-            }),
-        ]);
-        assert!(
-            matches!(outcome.actions.as_slice(), [ClientShellAction::ActivateEndpoint {
-            endpoint_id: ClientEndpointId::Local, target,
-        }] if target.is_some() == workspace)
-        );
-    }
 }
 
 #[test]
@@ -1681,7 +1839,7 @@ fn reconnecting_local_selection_still_reaches_the_runtime() {
 }
 
 #[test]
-fn machine_arrow_toggles_inactive_machine_without_switching() {
+fn machine_label_toggles_inactive_machine_without_switching() {
     for sidebar_collapsed in [false, true] {
         for status in [
             ClientEndpointStatus::Online,
@@ -1704,18 +1862,33 @@ fn machine_arrow_toggles_inactive_machine_without_switching() {
                     .machines
                     .iter()
                     .find(|hit| hit.endpoint_id == remote_id)
-                    .expect("remote machine")
-                    .rect;
-                let column = machine.x + u16::from(!sidebar_collapsed);
+                    .expect("remote machine");
+                let column = machine
+                    .collapse_toggle
+                    .x
+                    .saturating_add(machine.collapse_toggle.width / 2);
                 let buffer = frame.to_ratatui_buffer().expect("frame buffer");
-                assert_eq!(
-                    buffer[(column, machine.y)].symbol(),
-                    if collapsed { "▾" } else { "▸" }
-                );
+                let header = (machine.rect.x..machine.rect.right())
+                    .map(|x| buffer[(x, machine.rect.y)].symbol())
+                    .collect::<String>();
+                assert!(!header.contains('▾'));
+                assert!(!header.contains('▸'));
+                if !sidebar_collapsed {
+                    assert!(header.contains("┤ Build ├"), "header: {header}");
+                    let expected_color = if status == ClientEndpointStatus::Online {
+                        state.config.palette.green
+                    } else {
+                        state.config.palette.yellow
+                    };
+                    assert!((machine.rect.x..machine.rect.right()).any(|x| {
+                        buffer[(x, machine.rect.y)].symbol() == "─"
+                            && buffer[(x, machine.rect.y)].fg == expected_color
+                    }));
+                }
                 let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column,
-                    row: machine.y,
+                    row: machine.rect.y,
                     modifiers: KeyModifiers::empty(),
                 })]);
                 assert!(
@@ -1990,7 +2163,7 @@ fn disconnected_active_endpoint_freezes_surface_and_marks_cached_ui_stale() {
         state.endpoint_status(&endpoint_id),
         Some(ClientEndpointStatus::Reconnecting)
     );
-    assert!(text.contains("◐ reconnecting"), "frame: {text}");
+    assert!(text.contains("Build · reconnecting"), "frame: {text}");
     assert!(text.contains("Build · remote agent"), "frame: {text}");
     assert!(
         text.contains("LIVE"),
@@ -2589,5 +2762,386 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
             endpoint_id: activated,
             target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
         }] if activated == &endpoint_id && workspace_id == "ws_1"
+    ));
+}
+
+#[test]
+fn herd_pages_filter_both_sidebar_panels_and_keep_hidden_main_endpoint() {
+    let (mut state, remote) = state_with_remote();
+    for id in [ClientEndpointId::Local, remote.clone()] {
+        let mut projection = state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == id)
+            .unwrap()
+            .snapshot
+            .clone()
+            .unwrap();
+        projection.agents = vec![agent("herd agent", AgentStatus::Idle, 1)];
+        state.set_endpoint_snapshot(&id, projection);
+    }
+    let mut outcome = ClientShellInput::default();
+    state.add_herd(&mut outcome);
+    assert!(outcome.repaint);
+    assert_eq!(state.selected_herd, 1);
+    assert_eq!(state.herd_count, 2);
+    state.move_machine_to_herd(&remote, 1, &mut ClientShellInput::default());
+    assert!(state.activate_endpoint_projection(&remote));
+    state.set_pane_surface(PaneSurfaceFrame {
+        boot_id: "remote-boot".into(),
+        ..surface()
+    });
+
+    for collapsed in [false, true] {
+        state.sidebar_collapsed = collapsed;
+        state.compose(100, 32).expect("herd sidebar");
+        assert_eq!(state.hits.machines.len(), 1);
+        assert_eq!(state.hits.machines[0].endpoint_id, remote);
+        assert!(state
+            .hits
+            .workspaces
+            .iter()
+            .all(|hit| hit.endpoint_id == remote));
+        assert!(state
+            .hits
+            .endpoint_agents
+            .iter()
+            .all(|(_, id, _)| id == &remote));
+        assert!(!state.hits.endpoint_agents.is_empty());
+        assert_eq!(state.hits.herd_tabs.len(), 2);
+        assert!(!state.hits.add_herd.is_empty());
+
+        state.workspace_scroll = 4;
+        state.agent_scroll = 4;
+        state.select_herd(0, &mut ClientShellInput::default());
+        assert_eq!((state.workspace_scroll, state.agent_scroll), (0, 0));
+        assert!(
+            state.hits.machines.is_empty(),
+            "old page hits disappear immediately"
+        );
+        state.compose(100, 32).expect("local herd sidebar");
+        assert_eq!(
+            state.active_endpoint_id, remote,
+            "main endpoint remains active"
+        );
+        assert_eq!(state.hits.machines.len(), 1);
+        assert_eq!(state.hits.machines[0].endpoint_id, ClientEndpointId::Local);
+        assert!(state
+            .hits
+            .workspaces
+            .iter()
+            .all(|hit| hit.endpoint_id.is_local()));
+        assert!(state
+            .hits
+            .endpoint_agents
+            .iter()
+            .all(|(_, id, _)| id.is_local()));
+        assert!(!state.hits.endpoint_agents.is_empty());
+
+        assert!(state.activate_endpoint_projection(&remote));
+        assert_eq!(
+            state.selected_herd, 1,
+            "endpoint activation follows its herd"
+        );
+        state.set_pane_surface(PaneSurfaceFrame {
+            boot_id: "remote-boot".into(),
+            ..surface()
+        });
+    }
+}
+
+#[test]
+fn herd_assignment_persists_by_profile_id_across_renames_and_old_preferences() {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-herd-preferences-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, r#"{"sidebar_width":24}"#).unwrap();
+    let config =
+        ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+    let mut state = ClientShellState::new(config);
+    assert_eq!((state.herd_count, state.selected_herd), (1, 0));
+    let mut profile = remote_profile();
+    let remote = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile.clone()]);
+    state.add_herd(&mut ClientShellInput::default());
+    state.move_machine_to_herd(
+        &ClientEndpointId::Local,
+        1,
+        &mut ClientShellInput::default(),
+    );
+    state.move_machine_to_herd(&remote, 1, &mut ClientShellInput::default());
+    let saved = super::preferences::load(&path).expect("persisted preferences");
+    assert_eq!((saved.herd_count, saved.selected_herd), (2, 1));
+    assert_eq!(saved.machine_herds.len(), 2);
+    assert!(saved
+        .machine_herds
+        .iter()
+        .any(|assignment| { assignment.profile_id.is_none() && assignment.herd == 1 }));
+    assert!(saved.machine_herds.iter().any(|assignment| {
+        assignment.profile_id.as_deref() == Some(profile.id.as_str()) && assignment.herd == 1
+    }));
+
+    profile.label = "Renamed machine".into();
+    let config =
+        ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+    let mut restored = ClientShellState::new(config);
+    restored.set_endpoint_catalog(&[profile]);
+    assert_eq!(restored.herd_for(&remote), 1);
+    assert_eq!(restored.herd_for(&ClientEndpointId::Local), 1);
+    assert_eq!(restored.selected_herd, 1);
+    restored.set_endpoint_catalog(&[]);
+    assert_eq!(
+        restored.herd_for(&remote),
+        0,
+        "removed profiles are discarded"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn machine_menu_moves_entire_machine_and_excludes_current_herd() {
+    let (mut state, remote) = state_with_remote();
+    state.add_herd(&mut ClientShellInput::default());
+    state.add_herd(&mut ClientShellInput::default());
+    state.select_herd(0, &mut ClientShellInput::default());
+    state.open_machine_context_menu(remote.clone(), 3, 4);
+    let actions = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+        _ => panic!("machine context menu"),
+    };
+    assert_eq!(
+        actions
+            .iter()
+            .map(|item| item.label.as_ref())
+            .collect::<Vec<_>>(),
+        ["Move to herd 1", "Move to herd 2"]
+    );
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(1, &mut outcome);
+    assert!(outcome.repaint);
+    assert_eq!(state.herd_for(&remote), 2);
+    assert_eq!(state.selected_herd, 0, "migration does not switch pages");
+    state.compose(100, 28).expect("machine moved off page");
+    assert!(!state
+        .hits
+        .machines
+        .iter()
+        .any(|hit| hit.endpoint_id == remote));
+    assert!(!state
+        .hits
+        .workspaces
+        .iter()
+        .any(|hit| hit.endpoint_id == remote));
+    assert!(!state
+        .hits
+        .endpoint_agents
+        .iter()
+        .any(|(_, id, _)| id == &remote));
+    state.select_herd(2, &mut ClientShellInput::default());
+    state.compose(100, 28).expect("destination herd");
+    assert!(state
+        .hits
+        .machines
+        .iter()
+        .any(|hit| hit.endpoint_id == remote));
+    state.open_machine_context_menu(remote.clone(), 3, 4);
+    let labels = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu
+            .items()
+            .into_iter()
+            .map(|item| item.label.into_owned())
+            .collect::<Vec<_>>(),
+        _ => panic!("machine context menu"),
+    };
+    assert_eq!(labels, ["Move to herd 0", "Move to herd 1"]);
+}
+
+#[test]
+fn first_herd_header_offers_add_button_in_both_sidebar_modes() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    for collapsed in [false, true] {
+        state.sidebar_collapsed = collapsed;
+        let frame = state.compose(100, 28).expect("local sidebar");
+        let header = state.hits.herd_tabs[0].0;
+        let add = state.hits.add_herd;
+        assert_eq!(state.hits.herd_tabs[0].1, 0);
+        assert!(!add.is_empty());
+        let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+        assert_eq!(buffer[(header.x, header.y)].symbol(), "0");
+        assert_eq!(buffer[(add.x, add.y)].symbol(), "+");
+    }
+}
+
+#[test]
+fn herd_tabs_and_machine_menu_route_mouse_input_to_visible_machines() {
+    let (mut state, remote) = state_with_remote();
+    let mouse = |kind, rect: Rect| {
+        RawInputEvent::Mouse(MouseEvent {
+            kind,
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    state.compose(100, 32).expect("initial sidebar");
+    let add = state.hits.add_herd;
+    state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), add)]);
+    assert_eq!((state.herd_count, state.selected_herd), (2, 1));
+
+    state.compose(100, 32).expect("new herd");
+    let first = state.hits.herd_tabs[0].0;
+    state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), first)]);
+    state.compose(100, 32).expect("first herd");
+    let remote_row = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == remote)
+        .expect("remote machine")
+        .rect;
+    state.handle_raw_events(vec![mouse(
+        MouseEventKind::Down(MouseButton::Right),
+        remote_row,
+    )]);
+    state.compose(100, 32).expect("machine menu");
+    assert_eq!(state.hits.context_menu_rows.len(), 1);
+    let menu_row = state.hits.context_menu_rows[0].0;
+    state.handle_raw_events(vec![mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        menu_row,
+    )]);
+    assert_eq!(state.herd_for(&remote), 1);
+    state
+        .compose(100, 32)
+        .expect("machine removed from first herd");
+    assert!(state
+        .hits
+        .machines
+        .iter()
+        .all(|hit| hit.endpoint_id.is_local()));
+
+    let second = state.hits.herd_tabs[1].0;
+    state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), second)]);
+    state.compose(100, 32).expect("destination herd");
+    assert_eq!(state.selected_herd, 1);
+    assert_eq!(state.hits.machines.len(), 1);
+    assert_eq!(state.hits.machines[0].endpoint_id, remote);
+}
+
+#[test]
+fn collapsed_herd_tabs_cycle_through_pages_beyond_visible_slots() {
+    let (mut state, _) = state_with_remote();
+    state.sidebar_collapsed = true;
+    state.add_herd(&mut ClientShellInput::default());
+    state.add_herd(&mut ClientShellInput::default());
+    state.add_herd(&mut ClientShellInput::default());
+    state.select_herd(0, &mut ClientShellInput::default());
+    for (current, next) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+        state.compose(100, 28).expect("collapsed herd tabs");
+        assert_eq!(state.selected_herd, current);
+        assert_eq!(state.hits.herd_tabs[1].1, next);
+        let rect = state.hits.herd_tabs[1].0;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })]);
+        assert_eq!(state.selected_herd, next);
+    }
+}
+
+#[test]
+fn herd_hotkeys_wrap_without_switching_the_active_machine() {
+    let (mut state, remote) = state_with_remote();
+    state.add_herd(&mut ClientShellInput::default());
+    state.add_herd(&mut ClientShellInput::default());
+    state.move_machine_to_herd(&remote, 2, &mut ClientShellInput::default());
+    state.select_herd(0, &mut ClientShellInput::default());
+    assert!(state.activate_endpoint_projection(&remote));
+    state.select_herd(0, &mut ClientShellInput::default());
+
+    let previous = state.handle_input_bytes(b"\x02,");
+    assert_eq!(state.selected_herd, 2);
+    assert_eq!(state.active_endpoint_id, remote);
+    assert!(previous.actions.is_empty());
+
+    let next = state.handle_input_bytes(b"\x02.");
+    assert_eq!(state.selected_herd, 0);
+    assert_eq!(state.active_endpoint_id, remote);
+    assert!(next.actions.is_empty());
+
+    state.handle_input_bytes(b"\x02.");
+    assert_eq!(state.selected_herd, 1);
+}
+
+#[test]
+fn active_remote_worktree_drag_reorders_on_its_own_endpoint() {
+    let (mut state, remote_id) = state_with_remote();
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    let parent = &mut remote.workspaces[0];
+    parent.worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    for (id, number) in [("first", 2), ("second", 3)] {
+        let mut child = remote.workspaces[0].clone();
+        child.workspace_id = id.into();
+        child.number = number;
+        child.focused = false;
+        child.worktree.as_mut().unwrap().is_linked_worktree = true;
+        remote.workspaces.push(child);
+    }
+    state.set_endpoint_snapshot(&remote_id, Box::new(remote));
+    assert!(state.activate_endpoint_projection(&remote_id));
+    state.set_pane_surface(PaneSurfaceFrame {
+        boot_id: "remote-boot".into(),
+        ..surface()
+    });
+    state.compose(100, 32).expect("remote worktrees");
+    let first = state
+        .hits
+        .workspaces
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id && hit.workspace_id == "first")
+        .unwrap()
+        .rect;
+    let second = state
+        .hits
+        .workspaces
+        .iter()
+        .find(|hit| hit.endpoint_id == remote_id && hit.workspace_id == "second")
+        .unwrap()
+        .rect;
+    let event = |kind, rect: Rect| {
+        RawInputEvent::Mouse(MouseEvent {
+            kind,
+            column: rect.x + 2,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    state.handle_raw_events(vec![event(MouseEventKind::Down(MouseButton::Left), second)]);
+    state.handle_raw_events(vec![event(MouseEventKind::Drag(MouseButton::Left), first)]);
+    let dropped =
+        state.handle_raw_events(vec![event(MouseEventKind::Up(MouseButton::Left), first)]);
+    assert!(matches!(
+        dropped.actions.as_slice(),
+        [ClientShellAction::Endpoint { endpoint_id, request, .. }]
+            if endpoint_id == &remote_id && matches!(
+                &request.method,
+                crate::api::schema::Method::WorkspaceMoveBlock(params)
+                    if params.workspace_ids == ["second"]
+                        && params.before_workspace_id.as_deref() == Some("first")
+            )
     ));
 }
