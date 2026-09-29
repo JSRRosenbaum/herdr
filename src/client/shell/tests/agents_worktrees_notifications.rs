@@ -1,26 +1,30 @@
 use super::*;
+use crate::config::WorktreeLayout;
 
 #[test]
+
 fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
     let config = ClientShellConfig::from_config(&Config::default());
     let mut state = ClientShellState::new(config);
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     state.compose(106, 20).expect("composed frame");
+    let workspace_hit = state.hits.workspaces[0].rect;
+    let pane_hit = state.hits.panes[0].inner_rect;
 
     let workspace_down =
         state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 2,
+            column: workspace_hit.x + 2,
+            row: workspace_hit.y,
             modifiers: KeyModifiers::empty(),
         })]);
     assert!(workspace_down.actions.is_empty());
     let workspace =
         state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
-            column: 2,
-            row: 2,
+            column: workspace_hit.x + 2,
+            row: workspace_hit.y,
             modifiers: KeyModifiers::empty(),
         })]);
     assert!(workspace.requests.is_empty());
@@ -35,8 +39,8 @@ fn mouse_hits_use_stable_workspace_tab_and_pane_ids() {
 
     let pane = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: 27,
-        row: 1,
+        column: pane_hit.x + 1,
+        row: pane_hit.y,
         modifiers: KeyModifiers::empty(),
     })]);
     assert!(pane.requests.is_empty());
@@ -91,7 +95,8 @@ fn collapsed_workspace_jitter_remains_a_click() {
 
 #[test]
 fn grouped_worktrees_render_parent_branch_and_indented_child() {
-    let config = ClientShellConfig::from_config(&Config::default());
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.show_workspace_ids = true;
     let mut state = ClientShellState::new(config);
     let mut snapshot = snapshot();
     snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
@@ -100,7 +105,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
         is_linked_worktree: false,
     });
     snapshot.workspaces.push(ClientShellWorkspace {
-        workspace_id: "ws_2".into(),
+        workspace_id: "ws_22".into(),
         active_tab_id: "tab_ws2".into(),
         new_workspace_cwd: "/repo/feature".into(),
         number: 2,
@@ -133,10 +138,33 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
     assert!(text.contains("main"));
     assert!(text.contains("└─"));
     assert!(text.contains("feature"));
+    let child = &state.hits.workspaces[1];
+    let child_status = usize::from(child.rect.y) * usize::from(frame.width)
+        + usize::from(child.rect.x.saturating_add(6));
+    assert_eq!(frame.cells[child_status].symbol, "○");
+    assert!(text.contains("ws_1"));
+    assert!(text.contains("ws_22"));
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent.group_toggle.as_ref().expect("parent group toggle");
+    let row_start = usize::from(parent.rect.y) * usize::from(frame.width);
+    let tag_start = frame.cells[row_start..row_start + usize::from(frame.width)]
+        .windows("ws_1".len())
+        .position(|cells| {
+            cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .eq(["w", "s", "_", "1"])
+        })
+        .expect("workspace tag");
+    assert_eq!(tag_start + "ws_1".len(), usize::from(parent.rect.right()));
+    assert_eq!(
+        toggle.x,
+        parent.rect.right().saturating_sub("ws_22".len() as u16 + 1)
+    );
 
     let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
     replacement.revision = 2;
-    replacement.focused_workspace_id = Some("ws_2".into());
+    replacement.focused_workspace_id = Some("ws_22".into());
     replacement.workspaces[0].focused = false;
     replacement.workspaces[1].focused = true;
     replacement.workspaces[1].agent_status = AgentStatus::Blocked;
@@ -168,6 +196,244 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
                     if target.workspace_id == "ws_1"
             )
     ));
+}
+
+fn compact_grouped_snapshot() -> ClientShellSnapshot {
+    let mut snapshot = snapshot();
+    snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    snapshot.workspaces.push(ClientShellWorkspace {
+        workspace_id: "ws_22".into(),
+        active_tab_id: "tab_ws2".into(),
+        new_workspace_cwd: "/repo/feature".into(),
+        number: 2,
+        label: "repo-feature".into(),
+        custom_label: false,
+        branch: Some("worktree/feature".into()),
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: true,
+        }),
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    });
+    snapshot
+}
+
+#[test]
+fn compact_layout_renders_shallow_connectors_and_inline_branch() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    config.spaces.show_workspace_ids = true;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(compact_grouped_snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 20).expect("composed frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("┬○ client-"));
+    assert!(text.contains("└○ feature"));
+    assert!(!text.contains("└─"));
+    assert!(!text.contains("   ├─ "));
+    assert!(!text.contains("   └─ "));
+    assert!(text.contains("main"));
+    assert!(text.contains("feature"));
+    assert!(text.contains(" - "));
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent
+        .group_toggle
+        .as_ref()
+        .expect("compact parent group toggle");
+    let toggle_index = usize::from(toggle.y) * usize::from(frame.width) + usize::from(toggle.x);
+    assert_eq!(frame.cells[toggle_index].symbol, "┬");
+    let child = &state.hits.workspaces[1];
+    for workspace in [parent, child] {
+        let status_index = usize::from(workspace.rect.y) * usize::from(frame.width)
+            + usize::from(workspace.rect.x.saturating_add(1));
+        assert_eq!(frame.cells[status_index].symbol, "○");
+    }
+    state.collapsed_groups.insert("repo".into());
+    let collapsed_frame = state
+        .compose(106, 20)
+        .expect("collapsed compact worktree group");
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent
+        .group_toggle
+        .as_ref()
+        .expect("collapsed compact parent group toggle");
+    let toggle_index =
+        usize::from(toggle.y) * usize::from(collapsed_frame.width) + usize::from(toggle.x);
+    assert_eq!(collapsed_frame.cells[toggle_index].symbol, "▸");
+    assert_eq!(
+        collapsed_frame.cells[toggle_index.saturating_add(1)].symbol,
+        "○"
+    );
+}
+
+#[test]
+fn compact_worktree_groups_have_a_muted_separator_before_the_next_group() {
+    let mut snapshot = compact_grouped_snapshot();
+    let mut next_parent = snapshot.workspaces[0].clone();
+    next_parent.workspace_id = "ws_3".into();
+    next_parent.active_tab_id = "tab_ws3".into();
+    next_parent.number = 3;
+    next_parent.label = "next-repo".into();
+    next_parent.focused = false;
+    next_parent.worktree = Some(ClientShellWorktree {
+        key: "next".into(),
+        label: "next".into(),
+        is_linked_worktree: false,
+    });
+    let mut next_child = snapshot.workspaces[1].clone();
+    next_child.workspace_id = "ws_4".into();
+    next_child.active_tab_id = "tab_ws4".into();
+    next_child.number = 4;
+    next_child.worktree = Some(ClientShellWorktree {
+        key: "next".into(),
+        label: "next".into(),
+        is_linked_worktree: true,
+    });
+    snapshot.workspaces.extend([next_parent, next_child]);
+
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 32).expect("expanded worktree groups");
+    let parent = state.hits.workspaces[0].rect;
+    let child = state.hits.workspaces[1].rect;
+    let next_parent = state.hits.workspaces[2].rect;
+    let last_child = state.hits.workspaces[3].rect;
+    assert_eq!(child.y, parent.bottom());
+    assert_eq!(next_parent.y, child.bottom() + 1);
+    let buffer = frame.to_ratatui_buffer().expect("group frame");
+    for x in child.x + 1..child.right() - 1 {
+        assert_eq!(buffer[(x, child.bottom())].symbol(), "─");
+        assert_eq!(
+            buffer[(x, child.bottom())].fg,
+            state.config.palette.surface_dim
+        );
+    }
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .all(|hit| { hit.rect.y > child.bottom() || hit.rect.bottom() <= child.bottom() }));
+    assert_ne!(
+        buffer[(last_child.x + 1, last_child.bottom())].symbol(),
+        "─"
+    );
+
+    state.collapsed_groups.insert("repo".into());
+    let frame = state.compose(106, 32).expect("collapsed first group");
+    let first = state.hits.workspaces[0].rect;
+    let next = state.hits.workspaces[1].rect;
+    assert_eq!(next.y, first.bottom() + 1);
+    let buffer = frame.to_ratatui_buffer().expect("collapsed group frame");
+    assert_eq!(buffer[(first.x + 1, first.bottom())].symbol(), "─");
+
+    state.collapsed_groups.clear();
+    state.config.spaces.worktree_layout = WorktreeLayout::Tree;
+    state.compose(106, 32).expect("tree layout frame");
+    assert_eq!(
+        state.hits.workspaces[2].rect.y,
+        state.hits.workspaces[1].rect.bottom()
+    );
+}
+
+#[test]
+fn explicit_rows_keep_configured_rows_in_compact_layout() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    config.spaces.rows_explicit = true;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(compact_grouped_snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 20).expect("composed frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(state.hits.workspaces[0].rect.height, 2);
+    let child = &state.hits.workspaces[1];
+    let child_connector =
+        usize::from(child.rect.y) * usize::from(frame.width) + usize::from(child.rect.x);
+    assert_eq!(frame.cells[child_connector].symbol, "└");
+    assert!(!text.contains(" - "));
+}
+
+#[test]
+fn grouped_worktrees_hide_workspace_id_tags_by_default() {
+    let config = ClientShellConfig::from_config(&Config::default());
+    let mut state = ClientShellState::new(config);
+    let mut snapshot = snapshot();
+    snapshot.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    snapshot.workspaces.push(ClientShellWorkspace {
+        workspace_id: "ws_22".into(),
+        active_tab_id: "tab_ws2".into(),
+        new_workspace_cwd: "/repo/feature".into(),
+        number: 2,
+        label: "repo-feature".into(),
+        custom_label: false,
+        branch: Some("worktree/feature".into()),
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: true,
+        }),
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    });
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 20).expect("composed frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("ws_1"));
+    assert!(!text.contains("ws_22"));
+    assert!(text.contains("main"));
+    assert!(text.contains("feature"));
+    let parent = &state.hits.workspaces[0];
+    let (toggle, _) = parent
+        .group_toggle
+        .as_ref()
+        .expect("parent group toggle at row end without tag column");
+    assert_eq!(toggle.x, parent.rect.right().saturating_sub(1));
 }
 
 #[test]
@@ -258,7 +524,7 @@ fn workspace_click_waits_for_release_and_drag_reorders_by_stable_id() {
 }
 
 #[test]
-fn workspace_drag_moves_parent_worktree_as_one_block_and_rejects_child() {
+fn workspace_drag_moves_parent_worktree_as_one_block() {
     let mut projected = snapshot();
     projected.workspaces[0].worktree = Some(ClientShellWorktree {
         key: "repo".into(),
@@ -289,7 +555,6 @@ fn workspace_drag_moves_parent_worktree_as_one_block_and_rejects_child() {
     state.compose(106, 24).expect("worktree workspaces");
     assert!(state.hits.workspaces[1].indented);
     let parent = state.hits.workspaces[0].rect;
-    let child = state.hits.workspaces[1].rect;
     let other = state.hits.workspaces[2].rect;
 
     state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
@@ -320,23 +585,211 @@ fn workspace_drag_moves_parent_worktree_as_one_block_and_rejects_child() {
                         && params.before_workspace_id.is_none()
             )
     ));
+}
 
-    state.compose(106, 24).expect("worktree child");
-    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: child.x + 2,
-        row: child.y,
-        modifiers: KeyModifiers::empty(),
-    })]);
-    let dragging_child =
-        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: other.x + 2,
-            row: other.bottom(),
+fn linked_drag_snapshot() -> ClientShellSnapshot {
+    let mut projected = snapshot();
+    projected.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    for (id, number) in [("first", 2), ("middle", 3), ("last", 4)] {
+        let mut child = projected.workspaces[0].clone();
+        child.workspace_id = id.into();
+        child.number = number;
+        child.label = id.into();
+        child.focused = false;
+        child.worktree.as_mut().unwrap().is_linked_worktree = true;
+        projected.workspaces.push(child);
+    }
+    let mut other = projected.workspaces[0].clone();
+    other.workspace_id = "other-root".into();
+    other.number = 5;
+    other.focused = false;
+    other.worktree = None;
+    projected.workspaces.push(other);
+    let mut other_parent = projected.workspaces[0].clone();
+    other_parent.workspace_id = "another-parent".into();
+    other_parent.number = 6;
+    other_parent.focused = false;
+    other_parent.worktree.as_mut().unwrap().key = "another-repo".into();
+    projected.workspaces.push(other_parent.clone());
+    other_parent.workspace_id = "another-child".into();
+    other_parent.number = 7;
+    other_parent.worktree.as_mut().unwrap().is_linked_worktree = true;
+    projected.workspaces.push(other_parent);
+    projected
+}
+
+fn drag_workspace(
+    state: &mut ClientShellState,
+    from: (u16, u16),
+    to: (u16, u16),
+) -> ClientShellInput {
+    let event = |kind, point: (u16, u16)| {
+        RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: point.0,
+            row: point.1,
             modifiers: KeyModifiers::empty(),
-        })]);
-    assert!(dragging_child.actions.is_empty());
-    assert!(state.chrome_drag.is_none());
+        })
+    };
+    state.handle_raw_events(vec![event(MouseEventKind::Down(MouseButton::Left), from)]);
+    state.handle_raw_events(vec![event(MouseEventKind::Drag(MouseButton::Left), to)]);
+    state.handle_raw_events(vec![event(MouseEventKind::Up(MouseButton::Left), to)])
+}
+
+#[test]
+fn linked_worktree_drag_reorders_within_parent_and_survives_snapshot_order() {
+    let mut projected = linked_drag_snapshot();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected.clone()));
+    state.set_pane_surface(surface());
+    state.compose(106, 50).expect("expanded worktree group");
+    let child = state.hits.workspaces[1].rect;
+    let last = state.hits.workspaces[3].rect;
+    let other_root = state.hits.workspaces[4].rect;
+    let end = if last.bottom() < other_root.y {
+        (last.x + 2, last.bottom())
+    } else if last.height > 1 {
+        (last.x + 2, last.bottom() - 1)
+    } else {
+        (last.right() - 2, last.y)
+    };
+    let moved = drag_workspace(&mut state, (child.x + 2, child.y), end);
+    assert!(matches!(
+        &moved.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method,
+                crate::api::schema::Method::WorkspaceMoveBlock(params)
+                    if params.workspace_ids == ["first"]
+                        && params.before_workspace_id.as_deref() == Some("other-root"))
+    ));
+
+    let first = projected.workspaces.remove(1);
+    projected.workspaces.insert(3, first);
+    state.set_snapshot(Box::new(projected));
+    state.compose(106, 50).expect("reordered snapshot");
+    assert_eq!(
+        state.hits.workspaces[..4]
+            .iter()
+            .map(|hit| hit.workspace_id.as_str())
+            .collect::<Vec<_>>(),
+        ["ws_1", "middle", "last", "first"]
+    );
+    let first = state.hits.workspaces[3].rect;
+    let middle = state.hits.workspaces[1].rect;
+    let moved = drag_workspace(&mut state, (first.x + 2, first.y), (middle.x + 2, middle.y));
+    assert!(matches!(
+        &moved.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method,
+                crate::api::schema::Method::WorkspaceMoveBlock(params)
+                    if params.workspace_ids == ["first"]
+                        && params.before_workspace_id.as_deref() == Some("middle"))
+    ));
+    let last = state.hits.workspaces[2].rect;
+    let between = drag_workspace(&mut state, (first.x + 2, first.y), (last.x + 2, last.y));
+    assert!(matches!(
+        &between.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method,
+                crate::api::schema::Method::WorkspaceMoveBlock(params)
+                    if params.workspace_ids == ["first"]
+                        && params.before_workspace_id.as_deref() == Some("last"))
+    ));
+}
+
+#[test]
+fn linked_worktree_drag_to_final_boundary_uses_no_before_id() {
+    let mut projected = linked_drag_snapshot();
+    projected.workspaces.truncate(4);
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.compose(106, 34).expect("final worktree group");
+    let first = state.hits.workspaces[1].rect;
+    let last = state.hits.workspaces[3].rect;
+    let moved = drag_workspace(
+        &mut state,
+        (first.x + 2, first.y),
+        (last.x + 2, last.bottom()),
+    );
+    assert!(matches!(
+        &moved.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method,
+                crate::api::schema::Method::WorkspaceMoveBlock(params)
+                    if params.workspace_ids == ["first"]
+                        && params.before_workspace_id.is_none())
+    ));
+}
+
+#[test]
+fn linked_worktree_drag_rejects_noop_other_group_root_and_collapsed_targets() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(linked_drag_snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 50).expect("expanded worktree groups");
+    let first = state.hits.workspaces[1].rect;
+    let middle = state.hits.workspaces[2].rect;
+    let other_root = state.hits.workspaces[4].rect;
+    let other_child = state.hits.workspaces[6].rect;
+    for to in [
+        (middle.x + 2, middle.y),
+        (other_root.x + 2, other_root.y),
+        (other_child.x + 2, other_child.y),
+    ] {
+        let dropped = drag_workspace(&mut state, (first.x + 2, first.y), to);
+        assert!(
+            dropped.actions.is_empty(),
+            "invalid child drop must not move"
+        );
+    }
+    state.collapsed_groups.insert("repo".into());
+    state.compose(106, 50).expect("collapsed worktree group");
+    assert!(!state
+        .hits
+        .workspaces
+        .iter()
+        .any(|hit| hit.workspace_id == "first"));
+}
+
+#[test]
+fn linked_worktree_drop_after_scroll_does_not_use_stale_target() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(linked_drag_snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 50).expect("expanded worktree group");
+    let first = state.hits.workspaces[1].rect;
+    let last = state.hits.workspaces[3].rect;
+    let other_root = state.hits.workspaces[4].rect;
+    let start = (first.x + 2, first.y);
+    let end = if last.bottom() < other_root.y {
+        (last.x + 2, last.bottom())
+    } else if last.height > 1 {
+        (last.x + 2, last.bottom() - 1)
+    } else {
+        (last.right() - 2, last.y)
+    };
+    let event = |kind, point: (u16, u16)| {
+        RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: point.0,
+            row: point.1,
+            modifiers: KeyModifiers::empty(),
+        })
+    };
+    state.handle_raw_events(vec![event(MouseEventKind::Down(MouseButton::Left), start)]);
+    state.handle_raw_events(vec![event(MouseEventKind::Drag(MouseButton::Left), end)]);
+    state.workspace_scroll = 5;
+    state.compose(106, 12).expect("scrolled sidebar");
+    let release = state.handle_raw_events(vec![event(MouseEventKind::Up(MouseButton::Left), end)]);
+    assert!(
+        release.actions.is_empty(),
+        "stale pre-scroll slot must not move"
+    );
 }
 
 #[test]

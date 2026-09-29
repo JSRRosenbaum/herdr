@@ -226,6 +226,16 @@ pub(crate) fn render_sidebar(
             .add_modifier(Modifier::BOLD),
     );
 
+    let workspace_tag_width = if config.spaces.show_workspace_ids {
+        snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| display_width(&workspace.workspace_id))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let entries = workspace_entries(snapshot, state.collapsed_groups);
     let body = Rect::new(
         workspace_area.x,
@@ -259,10 +269,10 @@ pub(crate) fn render_sidebar(
     let gaps = entries
         .iter()
         .enumerate()
-        .map(|(index, _)| {
+        .map(|(index, entry)| {
             entries
                 .get(index + 1)
-                .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
+                .map_or(0, |next| workspace_gap_after(entry, next, &config.spaces))
         })
         .collect::<Vec<_>>();
     let mut metrics = super::scroll::list_scroll_metrics(
@@ -321,27 +331,43 @@ pub(crate) fn render_sidebar(
         } else if workspace.focused {
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
-        render_workspace_rows(
+        let group_key = parent_group_key(snapshot, entry.index);
+        let group_collapsed = group_key.is_some_and(|key| state.collapsed_groups.contains(key));
+        let group_toggle = if config.spaces.worktree_layout.is_compact() {
+            None
+        } else {
+            render_parent_group_toggle(
+                buffer,
+                rect,
+                workspace_tag_width,
+                group_key,
+                group_collapsed,
+                palette,
+            )
+        };
+        let compact_group_toggle = render_workspace_rows(
             buffer,
             rect,
+            workspace,
             status,
             config.status_indicators,
             entry,
-            rows,
-            workspace.focused,
-            selected,
-            state.selected_workspace_id.is_some(),
-            dragged,
+            (rows, config.spaces.worktree_layout),
+            workspace_tag_width,
+            WorkspaceRowPresentation {
+                group_collapsed: group_key.map(|_| group_collapsed),
+                focused: workspace.focused,
+                selected,
+                navigating: state.selected_workspace_id.is_some(),
+                dragged,
+            },
             palette,
         );
-        let group_toggle = render_parent_group_toggle(
-            buffer,
-            rect,
-            snapshot,
-            entry.index,
-            state.collapsed_groups,
-            palette,
-        );
+        let group_toggle = group_toggle.or_else(|| {
+            compact_group_toggle
+                .zip(group_key)
+                .map(|(toggle, key)| (toggle, key.to_owned()))
+        });
         hits.workspaces.push(WorkspaceHit {
             rect,
             endpoint_id: ClientEndpointId::Local,
@@ -349,10 +375,17 @@ pub(crate) fn render_sidebar(
             indented: entry.indented,
             group_toggle,
         });
-        let gap = entries
-            .get(entry_position + 1)
-            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
-        y = y.saturating_add(row_height + gap);
+        let gap = gaps.get(entry_position).copied().unwrap_or(0);
+        if entry.last_in_group && config.spaces.worktree_layout.is_compact() && gap > 0 {
+            render_worktree_group_separator(
+                buffer,
+                body,
+                content_width,
+                y.saturating_add(row_height),
+                palette,
+            );
+        }
+        y = y.saturating_add(row_height).saturating_add(gap);
     }
 
     if show_scrollbar {
@@ -455,6 +488,32 @@ pub(crate) fn render_sidebar(
     );
 }
 
+pub(in crate::client::shell) fn workspace_gap_after(
+    entry: &WorkspaceEntry,
+    next: &WorkspaceEntry,
+    config: &SpacesSidebarConfig,
+) -> u16 {
+    (u16::from(!next.indented) * config.row_gap).saturating_add(u16::from(
+        config.worktree_layout.is_compact() && entry.last_in_group,
+    ))
+}
+
+pub(in crate::client::shell) fn render_worktree_group_separator(
+    buffer: &mut Buffer,
+    body: Rect,
+    content_width: u16,
+    y: u16,
+    palette: &Palette,
+) {
+    if y >= body.bottom() {
+        return;
+    }
+    let style = Style::default().fg(palette.surface_dim);
+    for x in body.x.saturating_add(1)..body.x.saturating_add(content_width).saturating_sub(1) {
+        buffer[(x, y)].set_symbol("─").set_style(style);
+    }
+}
+
 pub(crate) fn workspace_entries(
     snapshot: &ClientShellSnapshot,
     collapsed_groups: &HashSet<String>,
@@ -490,6 +549,7 @@ pub(crate) fn workspace_entries(
                 index,
                 indented: false,
                 last_child: false,
+                last_in_group: false,
             });
             continue;
         };
@@ -509,21 +569,28 @@ pub(crate) fn workspace_entries(
                     .is_some_and(|worktree| !worktree.is_linked_worktree)
             })
             .unwrap_or(index);
+        let collapsed = collapsed_groups.contains(&worktree.key);
+        let active_child = if collapsed {
+            group_members
+                .iter()
+                .copied()
+                .find(|member| *member != parent && snapshot.workspaces[*member].focused)
+        } else {
+            None
+        };
         entries.push(WorkspaceEntry {
             index: parent,
             indented: false,
             last_child: false,
+            last_in_group: collapsed && active_child.is_none(),
         });
-        if collapsed_groups.contains(&worktree.key) {
-            if let Some(active) = group_members
-                .iter()
-                .copied()
-                .find(|member| *member != parent && snapshot.workspaces[*member].focused)
-            {
+        if collapsed {
+            if let Some(active) = active_child {
                 entries.push(WorkspaceEntry {
                     index: active,
                     indented: true,
                     last_child: true,
+                    last_in_group: true,
                 });
             }
             continue;
@@ -538,13 +605,17 @@ pub(crate) fn workspace_entries(
                 index: *child,
                 indented: true,
                 last_child: child_index + 1 == children.len(),
+                last_in_group: child_index + 1 == children.len(),
             });
         }
     }
     entries
 }
 
-fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<String> {
+pub(in crate::client::shell) fn parent_group_key(
+    snapshot: &ClientShellSnapshot,
+    index: usize,
+) -> Option<&str> {
     let workspace = snapshot.workspaces.get(index)?;
     let worktree = workspace.worktree.as_ref()?;
     if worktree.is_linked_worktree {
@@ -561,20 +632,22 @@ fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<Stri
         })
         .count()
         >= 2)
-        .then(|| worktree.key.clone())
+        .then_some(worktree.key.as_str())
 }
 
 pub(in crate::client::shell) fn render_parent_group_toggle(
     buffer: &mut Buffer,
     workspace_rect: Rect,
-    snapshot: &ClientShellSnapshot,
-    workspace_index: usize,
-    collapsed_groups: &HashSet<String>,
+    workspace_tag_width: u16,
+    group_key: Option<&str>,
+    collapsed: bool,
     palette: &Palette,
 ) -> Option<(Rect, String)> {
-    let key = parent_group_key(snapshot, workspace_index)?;
+    let key = group_key?;
     let toggle = Rect::new(
-        workspace_rect.right().saturating_sub(1),
+        workspace_rect
+            .right()
+            .saturating_sub(workspace_tag_width.saturating_add(1)),
         workspace_rect.y,
         1,
         1,
@@ -584,14 +657,10 @@ pub(in crate::client::shell) fn render_parent_group_toggle(
         toggle.x,
         toggle.y,
         toggle.width,
-        if collapsed_groups.contains(&key) {
-            "▸"
-        } else {
-            "▾"
-        },
+        if collapsed { "▸" } else { "▾" },
         Style::default().fg(palette.accent),
     );
-    Some((toggle, key))
+    Some((toggle, key.to_owned()))
 }
 
 pub(in crate::client::shell) fn displayed_workspace_status(
@@ -639,32 +708,71 @@ pub(in crate::client::shell) fn workspace_rows(
         &workspace.label
     };
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
-    crate::ui::sidebar_space_rows(
-        config,
-        crate::ui::SpaceTokenContext {
-            workspace: label,
-            branch: workspace.branch.as_deref(),
-            state_text: status_text(status),
-            ahead_behind: workspace.git_ahead_behind,
-            tokens: &token_values,
-            suppress_git_details: indented,
-        },
-    )
+    let rows = if config.worktree_layout.is_compact() && !config.rows_explicit {
+        let row = [
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+            crate::config::SpaceSidebarToken::Branch,
+            crate::config::SpaceSidebarToken::GitStatus,
+        ]
+        .to_vec();
+        let compact = SpacesSidebarConfig {
+            rows: vec![row],
+            ..config.clone()
+        };
+        crate::ui::sidebar_space_rows(
+            &compact,
+            crate::ui::SpaceTokenContext {
+                workspace: label,
+                branch: workspace.branch.as_deref(),
+                state_text: status_text(status),
+                ahead_behind: workspace.git_ahead_behind,
+                tokens: &token_values,
+                suppress_git_details: indented,
+            },
+        )
+    } else {
+        crate::ui::sidebar_space_rows(
+            config,
+            crate::ui::SpaceTokenContext {
+                workspace: label,
+                branch: workspace.branch.as_deref(),
+                state_text: status_text(status),
+                ahead_behind: workspace.git_ahead_behind,
+                tokens: &token_values,
+                suppress_git_details: indented,
+            },
+        )
+    };
+    rows
+}
+
+pub(in crate::client::shell) struct WorkspaceRowPresentation {
+    pub(in crate::client::shell) group_collapsed: Option<bool>,
+    pub(in crate::client::shell) focused: bool,
+    pub(in crate::client::shell) selected: bool,
+    pub(in crate::client::shell) navigating: bool,
+    pub(in crate::client::shell) dragged: bool,
 }
 
 pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
+    workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
     indicators: crate::config::StatusIndicatorStyle,
     entry: &WorkspaceEntry,
-    rows: Vec<Vec<crate::ui::ResolvedToken>>,
-    focused: bool,
-    selected: bool,
-    navigating: bool,
-    dragged: bool,
+    rows: (
+        Vec<Vec<crate::ui::ResolvedToken>>,
+        crate::config::WorktreeLayout,
+    ),
+    workspace_tag_width: u16,
+    presentation: WorkspaceRowPresentation,
     palette: &Palette,
-) {
+) -> Option<Rect> {
+    let has_group_toggle = presentation.group_collapsed.is_some();
+    let mut compact_group_toggle = None;
+    let (rows, worktree_layout) = rows;
     for (row_index, row) in rows.iter().enumerate() {
         let y = area.y + row_index as u16;
         if y >= area.bottom() {
@@ -672,7 +780,20 @@ pub(in crate::client::shell) fn render_workspace_rows(
         }
         let mut x = area.x;
         if entry.indented {
-            let prefix = if row_index == 0 {
+            let compact = worktree_layout.is_compact();
+            let prefix = if compact {
+                if row_index == 0 {
+                    if entry.last_child {
+                        "└"
+                    } else {
+                        "├"
+                    }
+                } else if entry.last_child {
+                    " "
+                } else {
+                    "│"
+                }
+            } else if row_index == 0 {
                 if entry.last_child {
                     "   └─ "
                 } else {
@@ -696,7 +817,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             x = x.saturating_add(3);
         }
-        let highlighted = focused || dragged;
+        let highlighted = presentation.focused || presentation.dragged;
         let workspace_style = Style::default()
             .fg(if highlighted {
                 palette.text
@@ -708,11 +829,27 @@ pub(in crate::client::shell) fn render_workspace_rows(
             } else {
                 Modifier::empty()
             });
-        let secondary_style = Style::default().fg(if focused {
+        let secondary_style = Style::default().fg(if presentation.focused {
             palette.mauve
         } else {
             palette.overlay0
         });
+        let tag_width = display_width(&workspace.workspace_id);
+        let tag_right = area.right();
+        let available_width = tag_right.saturating_sub(x);
+        let show_workspace_tag = row_index == 0
+            && workspace_tag_width > 0
+            && available_width > tag_width.saturating_add(1);
+        let reserved_tag_width = if has_group_toggle {
+            workspace_tag_width
+        } else {
+            tag_width
+        };
+        let content_right = if show_workspace_tag {
+            tag_right.saturating_sub(reserved_tag_width.saturating_add(1))
+        } else {
+            tag_right
+        };
         let spans = crate::ui::resolved_token_spans(
             row,
             (
@@ -724,20 +861,51 @@ pub(in crate::client::shell) fn render_workspace_rows(
             secondary_style,
             Style::default().fg(palette.overlay1),
             palette,
-            area.right().saturating_sub(2).saturating_sub(x) as usize,
+            content_right.saturating_sub(x) as usize,
+            if worktree_layout.is_compact() {
+                crate::ui::compact_separator
+            } else {
+                crate::ui::separator
+            },
         );
-        Paragraph::new(Line::from(spans)).render(
-            Rect::new(x, y, area.right().saturating_sub(2).saturating_sub(x), 1),
-            buffer,
-        );
+
+        Paragraph::new(Line::from(spans))
+            .render(Rect::new(x, y, content_right.saturating_sub(x), 1), buffer);
+        if row_index == 0 && worktree_layout.is_compact() {
+            if let Some(collapsed) = presentation.group_collapsed {
+                let toggle = Rect::new(area.x, y, u16::from(!area.is_empty()), 1);
+                put_text(
+                    buffer,
+                    toggle.x,
+                    toggle.y,
+                    toggle.width,
+                    if collapsed { "▸" } else { "┬" },
+                    Style::default().fg(palette.accent),
+                );
+                compact_group_toggle = Some(toggle);
+            }
+        }
+        if show_workspace_tag {
+            put_text(
+                buffer,
+                tag_right.saturating_sub(tag_width),
+                y,
+                tag_width,
+                &workspace.workspace_id,
+                Style::default().fg(palette.overlay0),
+            );
+        }
     }
 
-    let background = if selected {
+    let background = if presentation.selected {
         Some(workspace_selection_background(palette))
-    } else if dragged {
+    } else if presentation.dragged {
         Some(palette.surface1)
-    } else if focused {
-        Some(workspace_active_background(palette, navigating))
+    } else if presentation.focused {
+        Some(workspace_active_background(
+            palette,
+            presentation.navigating,
+        ))
     } else {
         None
     };
@@ -748,4 +916,5 @@ pub(in crate::client::shell) fn render_workspace_rows(
             }
         }
     }
+    compact_group_toggle
 }

@@ -83,6 +83,8 @@ pub(super) enum ClientMobileTarget {
 
 #[derive(Default)]
 pub(super) struct ShellHitMap {
+    pub(super) herd_tabs: Vec<(Rect, u16)>,
+    pub(super) add_herd: Rect,
     pub(super) machines: Vec<MachineHit>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
@@ -525,10 +527,16 @@ pub(super) enum ClientContextMenuAction {
     Zoom,
     ToggleRightClickPassthrough,
     ClosePane,
+    MoveToHerd(u16),
 }
 
 #[derive(Debug)]
 pub(super) enum ClientContextMenuTarget {
+    Machine {
+        endpoint_id: ClientEndpointId,
+        herd_count: u16,
+        current_herd: u16,
+    },
     Workspace {
         workspace_id: String,
         is_git: bool,
@@ -558,7 +566,7 @@ pub(super) struct ClientContextMenuOverlay {
 }
 
 pub(super) struct ClientContextMenuItem {
-    pub(super) label: &'static str,
+    pub(super) label: std::borrow::Cow<'static, str>,
     pub(super) action: ClientContextMenuAction,
 }
 
@@ -869,6 +877,9 @@ pub(crate) struct ClientShellState {
     pub(super) tab_press: Option<ClientTabPress>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
+    pub(super) herd_count: u16,
+    pub(super) selected_herd: u16,
+    pub(super) machine_herds: HashMap<ClientEndpointId, u16>,
     pub(super) workspace_scroll: usize,
     pub(super) agent_scroll: usize,
     pub(super) pending_agent_reveal: Option<(ClientEndpointId, String)>,
@@ -968,6 +979,7 @@ pub(super) struct WorkspaceEntry {
     pub(super) index: usize,
     pub(super) indented: bool,
     pub(super) last_child: bool,
+    pub(super) last_in_group: bool,
 }
 
 impl ClientShellState {
@@ -1007,6 +1019,23 @@ impl ClientShellState {
                 .or_default()
                 .extend(saved.collapsed_groups);
         }
+        let herd_count = preferences.herd_count.max(1);
+        let selected_herd = preferences.selected_herd.min(herd_count - 1);
+        let mut machine_herds = HashMap::new();
+        for saved in &preferences.machine_herds {
+            let endpoint_id = match saved.profile_id.as_deref() {
+                None => ClientEndpointId::Local,
+                Some(id) => {
+                    let Ok(id) = crate::client::endpoint::ProfileId::parse(id.to_owned()) else {
+                        continue;
+                    };
+                    ClientEndpointId::Ssh(id)
+                }
+            };
+            if saved.herd < herd_count && saved.herd != 0 {
+                machine_herds.insert(endpoint_id, saved.herd);
+            }
+        }
         Self {
             machine_diagnostics: Default::default(),
             config,
@@ -1034,6 +1063,9 @@ impl ClientShellState {
             tab_press: None,
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
             remote_collapsed_groups,
+            herd_count,
+            selected_herd,
+            machine_herds,
             workspace_scroll: 0,
             agent_scroll: 0,
             pending_agent_reveal: None,

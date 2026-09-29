@@ -127,6 +127,8 @@ pub(crate) fn keybind_help_groups(
                     "rename workspace",
                 ),
                 entry(binding_label(&keybinds.close_workspace), "close workspace"),
+                entry(binding_label(&keybinds.previous_herd), "previous herd"),
+                entry(binding_label(&keybinds.next_herd), "next herd"),
                 entry(
                     binding_label(&keybinds.previous_workspace),
                     "previous workspace",
