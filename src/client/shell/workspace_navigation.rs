@@ -57,6 +57,9 @@ impl ClientShellState {
         endpoint_id: &ClientEndpointId,
         workspace_id: &str,
     ) -> Option<WorkspaceNavigationTarget> {
+        if self.herd_for(endpoint_id) != self.selected_herd {
+            return None;
+        }
         let endpoint = self
             .endpoints
             .iter()
@@ -76,6 +79,9 @@ impl ClientShellState {
     }
 
     pub(super) fn navigation_target_valid(&self, target: &WorkspaceNavigationTarget) -> bool {
+        if self.herd_for(&target.endpoint_id) != self.selected_herd {
+            return false;
+        }
         self.endpoints.iter().any(|endpoint| {
             endpoint.endpoint_id == target.endpoint_id
                 && endpoint.status == ClientEndpointStatus::Online
@@ -102,7 +108,9 @@ impl ClientShellState {
         let empty_collapsed_groups = HashSet::new();
         let mut targets = Vec::new();
         for endpoint in &self.endpoints {
-            if endpoint.status != ClientEndpointStatus::Online {
+            if endpoint.status != ClientEndpointStatus::Online
+                || self.herd_for(&endpoint.endpoint_id) != self.selected_herd
+            {
                 continue;
             }
             let Some(snapshot) = endpoint.snapshot.as_deref() else {

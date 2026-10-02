@@ -115,7 +115,10 @@ impl ClientShellState {
             let workspaces = self
                 .endpoints
                 .iter()
-                .filter(|endpoint| endpoint.status == ClientEndpointStatus::Online)
+                .filter(|endpoint| {
+                    endpoint.status == ClientEndpointStatus::Online
+                        && self.herd_for(&endpoint.endpoint_id) == self.selected_herd
+                })
                 .flat_map(|endpoint| {
                     endpoint
                         .snapshot
