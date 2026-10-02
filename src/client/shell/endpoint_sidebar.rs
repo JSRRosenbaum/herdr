@@ -704,7 +704,7 @@ fn render_endpoint_row(
     let decoration_width = label_width.saturating_add(4);
     if rect.width < decoration_width {
         put_right_text(buffer, rect, rect.y, &endpoint.label, label_style);
-        return rect;
+        return Rect::default();
     }
 
     let rail_width = rect
@@ -743,5 +743,5 @@ fn render_endpoint_row(
     {
         buffer[(x, rect.y)].set_symbol("─").set_style(rail_style);
     }
-    rect
+    Rect::new(right_cap_x, rect.y, 1, 1)
 }
