@@ -496,6 +496,19 @@ impl WorktreeLayout {
     }
 }
 
+/// Separator after a compact worktree group, before another Space on the same machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeGroupSeparator {
+    /// Only collapsed groups reserve a separator row.
+    #[default]
+    Collapsed,
+    /// Preserve the separator after every group.
+    Always,
+    /// Never reserve a group separator row.
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct SpacesSidebarConfig {
@@ -504,6 +517,8 @@ pub struct SpacesSidebarConfig {
     pub row_gap: u16,
     /// Worktree presentation in the expanded sidebar. Default: "tree".
     pub worktree_layout: WorktreeLayout,
+    /// Compact worktree group separator policy. Default: "collapsed".
+    pub worktree_group_separator: WorktreeGroupSeparator,
     /// Whether the user set `rows` explicitly, so an explicit layout always
     /// wins over the compact single-row default.
     #[serde(skip)]
@@ -522,6 +537,8 @@ struct SpacesSidebarConfigInput {
     row_gap: u16,
     #[serde(default, deserialize_with = "deserialize_worktree_layout")]
     worktree_layout: WorktreeLayout,
+    #[serde(default)]
+    worktree_group_separator: WorktreeGroupSeparator,
     #[serde(default)]
     show_workspace_ids: bool,
 }
@@ -555,6 +572,7 @@ impl<'de> Deserialize<'de> for SpacesSidebarConfig {
             rows,
             row_gap: input.row_gap,
             worktree_layout: input.worktree_layout,
+            worktree_group_separator: input.worktree_group_separator,
             show_workspace_ids: input.show_workspace_ids,
         })
     }
@@ -568,6 +586,7 @@ impl Default for SpacesSidebarConfig {
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
             worktree_layout: WorktreeLayout::Tree,
+            worktree_group_separator: WorktreeGroupSeparator::Collapsed,
             rows_explicit: false,
             show_workspace_ids: false,
         }
@@ -611,6 +630,10 @@ mod tests {
         );
         assert_eq!(config.spaces.row_gap, 0);
         assert_eq!(config.spaces.worktree_layout, WorktreeLayout::Tree);
+        assert_eq!(
+            config.spaces.worktree_group_separator,
+            WorktreeGroupSeparator::Collapsed
+        );
         assert!(!config.spaces.rows_explicit);
         assert!(!config.spaces.show_workspace_ids);
     }
@@ -632,6 +655,26 @@ mod tests {
         )
         .expect_err("unknown worktree_layout");
         assert!(error.to_string().contains("worktree_layout"));
+    }
+
+    #[test]
+    fn parses_worktree_group_separator_policy() {
+        for (value, expected) in [
+            ("collapsed", WorktreeGroupSeparator::Collapsed),
+            ("always", WorktreeGroupSeparator::Always),
+            ("none", WorktreeGroupSeparator::None),
+        ] {
+            let parsed: crate::config::Config = toml::from_str(&format!(
+                "[ui.sidebar.spaces]\nworktree_group_separator = {value:?}\n"
+            ))
+            .expect("valid separator policy");
+            assert_eq!(parsed.ui.sidebar.spaces.worktree_group_separator, expected);
+        }
+        let error = toml::from_str::<crate::config::Config>(
+            "[ui.sidebar.spaces]\nworktree_group_separator = \"invalid\"\n",
+        )
+        .expect_err("invalid separator policy");
+        assert!(error.to_string().contains("worktree_group_separator"));
     }
 
     #[test]

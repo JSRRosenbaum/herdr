@@ -270,9 +270,15 @@ pub(crate) fn render_sidebar(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            entries
-                .get(index + 1)
-                .map_or(0, |next| workspace_gap_after(entry, next, &config.spaces))
+            entries.get(index + 1).map_or(0, |next| {
+                workspace_gap_after(
+                    entry,
+                    next,
+                    snapshot,
+                    state.collapsed_groups,
+                    &config.spaces,
+                )
+            })
         })
         .collect::<Vec<_>>();
     let mut metrics = super::scroll::list_scroll_metrics(
@@ -376,7 +382,14 @@ pub(crate) fn render_sidebar(
             group_toggle,
         });
         let gap = gaps.get(entry_position).copied().unwrap_or(0);
-        if entry.last_in_group && config.spaces.worktree_layout.is_compact() && gap > 0 {
+        if entries.get(entry_position + 1).is_some()
+            && worktree_group_separator_after(
+                entry,
+                snapshot,
+                state.collapsed_groups,
+                &config.spaces,
+            )
+        {
             render_worktree_group_separator(
                 buffer,
                 body,
@@ -488,13 +501,35 @@ pub(crate) fn render_sidebar(
     );
 }
 
+pub(in crate::client::shell) fn worktree_group_separator_after(
+    entry: &WorkspaceEntry,
+    snapshot: &ClientShellSnapshot,
+    collapsed_groups: &HashSet<String>,
+    config: &SpacesSidebarConfig,
+) -> bool {
+    if !config.worktree_layout.is_compact() || !entry.last_in_group {
+        return false;
+    }
+    match config.worktree_group_separator {
+        crate::config::WorktreeGroupSeparator::Always => true,
+        crate::config::WorktreeGroupSeparator::None => false,
+        crate::config::WorktreeGroupSeparator::Collapsed => snapshot
+            .workspaces
+            .get(entry.index)
+            .and_then(|workspace| workspace.worktree.as_ref())
+            .is_some_and(|worktree| collapsed_groups.contains(&worktree.key)),
+    }
+}
+
 pub(in crate::client::shell) fn workspace_gap_after(
     entry: &WorkspaceEntry,
     next: &WorkspaceEntry,
+    snapshot: &ClientShellSnapshot,
+    collapsed_groups: &HashSet<String>,
     config: &SpacesSidebarConfig,
 ) -> u16 {
     (u16::from(!next.indented) * config.row_gap).saturating_add(u16::from(
-        config.worktree_layout.is_compact() && entry.last_in_group,
+        worktree_group_separator_after(entry, snapshot, collapsed_groups, config),
     ))
 }
 

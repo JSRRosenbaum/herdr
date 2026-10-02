@@ -403,7 +403,19 @@ pub(super) fn render_expanded(
                     entry: next,
                 }),
             ) if endpoint == next_endpoint => {
-                super::sidebar::workspace_gap_after(current, next, &config.spaces)
+                let endpoint = &state.endpoints[*endpoint];
+                endpoint.snapshot.as_deref().map_or(0, |snapshot| {
+                    let collapsed_groups =
+                        collapsed_groups_for_endpoint(state, &endpoint.endpoint_id)
+                            .unwrap_or(&empty_collapsed_groups);
+                    super::sidebar::workspace_gap_after(
+                        current,
+                        next,
+                        snapshot,
+                        collapsed_groups,
+                        &config.spaces,
+                    )
+                })
             }
             _ => 0,
         })
@@ -502,6 +514,7 @@ pub(super) fn render_expanded(
                     .saturating_add(gaps.get(row_index).copied().unwrap_or(0));
             }
             Row::Workspace { endpoint, entry } => {
+                let endpoint_index = *endpoint;
                 let endpoint = &state.endpoints[*endpoint];
                 let Some(snapshot) = endpoint.snapshot.as_deref() else {
                     continue;
@@ -586,7 +599,15 @@ pub(super) fn render_expanded(
                     group_toggle,
                 });
                 let gap = gaps.get(row_index).copied().unwrap_or(0);
-                if entry.last_in_group && config.spaces.worktree_layout.is_compact() && gap > 0 {
+                if matches!(
+                    rows.get(row_index + 1),
+                    Some(Row::Workspace { endpoint: next, .. }) if *next == endpoint_index
+                ) && super::sidebar::worktree_group_separator_after(
+                    entry,
+                    snapshot,
+                    collapsed_groups,
+                    &config.spaces,
+                ) {
                     super::sidebar::render_worktree_group_separator(
                         buffer,
                         body,

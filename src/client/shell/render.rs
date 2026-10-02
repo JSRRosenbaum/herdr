@@ -243,7 +243,11 @@ pub(super) fn render_herd_header(
     }
     let header = Rect::new(area.x, area.y, area.width, 1);
     buffer.set_style(header, Style::default().bg(config.palette.sidebar_bg));
-    let add_x = area.right() - 1;
+    let tab_width = if collapsed { 1 } else { 3 };
+    let slots = usize::from(area.width.saturating_sub(1) / tab_width);
+    let count = usize::from(count);
+    let visible_tabs = count.min(slots);
+    let add_x = area.x + (visible_tabs as u16) * tab_width;
     hits.add_herd = Rect::new(add_x, area.y, 1, 1);
     put_text(
         buffer,
@@ -253,10 +257,7 @@ pub(super) fn render_herd_header(
         "+",
         Style::default().fg(config.palette.accent),
     );
-    let tab_width = if collapsed { 1 } else { 3 };
-    let slots = usize::from(area.width.saturating_sub(1) / tab_width);
-    let count = usize::from(count);
-    for offset in 0..count.min(slots) {
+    for offset in 0..visible_tabs {
         let index = if count > slots {
             (usize::from(selected) + offset) % count
         } else {

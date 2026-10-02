@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::WorktreeLayout;
+use crate::config::{WorktreeGroupSeparator, WorktreeLayout};
 
 #[test]
 
@@ -284,8 +284,7 @@ fn compact_layout_renders_shallow_connectors_and_inline_branch() {
     );
 }
 
-#[test]
-fn compact_worktree_groups_have_a_muted_separator_before_the_next_group() {
+fn compact_two_groups_snapshot() -> ClientShellSnapshot {
     let mut snapshot = compact_grouped_snapshot();
     let mut next_parent = snapshot.workspaces[0].clone();
     next_parent.workspace_id = "ws_3".into();
@@ -308,52 +307,185 @@ fn compact_worktree_groups_have_a_muted_separator_before_the_next_group() {
         is_linked_worktree: true,
     });
     snapshot.workspaces.extend([next_parent, next_child]);
+    snapshot
+}
 
+#[test]
+fn compact_group_separators_follow_policy_and_collapse_state() {
     let mut config = ClientShellConfig::from_config(&Config::default());
     config.spaces.worktree_layout = WorktreeLayout::Compact;
     let mut state = ClientShellState::new(config);
-    state.set_snapshot(Box::new(snapshot));
+    state.set_snapshot(Box::new(compact_two_groups_snapshot()));
     state.set_pane_surface(surface());
-    let frame = state.compose(106, 32).expect("expanded worktree groups");
-    let parent = state.hits.workspaces[0].rect;
-    let child = state.hits.workspaces[1].rect;
-    let next_parent = state.hits.workspaces[2].rect;
-    let last_child = state.hits.workspaces[3].rect;
-    assert_eq!(child.y, parent.bottom());
-    assert_eq!(next_parent.y, child.bottom() + 1);
-    let buffer = frame.to_ratatui_buffer().expect("group frame");
-    for x in child.x + 1..child.right() - 1 {
-        assert_eq!(buffer[(x, child.bottom())].symbol(), "─");
+
+    for (policy, collapsed, expected_separator) in [
+        (WorktreeGroupSeparator::Collapsed, false, false),
+        (WorktreeGroupSeparator::Collapsed, true, true),
+        (WorktreeGroupSeparator::Always, false, true),
+        (WorktreeGroupSeparator::Always, true, true),
+        (WorktreeGroupSeparator::None, false, false),
+        (WorktreeGroupSeparator::None, true, false),
+    ] {
+        state.config.spaces.worktree_group_separator = policy;
+        if collapsed {
+            state.collapsed_groups.insert("repo".into());
+        } else {
+            state.collapsed_groups.clear();
+        }
+        let frame = state.compose(106, 32).expect("compact group frame");
+        let last_first = state.hits.workspaces[if collapsed { 0 } else { 1 }].rect;
+        let next = state.hits.workspaces[if collapsed { 1 } else { 2 }].rect;
         assert_eq!(
-            buffer[(x, child.bottom())].fg,
-            state.config.palette.surface_dim
+            next.y,
+            last_first.bottom() + u16::from(expected_separator),
+            "{policy:?}, collapsed={collapsed}"
+        );
+        let buffer = frame.to_ratatui_buffer().expect("group frame buffer");
+        if expected_separator {
+            for x in last_first.x + 1..last_first.right() - 1 {
+                assert_eq!(buffer[(x, last_first.bottom())].symbol(), "─");
+                assert_eq!(
+                    buffer[(x, last_first.bottom())].fg,
+                    state.config.palette.surface_dim
+                );
+            }
+        } else {
+            assert_ne!(
+                buffer[(last_first.x + 1, last_first.bottom())].symbol(),
+                "─"
+            );
+        }
+        let final_child = state.hits.workspaces.last().expect("last Space").rect;
+        assert_ne!(
+            buffer[(final_child.x + 1, final_child.bottom())].symbol(),
+            "─",
+            "no group separator after the final Space"
         );
     }
-    assert!(state
-        .hits
-        .workspaces
-        .iter()
-        .all(|hit| { hit.rect.y > child.bottom() || hit.rect.bottom() <= child.bottom() }));
-    assert_ne!(
-        buffer[(last_child.x + 1, last_child.bottom())].symbol(),
-        "─"
-    );
-
-    state.collapsed_groups.insert("repo".into());
-    let frame = state.compose(106, 32).expect("collapsed first group");
-    let first = state.hits.workspaces[0].rect;
-    let next = state.hits.workspaces[1].rect;
-    assert_eq!(next.y, first.bottom() + 1);
-    let buffer = frame.to_ratatui_buffer().expect("collapsed group frame");
-    assert_eq!(buffer[(first.x + 1, first.bottom())].symbol(), "─");
 
     state.collapsed_groups.clear();
     state.config.spaces.worktree_layout = WorktreeLayout::Tree;
+    state.config.spaces.worktree_group_separator = WorktreeGroupSeparator::Always;
     state.compose(106, 32).expect("tree layout frame");
     assert_eq!(
         state.hits.workspaces[2].rect.y,
         state.hits.workspaces[1].rect.bottom()
     );
+}
+
+#[test]
+fn compact_group_separator_keeps_row_gap_independent_and_focused_child_visible() {
+    let mut snapshot = compact_two_groups_snapshot();
+    snapshot.workspaces[0].focused = false;
+    snapshot.workspaces[1].focused = true;
+    snapshot.focused_workspace_id = Some("ws_22".into());
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    config.spaces.row_gap = 2;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    state.collapsed_groups.insert("repo".into());
+
+    for (policy, expected_gap, expected_rule) in [
+        (WorktreeGroupSeparator::None, 2, false),
+        (WorktreeGroupSeparator::Collapsed, 3, true),
+    ] {
+        state.config.spaces.worktree_group_separator = policy;
+        let frame = state.compose(106, 32).expect("focused compact group");
+        let parent = state.hits.workspaces[0].rect;
+        let visible_child = state.hits.workspaces[1].rect;
+        let next = state.hits.workspaces[2].rect;
+        assert_eq!(visible_child.y, parent.bottom());
+        assert_eq!(next.y, visible_child.bottom() + expected_gap);
+        let buffer = frame.to_ratatui_buffer().expect("focused group buffer");
+        assert_eq!(
+            buffer[(visible_child.x + 1, visible_child.bottom())].symbol() == "─",
+            expected_rule
+        );
+    }
+}
+
+#[test]
+fn remote_compact_group_separator_is_endpoint_scoped() {
+    use crate::client::endpoint::{
+        ClientEndpointId, ClientEndpointStatus, ProfileId, SavedSshEndpoint,
+    };
+
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.spaces.worktree_layout = WorktreeLayout::Compact;
+    let mut state = ClientShellState::new(config);
+    let profile = SavedSshEndpoint {
+        id: ProfileId::parse("0123456789abcdef0123456789abcdef").expect("profile id"),
+        label: "Build".into(),
+        target: "dev@build.example".into(),
+        session: "agents".into(),
+        enabled: true,
+    };
+    let remote_id = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&remote_id, ClientEndpointStatus::Online);
+    state.set_snapshot(Box::new(compact_grouped_snapshot()));
+    state.set_pane_surface(surface());
+    let mut remote = compact_two_groups_snapshot();
+    remote.boot_id = "remote-boot".into();
+    state.set_endpoint_snapshot(&remote_id, Box::new(remote));
+
+    for (policy, collapsed, expected_separator) in [
+        (WorktreeGroupSeparator::Collapsed, false, false),
+        (WorktreeGroupSeparator::Collapsed, true, true),
+        (WorktreeGroupSeparator::Always, false, true),
+        (WorktreeGroupSeparator::None, true, false),
+    ] {
+        state.config.spaces.worktree_group_separator = policy;
+        if collapsed {
+            state
+                .remote_collapsed_groups
+                .entry(remote_id.clone())
+                .or_default()
+                .insert("repo".into());
+        } else {
+            state.remote_collapsed_groups.remove(&remote_id);
+        }
+        let frame = state.compose(106, 40).expect("multi-machine compact frame");
+        let remote_rows = state
+            .hits
+            .workspaces
+            .iter()
+            .filter(|hit| hit.endpoint_id == remote_id)
+            .map(|hit| hit.rect)
+            .collect::<Vec<_>>();
+        let last_first = remote_rows[if collapsed { 0 } else { 1 }];
+        let next = remote_rows[if collapsed { 1 } else { 2 }];
+        assert_eq!(
+            next.y,
+            last_first.bottom() + u16::from(expected_separator),
+            "remote {policy:?}, collapsed={collapsed}"
+        );
+        let buffer = frame
+            .to_ratatui_buffer()
+            .expect("multi-machine frame buffer");
+        assert_eq!(
+            buffer[(last_first.x + 1, last_first.bottom())].symbol() == "─",
+            expected_separator
+        );
+        let local_last = state
+            .hits
+            .workspaces
+            .iter()
+            .filter(|hit| hit.endpoint_id == ClientEndpointId::Local)
+            .map(|hit| hit.rect.bottom())
+            .max()
+            .expect("local Space");
+        let remote_machine = state
+            .hits
+            .machines
+            .iter()
+            .find(|hit| hit.endpoint_id == remote_id)
+            .expect("remote machine")
+            .rect;
+        assert_eq!(remote_machine.y, local_last + 1);
+    }
 }
 
 #[test]
