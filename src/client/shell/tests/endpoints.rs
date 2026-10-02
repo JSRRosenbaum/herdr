@@ -824,7 +824,7 @@ fn expanded_sidebar_ends_machine_workspace_lists_with_a_separator() {
 }
 
 #[test]
-fn remote_compact_worktree_group_separator_stays_inside_its_machine() {
+fn remote_compact_worktree_separator_follows_collapsed_state() {
     let (mut state, remote_id) = state_with_remote();
     state.config.spaces.worktree_layout = crate::config::WorktreeLayout::Compact;
     let mut remote = snapshot();
@@ -853,7 +853,7 @@ fn remote_compact_worktree_group_separator_stays_inside_its_machine() {
     remote.workspaces.extend([child, next]);
     state.set_endpoint_snapshot(&remote_id, Box::new(remote));
 
-    let frame = state
+    state
         .compose(100, 40)
         .expect("remote grouped workspace frame");
     let workspaces = state
@@ -865,12 +865,29 @@ fn remote_compact_worktree_group_separator_stays_inside_its_machine() {
         .collect::<Vec<_>>();
     assert_eq!(workspaces.len(), 3);
     assert_eq!(workspaces[1].y, workspaces[0].bottom());
-    assert_eq!(workspaces[2].y, workspaces[1].bottom() + 1);
-    let buffer = frame.to_ratatui_buffer().expect("remote workspace buffer");
-    for x in workspaces[1].x + 1..workspaces[1].right() - 1 {
-        assert_eq!(buffer[(x, workspaces[1].bottom())].symbol(), "─");
+    assert_eq!(workspaces[2].y, workspaces[1].bottom());
+    state
+        .remote_collapsed_groups
+        .entry(remote_id.clone())
+        .or_default()
+        .insert("remote-repo".into());
+    let frame = state
+        .compose(100, 40)
+        .expect("collapsed remote group frame");
+    let workspaces = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.endpoint_id == remote_id)
+        .map(|hit| hit.rect)
+        .collect::<Vec<_>>();
+    assert_eq!(workspaces.len(), 2);
+    assert_eq!(workspaces[1].y, workspaces[0].bottom() + 1);
+    let buffer = frame.to_ratatui_buffer().expect("collapsed group buffer");
+    for x in workspaces[0].x + 1..workspaces[0].right() - 1 {
+        assert_eq!(buffer[(x, workspaces[0].bottom())].symbol(), "─");
         assert_eq!(
-            buffer[(x, workspaces[1].bottom())].fg,
+            buffer[(x, workspaces[0].bottom())].fg,
             state.config.palette.surface_dim
         );
     }
@@ -3008,9 +3025,62 @@ fn first_herd_header_offers_add_button_in_both_sidebar_modes() {
         let header = state.hits.herd_tabs[0].0;
         let add = state.hits.add_herd;
         assert_eq!(state.hits.herd_tabs[0].1, 0);
+        assert_eq!(add, Rect::new(header.right(), header.y, 1, 1));
+        assert_eq!(header.width, if collapsed { 1 } else { 3 });
         assert!(!add.is_empty());
         let buffer = frame.to_ratatui_buffer().expect("frame buffer");
         assert_eq!(buffer[(header.x, header.y)].symbol(), "0");
+        assert_eq!(buffer[(add.x, add.y)].symbol(), "+");
+    }
+}
+
+#[test]
+fn herd_header_places_add_after_multiple_visible_tabs() {
+    let (mut state, _) = state_with_remote();
+    state.add_herd(&mut ClientShellInput::default());
+    state.add_herd(&mut ClientShellInput::default());
+
+    for collapsed in [false, true] {
+        state.sidebar_collapsed = collapsed;
+        let frame = state.compose(100, 28).expect("multiple herd tabs");
+        let tabs = &state.hits.herd_tabs;
+        let add = state.hits.add_herd;
+        assert_eq!(tabs.len(), 3);
+        assert_eq!([tabs[0].1, tabs[1].1, tabs[2].1], [0, 1, 2]);
+        assert_eq!(add.x, tabs.last().unwrap().0.right());
+        assert!(tabs.iter().all(|(rect, _)| rect.right() <= add.x));
+        let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+        assert_eq!(buffer[(add.x, add.y)].symbol(), "+");
+    }
+}
+
+#[test]
+fn herd_header_reserves_add_column_at_narrow_widths() {
+    let config = ClientShellConfig::from_config(&Config::default());
+    for (width, collapsed, tabs) in [
+        (1, false, 0),
+        (2, false, 0),
+        (3, false, 0),
+        (4, false, 1),
+        (1, true, 0),
+        (2, true, 1),
+    ] {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut hits = ShellHitMap::default();
+        render::render_herd_header(&mut buffer, area, &config, 0, 4, collapsed, &mut hits);
+        assert_eq!(hits.herd_tabs.len(), tabs);
+        let add = hits.add_herd;
+        assert_eq!(
+            add.x,
+            if tabs == 0 {
+                area.x
+            } else {
+                hits.herd_tabs.last().unwrap().0.right()
+            }
+        );
+        assert!(add.right() <= area.right());
+        assert!(hits.herd_tabs.iter().all(|(rect, _)| rect.right() <= add.x));
         assert_eq!(buffer[(add.x, add.y)].symbol(), "+");
     }
 }
@@ -3028,10 +3098,12 @@ fn herd_tabs_and_machine_menu_route_mouse_input_to_visible_machines() {
     };
     state.compose(100, 32).expect("initial sidebar");
     let add = state.hits.add_herd;
+    assert_eq!(add.x, state.hits.herd_tabs[0].0.right());
     state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), add)]);
     assert_eq!((state.herd_count, state.selected_herd), (2, 1));
 
     state.compose(100, 32).expect("new herd");
+    assert_eq!(state.hits.add_herd.x, state.hits.herd_tabs[1].0.right());
     let first = state.hits.herd_tabs[0].0;
     state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), first)]);
     state.compose(100, 32).expect("first herd");
@@ -3080,9 +3152,15 @@ fn collapsed_herd_tabs_cycle_through_pages_beyond_visible_slots() {
     state.add_herd(&mut ClientShellInput::default());
     state.select_herd(0, &mut ClientShellInput::default());
     for (current, next) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
-        state.compose(100, 28).expect("collapsed herd tabs");
+        let frame = state.compose(100, 28).expect("collapsed herd tabs");
         assert_eq!(state.selected_herd, current);
         assert_eq!(state.hits.herd_tabs[1].1, next);
+        let add = state.hits.add_herd;
+        assert_eq!(add.x, state.hits.herd_tabs.last().unwrap().0.right());
+        assert_eq!(add.width, 1);
+        assert_eq!(add.x + add.width, state.hits.herd_tabs[0].0.x + 4);
+        let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+        assert_eq!(buffer[(add.x, add.y)].symbol(), "+");
         let rect = state.hits.herd_tabs[1].0;
         state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3092,6 +3170,15 @@ fn collapsed_herd_tabs_cycle_through_pages_beyond_visible_slots() {
         })]);
         assert_eq!(state.selected_herd, next);
     }
+    state.compose(100, 28).expect("herd tabs before adding");
+    let add = state.hits.add_herd;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: add.x,
+        row: add.y,
+        modifiers: KeyModifiers::NONE,
+    })]);
+    assert_eq!((state.herd_count, state.selected_herd), (5, 4));
 }
 
 #[test]
