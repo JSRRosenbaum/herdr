@@ -57,7 +57,7 @@ Run `herdr` to open the UI. If a local client is already open, added and enabled
 
 Choose a machine or one of its workspaces in the sidebar. The selected machine receives your pane input and terminal size, and supplies the visible terminal content and graphics. Other connected machines keep updating their workspace information, agent states, and notifications without streaming their pane screens.
 
-Click the arrow beside any machine to collapse or expand its workspace list without switching away from your current workspace. This also works while that machine is reconnecting.
+Click a machine heading to collapse or expand its workspace list without switching away from your current workspace, including while it reconnects. If a remote machine reports a connection error, click the colored right rail cap for its diagnostic; the rest of the heading still toggles the section.
 
 To split the sidebar into herds, click `+` beside the numbered herd tabs, then right-click a machine heading and choose **Move to herd N**. Click a herd tab or press `prefix+,` / `prefix+.` to show the previous or next herd (wrapping at the ends). The selected herd shows its machines, workspaces, and agents. Switching herds does not change the active pane; click a machine or workspace to activate it. New machines start in herd 0; the client remembers each machine's herd by profile ID, so renaming it does not move it. Herds organize the local client only: they do not move workspaces between servers or pause hidden machines. Navigating to a workspace on another herd reveals that herd automatically. Customize the shortcuts with `keys.previous_herd` and `keys.next_herd`.
 

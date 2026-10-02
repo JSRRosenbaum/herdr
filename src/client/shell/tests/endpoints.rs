@@ -112,6 +112,39 @@ fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
     ));
 }
 
+#[test]
+fn offline_remote_machine_header_collapses_even_with_diagnostic() {
+    let (mut state, remote) = state_with_remote();
+    state.mark_endpoint_disconnected(&remote);
+    state.set_machine_diagnostic(&remote, "Connection refused".into());
+
+    for collapsed in [true, false] {
+        let frame = state.compose(100, 28).expect("offline machine frame");
+        let text = frame
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert_eq!(text.contains("remote-workspace"), collapsed);
+        let header = state
+            .hits
+            .machines
+            .iter()
+            .find(|hit| hit.endpoint_id == remote)
+            .expect("offline remote header")
+            .rect;
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: header.x + header.width / 2,
+            row: header.y,
+            modifiers: KeyModifiers::NONE,
+        })]);
+        assert!(outcome.repaint);
+        assert!(outcome.actions.is_empty());
+        assert_eq!(state.collapsed_endpoints.contains(&remote), collapsed);
+    }
+}
+
 fn state_with_scrollable_agents() -> (ClientShellState, ClientEndpointId) {
     let (mut state, remote) = state_with_remote();
     for endpoint_id in [ClientEndpointId::Local, remote.clone()] {
@@ -569,13 +602,16 @@ fn sidebar_renders_local_and_saved_ssh_endpoints_with_status() {
     assert!(text.contains("┤ Build ├"), "frame: {text}");
     assert!(!text.contains("▾ Build"), "frame: {text}");
     assert!(!text.contains("▸ Build"), "frame: {text}");
-    assert_eq!(remote.status_badge, remote.rect);
     let left_cap = (remote.rect.x..remote.rect.right())
         .find(|x| buffer[(*x, remote.rect.y)].symbol() == "┤")
         .expect("left machine rail cap");
     let right_cap = (remote.rect.x..remote.rect.right())
         .find(|x| buffer[(*x, remote.rect.y)].symbol() == "├")
         .expect("right machine rail cap");
+    assert_eq!(
+        remote.status_badge,
+        Rect::new(right_cap, remote.rect.y, 1, 1)
+    );
     assert_eq!(
         left_cap.saturating_sub(remote.rect.x),
         remote
