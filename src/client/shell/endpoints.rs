@@ -43,9 +43,9 @@ impl ClientShellState {
         self.machine_herds.get(endpoint_id).copied().unwrap_or(0)
     }
 
-    pub(super) fn select_herd(&mut self, index: u16, outcome: &mut ClientShellInput) {
+    fn show_herd(&mut self, index: u16, outcome: &mut ClientShellInput) -> bool {
         if index >= self.herd_count || index == self.selected_herd {
-            return;
+            return false;
         }
         self.selected_herd = index;
         self.workspace_scroll = 0;
@@ -55,6 +55,43 @@ impl ClientShellState {
         self.hits = ShellHitMap::default();
         outcome.repaint = true;
         self.persist_chrome_preferences(outcome);
+        true
+    }
+
+    pub(super) fn select_herd(&mut self, index: u16, outcome: &mut ClientShellInput) {
+        if !self.show_herd(index, outcome) {
+            return;
+        }
+        let target = self
+            .active_endpoint_by_herd
+            .get(&index)
+            .filter(|endpoint_id| {
+                self.herd_for(endpoint_id) == index && self.endpoint_is_online(endpoint_id)
+            })
+            .or_else(|| {
+                (self.herd_for(&self.active_endpoint_id) == index
+                    && self.endpoint_is_online(&self.active_endpoint_id))
+                .then_some(&self.active_endpoint_id)
+            })
+            .or_else(|| {
+                self.endpoints
+                    .iter()
+                    .find(|endpoint| {
+                        self.herd_for(&endpoint.endpoint_id) == index
+                            && endpoint.status == ClientEndpointStatus::Online
+                            && endpoint.snapshot.is_some()
+                    })
+                    .map(|endpoint| &endpoint.endpoint_id)
+            })
+            .cloned();
+        if let Some(endpoint_id) = target {
+            self.pending_workspace_highlight = None;
+            self.pending_agent_reveal = None;
+            outcome.actions.push(ClientShellAction::ActivateEndpoint {
+                endpoint_id,
+                target: None,
+            });
+        }
     }
 
     pub(super) fn add_herd(&mut self, outcome: &mut ClientShellInput) {
@@ -80,10 +117,18 @@ impl ClientShellState {
         {
             return;
         }
+        let previous_herd = self.herd_for(endpoint_id);
+        if self.active_endpoint_by_herd.get(&previous_herd) == Some(endpoint_id) {
+            self.active_endpoint_by_herd.remove(&previous_herd);
+        }
         if index == 0 {
             self.machine_herds.remove(endpoint_id);
         } else {
             self.machine_herds.insert(endpoint_id.clone(), index);
+        }
+        if endpoint_id == &self.active_endpoint_id {
+            self.active_endpoint_by_herd
+                .insert(index, endpoint_id.clone());
         }
         self.workspace_scroll = 0;
         self.agent_scroll = 0;
@@ -155,6 +200,14 @@ impl ClientShellState {
                 .iter()
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
+        let endpoints = &self.endpoints;
+        let machine_herds = &self.machine_herds;
+        self.active_endpoint_by_herd.retain(|herd, endpoint_id| {
+            endpoints
+                .iter()
+                .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
+                && machine_herds.get(endpoint_id).copied().unwrap_or(0) == *herd
+        });
     }
 
     pub(crate) fn select_unavailable_local(&mut self) {
@@ -162,7 +215,7 @@ impl ClientShellState {
         self.active_endpoint_id = ClientEndpointId::Local;
         let local_herd = self.herd_for(&ClientEndpointId::Local);
         if local_herd != self.selected_herd {
-            self.select_herd(local_herd, &mut ClientShellInput::default());
+            self.show_herd(local_herd, &mut ClientShellInput::default());
         }
         self.mode = ClientShellMode::Terminal;
         self.snapshot = None;
@@ -292,7 +345,7 @@ impl ClientShellState {
         let herd = self.herd_for(endpoint_id);
         if herd != self.selected_herd {
             let mut outcome = ClientShellInput::default();
-            self.select_herd(herd, &mut outcome);
+            self.show_herd(herd, &mut outcome);
         }
         let switching_endpoint = endpoint_id != &self.active_endpoint_id;
         let agent_scroll = self.agent_scroll;
@@ -305,6 +358,10 @@ impl ClientShellState {
         if switching_endpoint {
             // The aggregate agent list belongs to the client, not one endpoint.
             self.agent_scroll = agent_scroll;
+        }
+        if self.active_endpoint_by_herd.get(&herd) != Some(endpoint_id) {
+            self.active_endpoint_by_herd
+                .insert(herd, endpoint_id.clone());
         }
         if let Some((_, pane_id)) = pending_agent_reveal {
             self.reveal_endpoint_agent(endpoint_id, &pane_id, agent_body_height);

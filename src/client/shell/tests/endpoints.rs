@@ -2816,7 +2816,7 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
 }
 
 #[test]
-fn herd_pages_filter_both_sidebar_panels_and_keep_hidden_main_endpoint() {
+fn herd_pages_filter_both_sidebar_panels_and_switch_active_endpoint() {
     let (mut state, remote) = state_with_remote();
     for id in [ClientEndpointId::Local, remote.clone()] {
         let mut projection = state
@@ -2863,17 +2863,23 @@ fn herd_pages_filter_both_sidebar_panels_and_keep_hidden_main_endpoint() {
 
         state.workspace_scroll = 4;
         state.agent_scroll = 4;
-        state.select_herd(0, &mut ClientShellInput::default());
+        let mut switch = ClientShellInput::default();
+        state.select_herd(0, &mut switch);
+        assert!(matches!(
+            switch.actions.as_slice(),
+            [ClientShellAction::ActivateEndpoint {
+                endpoint_id: ClientEndpointId::Local,
+                target: None,
+            }]
+        ));
         assert_eq!((state.workspace_scroll, state.agent_scroll), (0, 0));
         assert!(
             state.hits.machines.is_empty(),
             "old page hits disappear immediately"
         );
+        assert!(state.activate_endpoint_projection(&ClientEndpointId::Local));
         state.compose(100, 32).expect("local herd sidebar");
-        assert_eq!(
-            state.active_endpoint_id, remote,
-            "main endpoint remains active"
-        );
+        assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
         assert_eq!(state.hits.machines.len(), 1);
         assert_eq!(state.hits.machines[0].endpoint_id, ClientEndpointId::Local);
         assert!(state
@@ -3133,7 +3139,15 @@ fn herd_tabs_and_machine_menu_route_mouse_input_to_visible_machines() {
         .all(|hit| hit.endpoint_id.is_local()));
 
     let second = state.hits.herd_tabs[1].0;
-    state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), second)]);
+    let switch =
+        state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left), second)]);
+    assert!(matches!(
+        switch.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &remote
+    ));
     state.compose(100, 32).expect("destination herd");
     assert_eq!(state.selected_herd, 1);
     assert_eq!(state.hits.machines.len(), 1);
@@ -3179,27 +3193,158 @@ fn collapsed_herd_tabs_cycle_through_pages_beyond_visible_slots() {
 }
 
 #[test]
-fn herd_hotkeys_wrap_without_switching_the_active_machine() {
+fn herd_hotkeys_wrap_and_restore_active_panes() {
     let (mut state, remote) = state_with_remote();
+    let mut remote_projection = state
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.endpoint_id == remote)
+        .unwrap()
+        .snapshot
+        .clone()
+        .unwrap();
+    remote_projection.focused_pane_id = Some("remote-pane".into());
+    remote_projection.panes[0].pane_id = "remote-pane".into();
+    state.set_endpoint_snapshot(&remote, remote_projection);
     state.add_herd(&mut ClientShellInput::default());
     state.add_herd(&mut ClientShellInput::default());
     state.move_machine_to_herd(&remote, 2, &mut ClientShellInput::default());
     state.select_herd(0, &mut ClientShellInput::default());
-    assert!(state.activate_endpoint_projection(&remote));
-    state.select_herd(0, &mut ClientShellInput::default());
 
     let previous = state.handle_input_bytes(b"\x02,");
     assert_eq!(state.selected_herd, 2);
-    assert_eq!(state.active_endpoint_id, remote);
-    assert!(previous.actions.is_empty());
+    assert!(matches!(
+        previous.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &remote
+    ));
+    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    let cancel = state.handle_input_bytes(b"\x02.");
+    assert_eq!(state.selected_herd, 0);
+    assert!(matches!(
+        cancel.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id: ClientEndpointId::Local,
+            target: None,
+        }]
+    ));
+    let retry = state.handle_input_bytes(b"\x02,");
+    assert_eq!(state.selected_herd, 2);
+    assert!(matches!(
+        retry.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &remote
+    ));
+    assert!(state.activate_endpoint_projection(&remote));
+    assert_eq!(state.snapshot.as_ref().unwrap().boot_id, "remote-boot");
+    assert_eq!(
+        state.snapshot.as_ref().unwrap().focused_pane_id.as_deref(),
+        Some("remote-pane")
+    );
 
     let next = state.handle_input_bytes(b"\x02.");
     assert_eq!(state.selected_herd, 0);
-    assert_eq!(state.active_endpoint_id, remote);
-    assert!(next.actions.is_empty());
+    assert!(matches!(
+        next.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id: ClientEndpointId::Local,
+            target: None,
+        }]
+    ));
+    assert!(state.activate_endpoint_projection(&ClientEndpointId::Local));
+    assert_eq!(
+        state.snapshot.as_ref().unwrap().focused_pane_id.as_deref(),
+        Some("pane_1")
+    );
+    assert_eq!(state.snapshot.as_ref().unwrap().boot_id, "boot-1");
 
-    state.handle_input_bytes(b"\x02.");
+    let empty = state.handle_input_bytes(b"\x02.");
     assert_eq!(state.selected_herd, 1);
+    assert!(
+        empty.actions.is_empty(),
+        "an empty herd has no pane to activate"
+    );
+    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+
+    let return_remote = state.handle_input_bytes(b"\x02.");
+    assert_eq!(state.selected_herd, 2);
+    assert!(matches!(
+        return_remote.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &remote
+    ));
+    assert!(state.activate_endpoint_projection(&remote));
+    assert_eq!(state.snapshot.as_ref().unwrap().boot_id, "remote-boot");
+    assert_eq!(
+        state.snapshot.as_ref().unwrap().focused_pane_id.as_deref(),
+        Some("remote-pane")
+    );
+}
+
+#[test]
+fn herd_remembers_the_last_machine_and_falls_back_when_it_disconnects() {
+    let (mut state, first) = state_with_remote();
+    let mut profile = remote_profile();
+    profile.id = ProfileId::parse("fedcba9876543210fedcba9876543210").unwrap();
+    profile.label = "Second".into();
+    state.set_endpoint_catalog(&[remote_profile(), profile.clone()]);
+    let second = ClientEndpointId::Ssh(profile.id);
+    state.set_endpoint_status(&second, ClientEndpointStatus::Online);
+    let mut second_snapshot = snapshot();
+    second_snapshot.boot_id = "second-boot".into();
+    state.set_endpoint_snapshot(&second, Box::new(second_snapshot));
+    state.add_herd(&mut ClientShellInput::default());
+    state.move_machine_to_herd(&first, 1, &mut ClientShellInput::default());
+    state.move_machine_to_herd(&second, 1, &mut ClientShellInput::default());
+    state.select_herd(0, &mut ClientShellInput::default());
+
+    let mut initial = ClientShellInput::default();
+    state.select_herd(1, &mut initial);
+    assert!(matches!(
+        initial.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &first
+    ));
+    assert!(state.activate_endpoint_projection(&first));
+    assert!(state.activate_endpoint_projection(&second));
+    assert_eq!(state.snapshot.as_ref().unwrap().boot_id, "second-boot");
+
+    state.select_herd(0, &mut ClientShellInput::default());
+    assert!(state.activate_endpoint_projection(&ClientEndpointId::Local));
+    let mut restored = ClientShellInput::default();
+    state.select_herd(1, &mut restored);
+    assert!(matches!(
+        restored.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &second
+    ));
+    assert!(state.activate_endpoint_projection(&second));
+
+    state.set_endpoint_status(&second, ClientEndpointStatus::Reconnecting);
+    state.select_herd(0, &mut ClientShellInput::default());
+    let mut fallback = ClientShellInput::default();
+    state.select_herd(1, &mut fallback);
+    assert!(matches!(
+        fallback.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        }] if endpoint_id == &first
+    ));
+    assert!(state.activate_endpoint_projection(&first));
+    state.move_machine_to_herd(&first, 0, &mut ClientShellInput::default());
+    assert_eq!(state.active_endpoint_by_herd.get(&0), Some(&first));
+    assert!(!state.active_endpoint_by_herd.contains_key(&1));
 }
 
 #[test]
