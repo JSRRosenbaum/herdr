@@ -317,6 +317,18 @@ fn compact_group_separators_follow_policy_and_collapse_state() {
     let mut state = ClientShellState::new(config);
     state.set_snapshot(Box::new(compact_two_groups_snapshot()));
     state.set_pane_surface(surface());
+    state
+        .collapsed_groups
+        .extend(["repo".into(), "next".into()]);
+    let frame = state
+        .compose(106, 32)
+        .expect("default collapsed group frame");
+    assert_eq!(state.hits.workspaces.len(), 2);
+    let parent = state.hits.workspaces[0].rect;
+    let next = state.hits.workspaces[1].rect;
+    assert_eq!(next.y, parent.bottom());
+    let buffer = frame.to_ratatui_buffer().expect("default group buffer");
+    assert_ne!(buffer[(parent.x + 1, parent.bottom())].symbol(), "─");
 
     for (policy, collapsed, expected_separator) in [
         (WorktreeGroupSeparator::Collapsed, false, false),
