@@ -824,7 +824,7 @@ fn expanded_sidebar_ends_machine_workspace_lists_with_a_separator() {
 }
 
 #[test]
-fn remote_compact_worktree_separator_follows_collapsed_state() {
+fn remote_compact_worktree_groups_default_to_packed_collapsed_rows() {
     let (mut state, remote_id) = state_with_remote();
     state.config.spaces.worktree_layout = crate::config::WorktreeLayout::Compact;
     let mut remote = snapshot();
@@ -882,15 +882,12 @@ fn remote_compact_worktree_separator_follows_collapsed_state() {
         .map(|hit| hit.rect)
         .collect::<Vec<_>>();
     assert_eq!(workspaces.len(), 2);
-    assert_eq!(workspaces[1].y, workspaces[0].bottom() + 1);
+    assert_eq!(workspaces[1].y, workspaces[0].bottom());
     let buffer = frame.to_ratatui_buffer().expect("collapsed group buffer");
-    for x in workspaces[0].x + 1..workspaces[0].right() - 1 {
-        assert_eq!(buffer[(x, workspaces[0].bottom())].symbol(), "─");
-        assert_eq!(
-            buffer[(x, workspaces[0].bottom())].fg,
-            state.config.palette.surface_dim
-        );
-    }
+    assert_ne!(
+        buffer[(workspaces[0].x + 1, workspaces[0].bottom())].symbol(),
+        "─"
+    );
 }
 
 #[test]

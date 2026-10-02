@@ -500,12 +500,12 @@ impl WorktreeLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorktreeGroupSeparator {
-    /// Only collapsed groups reserve a separator row.
-    #[default]
+    /// Reserve a separator row only after collapsed groups.
     Collapsed,
     /// Preserve the separator after every group.
     Always,
-    /// Never reserve a group separator row.
+    /// Keep worktree groups packed with the surrounding Spaces.
+    #[default]
     None,
 }
 
@@ -517,7 +517,7 @@ pub struct SpacesSidebarConfig {
     pub row_gap: u16,
     /// Worktree presentation in the expanded sidebar. Default: "tree".
     pub worktree_layout: WorktreeLayout,
-    /// Compact worktree group separator policy. Default: "collapsed".
+    /// Compact worktree group separator policy. Default: "none".
     pub worktree_group_separator: WorktreeGroupSeparator,
     /// Whether the user set `rows` explicitly, so an explicit layout always
     /// wins over the compact single-row default.
@@ -586,7 +586,7 @@ impl Default for SpacesSidebarConfig {
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
             worktree_layout: WorktreeLayout::Tree,
-            worktree_group_separator: WorktreeGroupSeparator::Collapsed,
+            worktree_group_separator: WorktreeGroupSeparator::None,
             rows_explicit: false,
             show_workspace_ids: false,
         }
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(config.spaces.worktree_layout, WorktreeLayout::Tree);
         assert_eq!(
             config.spaces.worktree_group_separator,
-            WorktreeGroupSeparator::Collapsed
+            WorktreeGroupSeparator::None
         );
         assert!(!config.spaces.rows_explicit);
         assert!(!config.spaces.show_workspace_ids);

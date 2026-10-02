@@ -1103,8 +1103,8 @@
         {
           "key": "ui.sidebar.spaces.worktree_group_separator",
           "type": "enum",
-          "default": "\"collapsed\"",
-          "description": "In compact worktree layout, collapsed adds a muted rule only after collapsed groups, always adds one after every group, and none adds no group rules. No rule appears at a machine boundary or after the final Space. row_gap controls ordinary blank rows independently.",
+          "default": "\"none\"",
+          "description": "In compact worktree layout, none keeps collapsed groups packed with adjacent Spaces; collapsed adds a muted rule only after collapsed groups, and always adds one after every group. No rule appears at a machine boundary or after the final Space. row_gap controls ordinary blank rows independently.",
           "values": [
             "collapsed",
             "always",
