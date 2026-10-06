@@ -122,7 +122,11 @@ impl App {
             return;
         }
         let base = params.base.unwrap_or_else(|| "HEAD".into());
-        let source = match self.resolve_worktree_source(params.workspace_id, params.cwd) {
+        let source = match self.resolve_worktree_source(
+            params.workspace_id,
+            params.cwd,
+            params.trust_repository,
+        ) {
             Ok(source) => source,
             Err(err) => {
                 Self::send_api_response(respond_to, encode_error(id, err.code, err.message));

@@ -10,7 +10,7 @@ use super::{absolute_user_path, find_worktree_entry, ApiFailure, WorktreeSource}
 
 // Capture only source provenance. Filesystem discovery and Git run on the worker;
 // workspace indices and the target's open state are resolved again on completion.
-struct SourceInput {
+pub(super) struct SourceInput {
     workspace_id: Option<String>,
     membership: Option<WorktreeSpaceMembership>,
     git_space: Option<GitSpaceMetadata>,
@@ -18,7 +18,7 @@ struct SourceInput {
 }
 
 impl SourceInput {
-    fn resolve(
+    pub(super) fn resolve(
         mut self,
         allow_linked: bool,
         trust_repository: bool,
@@ -73,12 +73,12 @@ impl SourceInput {
 fn linked_source_error() -> ApiFailure {
     ApiFailure::new(
         "linked_worktree_source",
-        "New and open worktree actions start from the repo parent workspace.",
+        "Open worktree actions start from the repo parent workspace.",
     )
 }
 
 impl App {
-    fn capture_worktree_read_source(
+    pub(super) fn capture_worktree_read_source(
         &self,
         workspace_id: &Option<String>,
         cwd: &Option<String>,

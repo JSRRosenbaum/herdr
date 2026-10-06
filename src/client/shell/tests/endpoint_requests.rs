@@ -37,6 +37,19 @@ fn pending_worktree() -> (ClientShellState, Vec<ClientShellAction>) {
     submit_worktree(state)
 }
 
+fn pending_linked_worktree() -> (ClientShellState, Vec<ClientShellAction>) {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut projection = snapshot();
+    projection.workspaces[0].worktree = Some(crate::protocol::ClientShellWorktree {
+        key: "repo-key".into(),
+        label: "repo".into(),
+        is_linked_worktree: true,
+    });
+    state.set_snapshot(Box::new(projection));
+    state.set_pane_surface(surface());
+    submit_worktree(state)
+}
+
 fn submit_worktree(mut state: ClientShellState) -> (ClientShellState, Vec<ClientShellAction>) {
     let boot_id = state.snapshot.as_ref().unwrap().boot_id.clone();
     let mut outcome = ClientShellInput::default();
@@ -116,6 +129,45 @@ fn worktree_create_leaves_server_focus_unchanged() {
     assert!(matches!(
         &request.method,
         crate::api::schema::Method::WorktreeCreate(params) if !params.focus
+    ));
+}
+
+#[test]
+fn linked_worktree_create_focuses_returned_tab_after_success() {
+    let (mut state, actions) = pending_linked_worktree();
+    let [ClientShellAction::Endpoint { request, .. }] = &actions[..] else {
+        panic!("expected worktree creation");
+    };
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::WorktreeCreate(params)
+            if params.workspace_id.as_deref() == Some("ws_1") && !params.focus
+    ));
+    let endpoint_id = state.active_endpoint_id.clone();
+    let mut updated = state.snapshot.clone().unwrap();
+    let boot_id = updated.boot_id.clone();
+    updated.revision += 1;
+    state.set_endpoint_snapshot(&endpoint_id, updated);
+    let (repaint, focus) = state.handle_endpoint_result(
+        &boot_id,
+        request_id(&actions),
+        Ok(worktree_created_result()),
+    );
+    assert!(repaint);
+    assert!(state.overlay.is_none());
+    let [ClientShellAction::Endpoint {
+        endpoint_id: target,
+        boot_id: target_boot,
+        request,
+    }] = &focus[..]
+    else {
+        panic!("linked creation should focus through normal client navigation");
+    };
+    assert_eq!(target, &endpoint_id);
+    assert_eq!(target_boot, &boot_id);
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2"
     ));
 }
 
