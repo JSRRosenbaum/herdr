@@ -1614,7 +1614,7 @@ fn remote_binary_candidates(
 
 fn windows_remote_binary_candidate_command() -> String {
     windows_powershell_script_command(&format!(
-        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Get-CimInstance Win32_Process -Filter "Name = 'herdr.exe' OR Name = 'herdr-dev.exe'" -ErrorAction SilentlyContinue | ForEach-Object {{ $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue; if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $userSid) {{ Emit-HerdrPath $_.ExecutablePath }} }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; exit 0"#
+        r#"function Emit-HerdrPath([string]$CandidatePath) {{ if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {{ return }}; $candidateFullPath = [System.IO.Path]::GetFullPath($CandidatePath); $encodedCandidate = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($candidateFullPath)); [Console]::Out.WriteLine('{WINDOWS_REMOTE_PATH_MARKER}' + $encodedCandidate) }}; $herdrHome = if ([string]::IsNullOrWhiteSpace($env:HERDR_HOME)) {{ Join-Path $env:USERPROFILE '.herdr' }} else {{ $env:HERDR_HOME }}; $activeJunction = Get-Item -LiteralPath (Join-Path $herdrHome 'packages\standalone\current') -Force -ErrorAction SilentlyContinue; if ($null -ne $activeJunction -and -not [string]::IsNullOrWhiteSpace([string]$activeJunction.Target)) {{ Emit-HerdrPath (Join-Path ([string]$activeJunction.Target) 'herdr.exe') }}; $pathCommand = Get-Command herdr.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $pathCommand) {{ Emit-HerdrPath $pathCommand.Source }}; $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Get-CimInstance Win32_Process -Filter "Name = 'herdr.exe' OR Name = 'herdr-dev.exe'" -ErrorAction SilentlyContinue | ForEach-Object {{ $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue; if ($owner.ReturnValue -eq 0 -and $owner.Sid -eq $userSid) {{ Emit-HerdrPath $_.ExecutablePath }} }}; exit 0"#
     ))
 }
 
@@ -3412,6 +3412,110 @@ mod tests {
         String::from_utf16(&utf16).expect("UTF-16LE")
     }
 
+    #[cfg(windows)]
+    struct WindowsCandidateFixture(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for WindowsCandidateFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidate_discovery_prefers_active_managed_install_over_path() {
+        use std::os::windows::process::CommandExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-windows-remote-candidates-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _fixture = WindowsCandidateFixture(root.clone());
+        let herdr_home = root.join("home");
+        let release = herdr_home.join("packages/standalone/releases/fixed");
+        let current = herdr_home.join("packages/standalone/current");
+        let stale_dir = root.join("stale");
+        fs::create_dir_all(&release).unwrap();
+        fs::create_dir_all(&stale_dir).unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let managed_executable = release.join("herdr.exe");
+        let stale_executable = stale_dir.join("herdr.exe");
+        fs::hard_link(&executable, &managed_executable).unwrap();
+        fs::hard_link(&executable, &stale_executable).unwrap();
+
+        let junction_command = format!(
+            r#"mklink /J "{}" "{}""#,
+            current.display(),
+            release.display()
+        );
+        let junction_output = Command::new("cmd.exe")
+            .args(["/d", "/s", "/c"])
+            .raw_arg(&junction_command)
+            .output()
+            .unwrap();
+        assert!(
+            junction_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&junction_output.stderr)
+        );
+
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "windows",
+            arch: "x86_64",
+        });
+        let powershell_dir = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0");
+        let system32_dir = powershell_dir.parent().unwrap();
+        let path = format!(
+            "{};{};{};{}",
+            stale_dir.display(),
+            powershell_dir.display(),
+            system32_dir.display(),
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).display()
+        );
+        let run_discovery = |path: &str| -> Vec<PathBuf> {
+            let command = windows_remote_binary_candidate_command();
+            let output = Command::new("cmd.exe")
+                .args(["/d", "/s", "/c"])
+                .raw_arg(&command)
+                .env("HERDR_HOME", &herdr_home)
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            windows_remote_binary_candidates(&remote_herdr, &stdout)
+                .into_iter()
+                .map(|candidate| match candidate.executable {
+                    RemoteExecutable::WindowsPath(path) => PathBuf::from(path),
+                    executable => panic!("unexpected candidate: {executable:?}"),
+                })
+                .collect()
+        };
+
+        let managed = managed_executable;
+        let stale = stale_executable;
+        let candidates = run_discovery(&path);
+        assert_eq!(candidates.first(), Some(&managed));
+        assert_eq!(candidates.get(1), Some(&stale));
+
+        fs::remove_dir(&current).unwrap();
+        let candidates = run_discovery(&path);
+        assert_eq!(candidates.first(), Some(&stale));
+    }
+
     #[cfg(unix)]
     thread_local! {
         pub(super) static UPLOAD_READ_ATTEMPTS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
@@ -4672,36 +4776,6 @@ mod tests {
             WINDOWS_REMOTE_INSTALL_RESULT_MARKER
         )
         .is_err());
-    }
-
-    #[test]
-    fn windows_candidate_discovery_prefers_path_then_active_release() {
-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
-            os: "windows",
-            arch: "x86_64",
-        });
-        let path = r"C:\stale\herdr.exe";
-        let active = r"C:\Users\test\.herdr\packages\standalone\releases\current\herdr.exe";
-        let stdout = format!(
-            "{WINDOWS_REMOTE_PATH_MARKER}{}\nnoise\n{WINDOWS_REMOTE_PATH_MARKER}{}\n{WINDOWS_REMOTE_PATH_MARKER}{}\n",
-            base64::engine::general_purpose::STANDARD.encode(path),
-            base64::engine::general_purpose::STANDARD.encode(active),
-            base64::engine::general_purpose::STANDARD.encode(active),
-        );
-        let candidates = windows_remote_binary_candidates(&remote_herdr, &stdout);
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(
-            candidates[0].executable,
-            RemoteExecutable::WindowsPath(path.to_string())
-        );
-        assert_eq!(
-            candidates[1].executable,
-            RemoteExecutable::WindowsPath(active.to_string())
-        );
-
-        let command = decode_windows_command(&windows_remote_binary_candidate_command());
-        assert!(command.contains("Get-Command herdr.exe"));
-        assert!(command.contains("$activeJunction.Target"));
     }
 
     #[cfg(windows)]

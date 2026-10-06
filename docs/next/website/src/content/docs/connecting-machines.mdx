@@ -47,7 +47,7 @@ herdr machine add workbox --remote-session agents
 
 Without `--label`, this machine shows as `workbox/agents`. If the default name is already taken, `machine add` asks you to pass `--label`.
 
-On Windows servers, setup also checks executables used by Herdr processes owned by the SSH user. It validates their capabilities before reuse, so a compatible running build can be used even when SSH's `PATH` points to an older installation.
+On Windows servers, setup first checks the active managed executable at `$HERDR_HOME/packages/standalone/current/herdr.exe` (or the default `~/.herdr` home), then falls back to `PATH` and compatible Herdr processes owned by the SSH user. It validates capabilities before reuse, so a compatible managed build wins even when `PATH` points to an older installation. This preference affects a new attachment or reconnect discovery only: it does not replace or restart an already running remote server, and reconnects do not stop that server or its pane processes.
 
 Herdr checks both the installed binary and the running server. It starts the requested background server before saving the profile. Compatible client and server versions do not have to match. Missing or incompatible installations go through an approval-based setup. When the running server needs replacement, setup asks before stopping it and its pane processes, then starts the compatible server. The default answer is No. If installation and replacement are both needed, one confirmation covers them. `machine add` does not use experimental live handoff. Cancelling or failing setup leaves the profile unsaved.
 

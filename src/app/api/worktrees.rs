@@ -168,109 +168,16 @@ impl App {
         &mut self,
         workspace_id: Option<String>,
         cwd: Option<String>,
+        trust_repository: bool,
     ) -> Result<WorktreeSource, ApiFailure> {
-        if workspace_id.is_some() && cwd.is_some() {
-            return Err(ApiFailure::new(
-                "invalid_request",
-                "only one of workspace_id or cwd may be supplied",
-            ));
-        }
-
-        if let Some(workspace_id) = workspace_id {
-            let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
-                return Err(ApiFailure::new(
-                    "workspace_not_found",
-                    format!("workspace {workspace_id} not found"),
-                ));
-            };
-            return self.worktree_source_from_workspace(ws_idx);
-        }
-
-        if let Some(cwd) = cwd {
-            let path = absolute_user_path(&cwd)?;
-            let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
-                ApiFailure::new(
-                    "not_git_worktree",
-                    "Herdr worktree actions require a path inside a Git work tree",
-                )
-            })?;
-            if space.is_linked_worktree {
-                return Err(ApiFailure::new(
-                    "linked_worktree_source",
-                    "New and open worktree actions start from the repo parent workspace.",
-                ));
-            }
-            let source = WorktreeSource {
-                workspace_idx: self.find_parent_workspace_for_space(&space),
-                source_checkout_path: space.repo_root.clone(),
-                source_repo_root: space.repo_root,
-                repo_key: space.key,
-                repo_name: space.repo_name,
-            };
-            return Ok(source);
-        }
-
-        let Some(ws_idx) = self.state.active.or_else(|| {
-            self.state
-                .workspaces
-                .get(self.state.selected)
-                .map(|_| self.state.selected)
-        }) else {
-            return Err(ApiFailure::new(
-                "invalid_request",
-                "workspace_id or cwd is required when no workspace is active",
-            ));
-        };
-        self.worktree_source_from_workspace(ws_idx)
-    }
-
-    fn worktree_source_from_workspace(&self, ws_idx: usize) -> Result<WorktreeSource, ApiFailure> {
-        let Some(ws) = self.state.workspaces.get(ws_idx) else {
-            return Err(ApiFailure::new(
-                "workspace_not_found",
-                "workspace not found",
-            ));
-        };
-        if let Some(membership) = ws.worktree_space() {
-            if membership.is_linked_worktree {
-                return Err(ApiFailure::new(
-                    "linked_worktree_source",
-                    "New and open worktree actions start from the repo parent workspace.",
-                ));
-            }
-            return Ok(WorktreeSource {
-                workspace_idx: Some(ws_idx),
-                source_checkout_path: membership.checkout_path.clone(),
-                source_repo_root: membership.repo_root.clone(),
-                repo_key: membership.key.clone(),
-                repo_name: membership.label.clone(),
-            });
-        }
-
-        let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
-        let Some(space) = git_space else {
-            return Err(ApiFailure::new(
-                "not_git_worktree",
-                "Herdr worktree actions require a workspace inside a Git work tree",
-            ));
-        };
-        if space.is_linked_worktree {
-            return Err(ApiFailure::new(
-                "linked_worktree_source",
-                "New and open worktree actions start from the repo parent workspace.",
-            ));
-        }
-        Ok(WorktreeSource {
-            workspace_idx: Some(ws_idx),
-            source_checkout_path: space.repo_root.clone(),
-            source_repo_root: space.repo_root,
-            repo_key: space.key,
-            repo_name: space.repo_name,
-        })
+        let input = self.capture_worktree_read_source(&workspace_id, &cwd)?;
+        let (source_workspace_id, mut source) = input.resolve(true, trust_repository)?;
+        source.workspace_idx = source_workspace_id
+            .as_deref()
+            .and_then(|id| self.parse_workspace_id(id))
+            .or_else(|| self.find_parent_workspace_by_key(&source.repo_key))
+            .or_else(|| self.open_workspace_idx_for_checkout(&source.source_checkout_path));
+        Ok(source)
     }
 
     fn ensure_source_parent_membership(
@@ -298,14 +205,6 @@ impl App {
             }
         }
         Ok(created_parent)
-    }
-
-    fn find_parent_workspace_for_space(
-        &self,
-        space: &crate::workspace::GitSpaceMetadata,
-    ) -> Option<usize> {
-        self.find_parent_workspace_by_key(&space.key)
-            .or_else(|| self.open_workspace_idx_for_checkout(&space.repo_root))
     }
 
     fn find_parent_workspace_by_key(&self, repo_key: &str) -> Option<usize> {
@@ -700,11 +599,21 @@ mod tests {
             return response;
         }
 
-        let event = wait_for_app_event(app);
-        app.handle_internal_event(event);
-        response_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("deferred API request should respond after completion event")
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(response) = response_rx.try_recv() {
+                return response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deferred API request should respond after completion event"
+            );
+            if let Ok(event) = app.event_rx.try_recv() {
+                app.handle_internal_event(event);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1330,7 +1239,7 @@ mod tests {
         let mut app = app_with_parent(&repo);
         let parent_id = app.state.workspaces[0].id.clone();
         let source = app
-            .resolve_worktree_source(Some(parent_id.clone()), None)
+            .resolve_worktree_source(Some(parent_id.clone()), None, false)
             .unwrap_or_else(|err| panic!("{}", err.message));
         app.mark_worktree_membership(&source, 0, repo.clone(), false, false);
         let parent_membership = app.state.workspaces[0].worktree_space().cloned();
@@ -1894,6 +1803,215 @@ mod tests {
 
         let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_create_accepts_linked_workspace_and_cwd_sources() {
+        let repo = create_committed_repo("api-worktree-create-linked-repo");
+        let linked_checkout = unique_temp_path("api-worktree-create-linked-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-create-linked-source",
+                linked_checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worktree_root = unique_temp_path("api-worktree-create-linked-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+        let linked_space = crate::workspace::git_space_metadata(&linked_checkout).unwrap();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = linked_checkout.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: linked_space.key.clone(),
+            label: linked_space.repo_name.clone(),
+            repo_root: repo.clone(),
+            checkout_path: linked_checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let child_id = child.id.clone();
+        app.state.workspaces.push(child);
+        app.state.ensure_test_terminals();
+
+        let mut created_checkouts = Vec::new();
+        for (workspace_id, cwd, branch) in [
+            (
+                Some(child_id.clone()),
+                None,
+                "worktree/api-create-linked-workspace",
+            ),
+            (
+                None,
+                Some(linked_checkout.display().to_string()),
+                "worktree/api-create-linked-cwd",
+            ),
+        ] {
+            let response = run_deferred_api_request(
+                &mut app,
+                Request {
+                    id: "req".into(),
+                    method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                        workspace_id,
+                        cwd,
+                        branch: Some(branch.into()),
+                        ..WorktreeCreateParams::default()
+                    }),
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::WorktreeCreated { worktree, .. } = success.result else {
+                panic!("expected worktree_created response");
+            };
+            assert_eq!(worktree.branch.as_deref(), Some(branch));
+            let checkout = PathBuf::from(&worktree.path);
+            assert!(checkout.join("README.md").exists());
+            let membership = app
+                .state
+                .workspaces
+                .iter()
+                .filter_map(Workspace::worktree_space)
+                .find(|membership| membership.checkout_path == checkout)
+                .expect("created checkout should have workspace provenance");
+            assert_eq!(membership.key, linked_space.key);
+            assert_eq!(
+                crate::worktree::canonical_or_original(&membership.repo_root),
+                crate::worktree::canonical_or_original(&repo)
+            );
+            assert!(membership.is_linked_worktree);
+            created_checkouts.push(checkout);
+        }
+
+        assert!(app.state.workspaces[0]
+            .worktree_space()
+            .is_some_and(|membership| !membership.is_linked_worktree));
+        assert!(app.state.workspaces.iter().any(|workspace| {
+            workspace.id == child_id
+                && workspace
+                    .worktree_space()
+                    .is_some_and(|membership| membership.is_linked_worktree)
+        }));
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        for checkout in created_checkouts {
+            let remove =
+                crate::worktree::build_worktree_remove_command(&repo, &checkout, false, false);
+            crate::worktree::run_worktree_command(&remove).unwrap();
+        }
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, &linked_checkout, false, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_create_from_linked_cwd_creates_missing_parent_workspace() {
+        let repo = create_committed_repo("api-linked-parent");
+        let linked_checkout = unique_temp_path("api-linked-child");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-linked-child",
+                linked_checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worktree_root = unique_temp_path("api-linked-root");
+        let event_hub = crate::api::EventHub::default();
+        let mut app = test_app_with_event_hub(event_hub.clone());
+        app.state.worktree_directory = worktree_root.clone();
+        let linked_space = crate::workspace::git_space_metadata(&linked_checkout).unwrap();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = linked_checkout.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: linked_space.key.clone(),
+            label: linked_space.repo_name.clone(),
+            repo_root: repo.clone(),
+            checkout_path: linked_checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let child_id = child.id.clone();
+        app.state.workspaces = vec![child];
+        app.state.ensure_test_terminals();
+
+        let response = run_deferred_api_request(
+            &mut app,
+            Request {
+                id: "req".into(),
+                method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                    cwd: Some(linked_checkout.display().to_string()),
+                    branch: Some("worktree/api-linked-target".into()),
+                    ..WorktreeCreateParams::default()
+                }),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeCreated { worktree, .. } = success.result else {
+            panic!("expected worktree_created response");
+        };
+        let target = PathBuf::from(&worktree.path);
+        let parent = app
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| {
+                workspace.worktree_space().is_some_and(|membership| {
+                    !membership.is_linked_worktree
+                        && crate::worktree::canonical_or_original(&membership.repo_root)
+                            == crate::worktree::canonical_or_original(&repo)
+                })
+            })
+            .expect("a missing parent workspace should be created");
+        assert_eq!(
+            parent
+                .worktree_space()
+                .expect("parent membership")
+                .checkout_path,
+            repo
+        );
+        assert!(app.state.workspaces.iter().any(|workspace| {
+            workspace.worktree_space().is_some_and(|membership| {
+                membership.checkout_path == target && membership.is_linked_worktree
+            })
+        }));
+        assert!(app.state.workspaces.iter().any(|workspace| {
+            workspace.id == child_id
+                && workspace
+                    .worktree_space()
+                    .is_some_and(|membership| membership.is_linked_worktree)
+        }));
+        assert!(event_hub.events_after(0).iter().any(|(_, event)| {
+            matches!(
+                &event.data,
+                EventData::WorkspaceCreated { workspace }
+                    if workspace
+                        .worktree
+                        .as_ref()
+                        .is_some_and(|membership| !membership.is_linked_worktree)
+            )
+        }));
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &target, false, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let remove =
+            crate::worktree::build_worktree_remove_command(&repo, &linked_checkout, false, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
     }
 
