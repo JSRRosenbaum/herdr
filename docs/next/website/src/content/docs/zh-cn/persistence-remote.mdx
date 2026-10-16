@@ -171,3 +171,7 @@ herdr --machine PROFILE_ID terminal native-attach term_abc123
 
 重新连接的前端不会重建应用的原生界面历史。已加载伴随扩展且处于空闲状态的 OMP 可用 `/native on` 重新探测并绘制，保持 PID、会话和内存中的对话不变。安装扩展不会把它热加载到已经运行的智能体中。
 
+对于已经运行的 ANSI 应用，请选择 Tern 的 **Use ANSI screen**。它使用普通 `terminal attach` 显示当前虚拟终端画面，即使应用空闲也能显示，且不改变 PID 或对话。这是明确的显示选择，不是原生连接的自动回退。与经典连接相同，选择休眠终端可能触发其恢复流程。
+
+两种视图的目标输入保护和就绪标记都要求本地客户端提供 `scoped-terminal-attach-v2`；远程原生服务器继续使用 `native-terminal-attach-v1`。升级 CLI 和插件后应重新创建跟随窗格。选择 **Use Native TSP** 本身不会切换 OMP 的渲染器：连接就绪后再执行 `/native on`；将原生渲染的 OMP 切回 ANSI 视图前先执行 `/native off`。
+

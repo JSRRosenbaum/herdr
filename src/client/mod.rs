@@ -628,19 +628,24 @@ async fn run_client_loop(
         .map(|matcher| matcher.active_handle())
         .unwrap_or_default();
     #[cfg(unix)]
-    let mut native_target = if native_raw {
-        input::NativeAttachTarget::from_env().map_err(ClientError::ConnectionFailed)?
-    } else {
-        None
-    };
+    let mut attach_target =
+        input::AttachTarget::from_env().map_err(ClientError::ConnectionFailed)?;
     #[cfg(unix)]
-    if let Some(target) = &mut native_target {
-        // The server approved native ownership and the frontend isolation
-        // barrier has completed. Input can now queue safely on the raw TTY.
-        target
-            .publish_ready()
-            .map_err(ClientError::ConnectionFailed)?;
+    if native_raw {
+        if let Some(target) = &mut attach_target {
+            // The server approved native ownership and the frontend isolation
+            // barrier has completed. Input can now queue safely on the raw TTY.
+            target
+                .publish_ready()
+                .map_err(ClientError::ConnectionFailed)?;
+        }
     }
+    #[cfg(unix)]
+    let stdin_target = if native_raw {
+        attach_target.take()
+    } else {
+        attach_target.as_ref().map(input::AttachTarget::input_guard)
+    };
     let stdin_thread = std::thread::spawn(move || {
         #[cfg(unix)]
         if native_raw {
@@ -648,16 +653,15 @@ async fn run_client_loop(
                 stdin_tx,
                 &stdin_quit,
                 stdin_initial_host_input,
-                native_target,
+                stdin_target,
             );
             return;
         }
         input::stdin_reader_loop(
             stdin_tx,
             &stdin_quit,
-            will_query_host_terminal_theme,
+            (will_query_host_terminal_theme, will_query_host_cell_size),
             stdin_host_theme_query_pending,
-            will_query_host_cell_size,
             stdin_mouse_capture_active,
             stdin_sgr_pixels_active,
             stdin_escape_disambiguation_active,
@@ -666,6 +670,8 @@ async fn run_client_loop(
             stdin_direct_response,
             #[cfg(unix)]
             stdin_direct_response_active,
+            #[cfg(unix)]
+            stdin_target,
         );
     });
     #[cfg(unix)]
@@ -946,6 +952,15 @@ async fn run_client_loop(
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                if attach_target
+                    .as_ref()
+                    .is_some_and(|target| !target.is_current())
+                {
+                    return Err(ClientError::ConnectionLost(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "attach target changed",
+                    )));
+                }
                 if native_raw {
                     // TSP input is an opaque stream. Host reply framing, attach
                     // escape keys and clipboard shortcuts all alter that stream.
@@ -1382,6 +1397,10 @@ async fn run_client_loop(
                 if native_raw {
                     return Err(ClientError::ConnectionLost(err));
                 }
+                #[cfg(unix)]
+                if attach_target.is_some() {
+                    return Err(ClientError::ConnectionLost(err));
+                }
                 return Ok(());
             }
             ClientLoopEvent::Resize(
@@ -1738,8 +1757,27 @@ async fn run_client_loop(
                             record_received_kitty_graphics(&frame.bytes);
                         }
                         let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&frame.bytes);
-                        let _ = stdout.flush();
+                        #[cfg(unix)]
+                        if attach_target.is_some() {
+                            stdout
+                                .write_all(&frame.bytes)
+                                .map_err(ClientError::ConnectionLost)?;
+                            stdout.flush().map_err(ClientError::ConnectionLost)?;
+                        } else {
+                            let _ = stdout.write_all(&frame.bytes);
+                            let _ = stdout.flush();
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = stdout.write_all(&frame.bytes);
+                            let _ = stdout.flush();
+                        }
+                        #[cfg(unix)]
+                        if let Some(target) = attach_target.as_mut() {
+                            target
+                                .publish_ready()
+                                .map_err(ClientError::ConnectionFailed)?;
+                        }
                     }
                     ServerMessage::Graphics { bytes } => {
                         if native_raw {

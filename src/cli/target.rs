@@ -44,7 +44,7 @@ pub(super) fn maybe_run(args: &[String]) -> Option<io::Result<super::CommandOutc
             println!(
                 "usage: herdr --machine <label-or-id> terminal attach <terminal_id> [--takeover]\n\
                  usage: herdr --machine <label-or-id> terminal native-attach <terminal_id>\n\
-                 saved-ssh-client-bridge-v1 native-terminal-attach-v1"
+                 saved-ssh-client-bridge-v1 native-terminal-attach-v1 scoped-terminal-attach-v2"
             );
             return Ok(super::CommandOutcome::Handled(0));
         }

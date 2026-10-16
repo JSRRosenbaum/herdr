@@ -5,10 +5,11 @@
 ### Added
 - Native `terminal native-attach` for TSP frontends on Linux/macOS, including saved SSH profiles and named remote sessions. Native ownership is negotiated explicitly; unsupported servers do not fall back to ANSI frames.
 - Optional `[session] resume_max_age_hours` filters automatic file-backed agent restores. Zero retains unrestricted restore; file-backed candidates are considered newest first.
+- Explicit ANSI screen presentation reuses classic terminal attach for preserved idle applications; native TSP remains a separate, explicitly selected stream.
 
 ### Fixed
 - Native terminal input remains opaque and bounded under backpressure; detach, takeover and shutdown revoke pending input before releasing ownership.
-- Follower retargets revoke old input independently of the shell observer and advertise readiness only after native approval.
+- Follower retargets revoke old input independently of the shell observer in both classic and native modes. Readiness follows native approval or the first displayed classic terminal frame.
 - Linux pane shutdown includes detached descendants. Compact herds, herd-scoped workspace navigation, per-herd focus and stable workspace-ID display are preserved on the rebased engine.
 
 

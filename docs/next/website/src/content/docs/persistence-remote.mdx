@@ -180,3 +180,7 @@ Input and PTY output are opaque byte streams with bounded backpressure. Native m
 
 A newly attached frontend does not reconstruct the application's native surface history. A companion-enabled, idle OMP process can re-probe and redraw with `/native on` without changing its PID, session or in-memory transcript. Installing a companion does not hot-load it into an already running agent.
 
+For an already-running ANSI application, choose Tern's **Use ANSI screen** instead. It uses ordinary `terminal attach` to display the current virtual-terminal screen, including when the application is idle, without changing its PID or conversation. This is an explicit presentation choice, not a native fallback. Classic attach retains its usual dormant-terminal activation behavior.
+
+The Tern follower requires a local client advertising `scoped-terminal-attach-v2` for target-scoped input and readiness in both views; remote native servers continue to use `native-terminal-attach-v1`. Recreate old follower panes after updating the CLI and plugin. Choosing **Use Native TSP** does not itself switch OMP's renderer: wait for attachment readiness before `/native on`; use `/native off` before returning a native-rendering OMP to an ANSI view.
+
