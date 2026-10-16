@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+- Native `terminal native-attach` for TSP frontends on Linux/macOS, including saved SSH profiles and named remote sessions. Native ownership is negotiated explicitly; unsupported servers do not fall back to ANSI frames.
+- Optional `[session] resume_max_age_hours` filters automatic file-backed agent restores. Zero retains unrestricted restore; file-backed candidates are considered newest first.
+
+### Fixed
+- Native terminal input remains opaque and bounded under backpressure; detach, takeover and shutdown revoke pending input before releasing ownership.
+- Follower retargets revoke old input independently of the shell observer and advertise readiness only after native approval.
+- Linux pane shutdown includes detached descendants. Compact herds, herd-scoped workspace navigation, per-herd focus and stable workspace-ID display are preserved on the rebased engine.
+
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4

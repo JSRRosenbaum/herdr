@@ -162,3 +162,21 @@ base64 bytes, `terminal.resize` changes the controller viewport,
 `terminal.scroll` scrolls the attached viewport, `terminal.mouse` sends a mouse
 event at a cell to applications that enabled mouse reporting, and
 `terminal.release` closes the controller. Only one controller owns input and resize at a time.
+
+### Native TSP attachment
+
+For a frontend such as Tern that renders the application's own TSP surfaces, use the native stream instead of reconstructed ANSI frames:
+
+```bash
+herdr --session agents terminal native-attach term_abc123
+herdr --machine PROFILE_ID terminal native-attach term_abc123
+```
+
+The local native client runs on Linux/macOS; a saved SSH profile can target a Windows server with its complete ConPTY package. The profile's saved session is used exactly, including when multiple profiles share one SSH host.
+
+Both client and running server require this fork's native-attach implementation. The server must explicitly approve native ownership; an old or unavailable server fails without presenting ANSI output as native. Dormant terminals are not automatically resumed.
+
+Input and PTY output are opaque byte streams with bounded backpressure. Native mode does not interpret `ctrl+b q`; close the frontend or stop only its attach client with SIGTERM to detach. The server-owned application keeps running. Detach joins the input reader and isolates late frontend replies before another attachment starts.
+
+A newly attached frontend does not reconstruct the application's native surface history. A companion-enabled, idle OMP process can re-probe and redraw with `/native on` without changing its PID, session or in-memory transcript. Installing a companion does not hot-load it into an already running agent.
+

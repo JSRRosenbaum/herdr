@@ -277,7 +277,12 @@ fn probe_stream_closed(stream: &mut LocalStream) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn windows_named_pipe_available(stream: &mut LocalStream) -> io::Result<Option<u32>> {
+pub(crate) fn client_stream_disconnected(stream: &LocalStream) -> io::Result<bool> {
+    Ok(windows_named_pipe_available(stream)?.is_none())
+}
+
+#[cfg(windows)]
+fn windows_named_pipe_available(stream: &LocalStream) -> io::Result<Option<u32>> {
     use std::os::windows::io::{AsHandle, AsRawHandle};
 
     let LocalStream::NamedPipe(pipe) = stream;

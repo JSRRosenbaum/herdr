@@ -2707,27 +2707,27 @@ fn nul_terminated_utf16_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
-pub fn session_processes(child_pid: u32) -> Vec<u32> {
+pub fn pane_processes(child_pid: u32) -> Vec<u32> {
     if child_pid == 0 {
         return Vec::new();
     }
 
     let snapshot = ProcessSnapshot::new(snapshot_processes());
-    session_processes_from_snapshot(child_pid, &snapshot)
+    pane_processes_from_snapshot(child_pid, &snapshot)
 }
 
-fn session_processes_from_snapshot(child_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
+fn pane_processes_from_snapshot(child_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
     if snapshot.entry(child_pid).is_none() {
-        return Vec::new();
+        return super::pane_processes_from_parts(child_pid, [], []);
     }
 
-    let mut pids = vec![child_pid];
-    pids.extend(
+    super::pane_processes_from_parts(
+        child_pid,
+        [],
         descendant_entries(child_pid, snapshot)
             .into_iter()
             .map(|entry| entry.pid),
-    );
-    pids
+    )
 }
 
 pub fn signal_processes(pids: &[u32], signal: Signal) {
@@ -5307,7 +5307,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_session_processes_collects_shell_and_descendants() {
+    fn windows_pane_processes_collect_shell_and_descendants() {
         let entries = vec![
             test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
             test_entry(20, 10, "cmd.exe", &["cmd.exe"]),
@@ -5316,10 +5316,15 @@ mod tests {
         ];
 
         let snapshot = super::ProcessSnapshot::new(entries);
-        let mut pids = super::session_processes_from_snapshot(10, &snapshot);
-        pids.sort_unstable();
+        let pids = super::pane_processes_from_snapshot(10, &snapshot);
 
         assert_eq!(pids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn windows_pane_processes_keep_shell_when_snapshot_misses_it() {
+        let snapshot = super::ProcessSnapshot::new(Vec::new());
+        assert_eq!(super::pane_processes_from_snapshot(10, &snapshot), vec![10]);
     }
 
     #[test]

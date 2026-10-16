@@ -1,6 +1,6 @@
 //! Terminal setup and restoration for the rendered client.
 
-use std::io::{self, Write as _};
+use std::io::{self, Write};
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,31 +29,120 @@ use super::frame_output::clear_received_kitty_graphics;
 ///
 /// Returns a guard that restores the terminal when dropped.
 pub(super) fn setup_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(true, mouse_capture)
+    setup_terminal_with_capabilities(true, mouse_capture, true)
 }
 
-/// Sets up a direct attach terminal.
-///
-/// Direct attach forwards stdin to the attached PTY. When configured, mouse
-/// capture lets wheel events drive the attached viewport or reach child
-/// programs that requested mouse input.
+/// Direct attach forwards stdin to the attached PTY while drawing its virtual
+/// terminal on an alternate screen.
 pub(super) fn setup_direct_attach_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(false, mouse_capture)
+    setup_terminal_with_capabilities(false, mouse_capture, true)
+}
+
+/// A native TSP surface must remain on Tern's main screen: inline applications
+/// cannot open their surface while the host is in an alternate screen.
+#[cfg(unix)]
+pub(super) fn setup_native_attach_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
+    let mut guard = setup_terminal_with_capabilities(false, mouse_capture, false)?;
+    reset_native_frontend()?;
+    // Kitty's keyboard stack is scoped to this client, even though the native
+    // application writes its own protocol controls directly to stdout.
+    io::stdout().write_all(b"\x1b[>0u")?;
+    guard.native_keyboard = Some(Arc::new(parking_lot::Mutex::new(
+        NativeKeyboardTracker::new(),
+    )));
+    let (previous_level, buffered_input) = query_native_modify_other_keys();
+    guard.restore_modify_other_keys_level = Some(previous_level.unwrap_or(0));
+    guard.buffered_host_input = buffered_input;
+    Ok(guard)
+}
+#[cfg(windows)]
+pub(super) fn setup_native_attach_terminal(_mouse_capture: bool) -> io::Result<TerminalGuard> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native terminal attach requires a Unix client",
+    ))
+}
+
+/// End the old frontend before changing PTY ownership. OSC 133;A closes its
+/// listening surfaces without resetting the caller's keyboard-mode stack.
+/// Drain through the host's real DA1 acknowledgement, then a quiet interval;
+/// otherwise late TSP replies could become input to the next attached agent.
+#[cfg(unix)]
+pub(super) fn reset_native_frontend() -> io::Result<()> {
+    io::stdout().write_all(b"\x1b]133;A\x07\x1b[2J\x1b[H\x1b[c")?;
+    io::stdout().flush()?;
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut responses = HostKeyboardProbeResponses::default();
+    let mut pending = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "native frontend did not quiesce")
+            })?;
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let timeout_ms = if responses.primary_device_attributes {
+            timeout_ms.min(50)
+        } else {
+            timeout_ms
+        };
+        match crate::platform::poll_fd_readable(fd, timeout_ms) {
+            Ok(false) if responses.primary_device_attributes => return Ok(()),
+            Ok(false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "native frontend did not acknowledge its detach barrier",
+                ));
+            }
+            Ok(true) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+        match crate::platform::read_fd(fd, &mut scratch) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) if !responses.primary_device_attributes => {
+                if pending.len() + n > MAX_BUFFERED_HOST_INPUT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native frontend replies exceeded the detach barrier limit",
+                    ));
+                }
+                pending.extend_from_slice(&scratch[..n]);
+                consume_host_keyboard_probe_responses(&mut pending, &mut responses);
+                if responses.primary_device_attributes {
+                    pending.clear();
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub(super) fn setup_terminal_with_capabilities(
     enable_client_protocols: bool,
     mouse_capture: bool,
+    alternate_screen: bool,
 ) -> io::Result<TerminalGuard> {
-    ratatui::init();
+    if alternate_screen {
+        ratatui::init();
+    } else {
+        crossterm::terminal::enable_raw_mode()?;
+    }
     let mut terminal_guard = TerminalGuard {
         host_escape_disambiguation_active: false,
         host_sgr_pixel_mouse: None,
         buffered_host_input: Vec::new(),
         reset_keyboard_enhancements: false,
-        reset_modify_other_keys: false,
         modify_other_keys_sequence: None,
+        native_keyboard: None,
+        restore_modify_other_keys_level: None,
         reset_host_color_scheme_reports: false,
+        alternate_screen,
         restore_claimed: Arc::new(AtomicBool::new(false)),
         restored: false,
         #[cfg(windows)]
@@ -115,7 +204,7 @@ pub(super) fn setup_terminal_with_capabilities(
         .then(crate::input::host_modify_other_keys_mode)
         .flatten();
     if let Some(mode) = modify_other_keys_mode {
-        terminal_guard.reset_modify_other_keys = true;
+        terminal_guard.restore_modify_other_keys_level = Some(0);
         terminal_guard.modify_other_keys_sequence = Some(mode.set_sequence());
         io::stdout().write_all(mode.set_sequence())?;
         io::stdout().flush()?;
@@ -139,14 +228,113 @@ pub(super) struct TerminalGuard {
     host_sgr_pixel_mouse: Option<bool>,
     buffered_host_input: Vec<u8>,
     reset_keyboard_enhancements: bool,
-    reset_modify_other_keys: bool,
     /// The modifyOtherKeys sequence written at setup, re-sent on refresh.
     modify_other_keys_sequence: Option<&'static [u8]>,
+    native_keyboard: Option<Arc<parking_lot::Mutex<NativeKeyboardTracker>>>,
+    restore_modify_other_keys_level: Option<u8>,
     reset_host_color_scheme_reports: bool,
+    alternate_screen: bool,
     restore_claimed: Arc<AtomicBool>,
     restored: bool,
     #[cfg(windows)]
     restore_windows_input_mode: Arc<WindowsInputModeRestore>,
+}
+
+/// Native output bypasses virtual keyboard mode messages. Count only Kitty
+/// stack operations actually forwarded to the host, across PTY chunk splits.
+#[derive(Clone, Copy, Default)]
+enum NativeKeyboardParse {
+    #[default]
+    Ground,
+    Escape,
+    Csi {
+        introducer: u8,
+        value: u8,
+        digits: bool,
+    },
+    ControlString,
+    ControlStringEscape,
+}
+
+#[derive(Default)]
+struct NativeKeyboardTracker {
+    depth: u8,
+    parse: NativeKeyboardParse,
+}
+
+impl NativeKeyboardTracker {
+    #[cfg(any(unix, test))]
+    fn new() -> Self {
+        Self {
+            depth: 1, // The entry pushed by setup_native_attach_terminal.
+            parse: NativeKeyboardParse::Ground,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        use NativeKeyboardParse::*;
+        for &byte in bytes {
+            self.parse = match self.parse {
+                Ground => match byte {
+                    0x1b => Escape,
+                    0x9b => Csi {
+                        introducer: 0,
+                        value: 0,
+                        digits: false,
+                    },
+                    _ => Ground,
+                },
+                Escape => match byte {
+                    b'[' => Csi {
+                        introducer: 0,
+                        value: 0,
+                        digits: false,
+                    },
+                    b'P' | b']' | b'_' | b'^' | b'X' => ControlString,
+                    0x1b => Escape,
+                    _ => Ground,
+                },
+                ControlString => match byte {
+                    0x1b => ControlStringEscape,
+                    0x07 => Ground,
+                    _ => ControlString,
+                },
+                ControlStringEscape => match byte {
+                    b'\\' | 0x07 => Ground,
+                    0x1b => ControlStringEscape,
+                    _ => ControlString,
+                },
+                Csi {
+                    introducer,
+                    value,
+                    digits,
+                } => match byte {
+                    b'>' | b'<' | b'=' if introducer == 0 && !digits => Csi {
+                        introducer: byte,
+                        value,
+                        digits,
+                    },
+                    b'0'..=b'9' => Csi {
+                        introducer,
+                        value: value.saturating_mul(10).saturating_add(byte - b'0').min(32),
+                        digits: true,
+                    },
+                    b'u' => {
+                        if introducer == b'>' {
+                            self.depth = self.depth.saturating_add(1).min(32);
+                        } else if introducer == b'<' {
+                            let popped = if digits && value > 0 { value } else { 1 };
+                            self.depth = self.depth.saturating_sub(popped);
+                        }
+                        Ground
+                    }
+                    0x1b => Escape,
+                    0x40..=0x7e => Ground,
+                    _ => Ground,
+                },
+            };
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -344,6 +532,85 @@ fn consume_host_keyboard_probe_responses(
             offset += 1;
         }
     }
+}
+
+/// Ask the host for the pre-attach modifyOtherKeys setting. XTerm replies to
+/// XTQMODKEYS with CSI > 4 ; level m. Unrelated input is passed to the PTY.
+#[cfg(not(windows))]
+fn query_native_modify_other_keys() -> (Option<u8>, Vec<u8>) {
+    let mut buffered = Vec::new();
+    if io::stdout()
+        .write_all(b"\x1b[?4m")
+        .and_then(|()| io::stdout().flush())
+        .is_err()
+    {
+        return (None, buffered);
+    }
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let deadline = Instant::now() + HOST_CAPABILITY_QUERY_TIMEOUT;
+    let mut level = None;
+    while level.is_none() && buffered.len() < MAX_BUFFERED_HOST_INPUT {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        match crate::platform::poll_fd_readable(fd, timeout_ms) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+        let mut scratch = [0u8; 4096];
+        let limit = scratch.len().min(MAX_BUFFERED_HOST_INPUT - buffered.len());
+        match crate::platform::read_fd(fd, &mut scratch[..limit]) {
+            Ok(0) => break,
+            Ok(n) => {
+                buffered.extend_from_slice(&scratch[..n]);
+                level = consume_native_modify_other_keys_reply(&mut buffered);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (level, buffered)
+}
+
+#[cfg(not(windows))]
+fn consume_native_modify_other_keys_reply(buffered: &mut Vec<u8>) -> Option<u8> {
+    const PASTE_START: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
+    const PREFIX: &[u8] = b"\x1b[>4;";
+    let mut offset = 0;
+    while offset < buffered.len() {
+        if buffered[offset..].starts_with(PASTE_START) {
+            let start = offset + PASTE_START.len();
+            let end = buffered[start..]
+                .windows(PASTE_END.len())
+                .position(|bytes| bytes == PASTE_END)?;
+            offset = start + end + PASTE_END.len();
+            continue;
+        }
+        if let Some(end) = host_control_string_end(&buffered[offset..]) {
+            offset += end?;
+            continue;
+        }
+        if buffered[offset..].starts_with(PREFIX) {
+            let value = offset + PREFIX.len();
+            if value + 1 >= buffered.len() {
+                break;
+            }
+            if (b'0'..=b'3').contains(&buffered[value]) && buffered[value + 1] == b'm' {
+                let level = buffered[value] - b'0';
+                buffered.drain(offset..value + 2);
+                return Some(level);
+            }
+        } else if PREFIX.starts_with(&buffered[offset..]) {
+            break;
+        }
+        offset += 1;
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -662,8 +929,10 @@ fn disable_windows_native_mouse_capture() -> io::Result<()> {
 fn restore_terminal_state_once(
     restore_claimed: &AtomicBool,
     reset_keyboard_enhancements: bool,
-    reset_modify_other_keys: bool,
+    native_keyboard: Option<&Arc<parking_lot::Mutex<NativeKeyboardTracker>>>,
+    restore_modify_other_keys_level: Option<u8>,
     reset_host_color_scheme_reports: bool,
+    alternate_screen: bool,
     #[cfg(windows)] restore_windows_input_mode: &WindowsInputModeRestore,
 ) -> io::Result<()> {
     if restore_claimed.swap(true, Ordering::AcqRel) {
@@ -673,8 +942,10 @@ fn restore_terminal_state_once(
     let restore_windows_input_mode = restore_windows_input_mode.take();
     restore_terminal_state(
         reset_keyboard_enhancements,
-        reset_modify_other_keys,
+        native_keyboard,
+        restore_modify_other_keys_level,
         reset_host_color_scheme_reports,
+        alternate_screen,
         #[cfg(windows)]
         restore_windows_input_mode,
     )
@@ -682,19 +953,21 @@ fn restore_terminal_state_once(
 
 fn restore_terminal_state(
     reset_keyboard_enhancements: bool,
-    reset_modify_other_keys: bool,
+    native_keyboard: Option<&Arc<parking_lot::Mutex<NativeKeyboardTracker>>>,
+    restore_modify_other_keys_level: Option<u8>,
     reset_host_color_scheme_reports: bool,
+    alternate_screen: bool,
     #[cfg(windows)] restore_windows_input_mode: Option<u32>,
 ) -> io::Result<()> {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
 
-    // Reset modifyOtherKeys if we enabled it.
-    if reset_modify_other_keys {
-        let _ = io::stdout().write_all(b"\x1b[>4;0m");
-        let _ = io::stdout().flush();
-    }
+    // modifyOtherKeys has no stack: restore the level observed before native
+    // attach (or the legacy reset for ordinary clients/unqueryable hosts).
+    let _ = write_modify_other_keys_restore(&mut io::stdout(), restore_modify_other_keys_level);
 
-    if reset_keyboard_enhancements {
+    if let Some(tracker) = native_keyboard {
+        let _ = pop_native_keyboard_stack(&mut io::stdout(), tracker);
+    } else if reset_keyboard_enhancements {
         let _ = pop_keyboard_enhancement_flags();
     }
 
@@ -714,7 +987,11 @@ fn restore_terminal_state(
         let _ = disable_windows_native_mouse_capture();
     }
 
-    let restore_result = ratatui::try_restore();
+    let restore_result = if alternate_screen {
+        ratatui::try_restore()
+    } else {
+        crossterm::terminal::disable_raw_mode()
+    };
     let postlude_result =
         write_terminal_restore_postlude(&mut io::stdout(), reset_host_color_scheme_reports);
 
@@ -724,6 +1001,25 @@ fn restore_terminal_state(
     }
 
     restore_result.and(postlude_result)
+}
+
+fn write_modify_other_keys_restore(writer: &mut impl Write, level: Option<u8>) -> io::Result<()> {
+    if let Some(level) = level {
+        write!(writer, "\x1b[>4;{level}m")?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn pop_native_keyboard_stack(
+    writer: &mut impl Write,
+    tracker: &parking_lot::Mutex<NativeKeyboardTracker>,
+) -> io::Result<()> {
+    let depth = tracker.lock().depth;
+    for _ in 0..depth {
+        writer.write_all(b"\x1b[<u")?;
+    }
+    writer.flush()
 }
 
 #[cfg(not(windows))]
@@ -840,6 +1136,12 @@ impl TerminalGuard {
         )
     }
 
+    pub(super) fn observe_native_output(&self, bytes: &[u8]) {
+        if let Some(tracker) = &self.native_keyboard {
+            tracker.lock().observe(bytes);
+        }
+    }
+
     #[cfg(windows)]
     pub(super) fn recover_windows_virtual_terminal_input(&self) -> io::Result<()> {
         let active = enable_windows_virtual_terminal_input(
@@ -857,16 +1159,20 @@ impl TerminalGuard {
     pub(super) fn panic_restore(&self) -> impl Fn() + Send + Sync + 'static {
         let restore_claimed = self.restore_claimed.clone();
         let reset_keyboard_enhancements = self.reset_keyboard_enhancements;
-        let reset_modify_other_keys = self.reset_modify_other_keys;
+        let native_keyboard = self.native_keyboard.clone();
+        let restore_modify_other_keys_level = self.restore_modify_other_keys_level;
         let reset_host_color_scheme_reports = self.reset_host_color_scheme_reports;
+        let alternate_screen = self.alternate_screen;
         #[cfg(windows)]
         let restore_windows_input_mode = self.restore_windows_input_mode.clone();
         move || {
             let _ = restore_terminal_state_once(
                 &restore_claimed,
                 reset_keyboard_enhancements,
-                reset_modify_other_keys,
+                native_keyboard.as_ref(),
+                restore_modify_other_keys_level,
                 reset_host_color_scheme_reports,
+                alternate_screen,
                 #[cfg(windows)]
                 &restore_windows_input_mode,
             );
@@ -878,8 +1184,10 @@ impl TerminalGuard {
         restore_terminal_state_once(
             &self.restore_claimed,
             self.reset_keyboard_enhancements,
-            self.reset_modify_other_keys,
+            self.native_keyboard.as_ref(),
+            self.restore_modify_other_keys_level,
             self.reset_host_color_scheme_reports,
+            self.alternate_screen,
             #[cfg(windows)]
             &self.restore_windows_input_mode,
         )
@@ -892,8 +1200,10 @@ impl Drop for TerminalGuard {
             let _ = restore_terminal_state_once(
                 &self.restore_claimed,
                 self.reset_keyboard_enhancements,
-                self.reset_modify_other_keys,
+                self.native_keyboard.as_ref(),
+                self.restore_modify_other_keys_level,
                 self.reset_host_color_scheme_reports,
+                self.alternate_screen,
                 #[cfg(windows)]
                 &self.restore_windows_input_mode,
             );
@@ -904,6 +1214,40 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_keyboard_restore_pops_only_entries_left_by_native_output() {
+        let mut tracker = NativeKeyboardTracker::new();
+        tracker.observe(b"\x1bPnot keyboard \x1b[>1u\x1b\\\x1b[>31");
+        tracker.observe(b"u\x1b[>7u\x1b[<u\x1b[=5u");
+        let mut output = Vec::new();
+        pop_native_keyboard_stack(&mut output, &parking_lot::Mutex::new(tracker)).unwrap();
+        assert_eq!(output, b"\x1b[<u\x1b[<u");
+
+        let mut balanced = NativeKeyboardTracker::new();
+        balanced.observe(b"\x1b[>31u\x1b[<u");
+        let mut output = Vec::new();
+        pop_native_keyboard_stack(&mut output, &parking_lot::Mutex::new(balanced)).unwrap();
+        assert_eq!(output, b"\x1b[<u");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_modify_other_keys_query_keeps_prior_level_and_opaque_payload() {
+        let opaque = b"\x1bPembedded \x1b[>4;0m\x1b\\\x1b[200~paste \x1b[>4;1m\x1b[201~";
+        let mut input = [opaque.as_slice(), b"typed\x1b[>4;".as_slice()].concat();
+        assert_eq!(consume_native_modify_other_keys_reply(&mut input), None);
+        input.extend_from_slice(b"2mnext");
+        assert_eq!(consume_native_modify_other_keys_reply(&mut input), Some(2));
+        assert_eq!(input, [opaque.as_slice(), b"typednext"].concat());
+    }
+
+    #[test]
+    fn native_modify_other_keys_restores_caller_level_instead_of_defaulting_to_zero() {
+        let mut output = Vec::new();
+        write_modify_other_keys_restore(&mut output, Some(2)).unwrap();
+        assert_eq!(output, b"\x1b[>4;2m");
+    }
 
     #[cfg(windows)]
     #[test]
@@ -975,7 +1319,9 @@ mod tests {
             host_sgr_pixel_mouse: None,
             buffered_host_input: Vec::new(),
             reset_keyboard_enhancements: client_protocols,
-            reset_modify_other_keys: modify_other_keys_sequence.is_some(),
+            native_keyboard: None,
+            restore_modify_other_keys_level: modify_other_keys_sequence.map(|_| 0),
+            alternate_screen: true,
             modify_other_keys_sequence,
             reset_host_color_scheme_reports: false,
             restore_claimed: Arc::new(AtomicBool::new(false)),

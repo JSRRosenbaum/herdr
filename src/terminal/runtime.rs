@@ -17,6 +17,18 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn native_input_handle(&self) -> crate::pane::NativeInputHandle {
+        self.0.native_input_handle()
+    }
+
+    pub(crate) fn subscribe_native_output(&self) -> mpsc::Receiver<Vec<u8>> {
+        self.0.subscribe_native_output()
+    }
+
+    pub(crate) fn unsubscribe_native_output(&self) {
+        self.0.unsubscribe_native_output();
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

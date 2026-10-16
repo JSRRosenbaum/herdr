@@ -57,7 +57,9 @@ use transport::*;
 
 #[cfg(test)]
 pub(crate) use shell::{ClientShellConfig, ClientShellState};
-pub use startup::{run_client, run_terminal_attach};
+pub use startup::{run_client, run_native_terminal_attach, run_terminal_attach};
+#[cfg(unix)]
+pub(crate) use startup::{run_native_terminal_attach_on_socket, run_terminal_attach_on_socket};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
 
 #[cfg(not(windows))]
@@ -76,7 +78,8 @@ use terminal_geometry::{
 use terminal_geometry::{reported_cell_size_from_events, store_reported_cell_size};
 use terminal_setup::{
     effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
-    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
+    setup_direct_attach_terminal, setup_native_attach_terminal, setup_terminal,
+    should_draw_host_cursor, TerminalGuard,
 };
 
 fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
@@ -176,8 +179,20 @@ fn run_client_with_mode(
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
+    socket_override: Option<&std::path::Path>,
+    native_raw: bool,
 ) -> io::Result<()> {
     init_logging();
+    let should_quit = Arc::new(AtomicBool::new(false));
+
+    // ctrlc's "termination" feature also catches SIGTERM/SIGHUP so direct
+    // termination signals still run the quit path and TerminalGuard::Drop.
+    let quit_flag = should_quit.clone();
+    if let Err(err) = ctrlc::set_handler(move || {
+        quit_flag.store(true, Ordering::Release);
+    }) {
+        warn!(%err, "failed to install termination handler; terminal restore relies on TerminalGuard::Drop and the panic hook");
+    }
 
     let loaded_config = crate::config::Config::load();
     // Windows may not have virtual terminal processing enabled until the rendered
@@ -186,7 +201,9 @@ fn run_client_with_mode(
     #[cfg(not(windows))]
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let client_rendered_shell = attach_request.is_none();
-    let socket_path = client_socket_path();
+    let socket_path = socket_override
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(client_socket_path);
     let keybinding_source = client_shell_keybinding_source();
     let startup_config_diagnostic =
         if keybinding_source == shell::ClientShellKeybindingSource::Endpoint {
@@ -260,7 +277,9 @@ fn run_client_with_mode(
         initial_terminal_geometry(pixel_geometry_enabled, kitty_graphics_enabled)?;
 
     let direct_attach = attach_escape.is_some();
-    let mut terminal_guard = if direct_attach {
+    let mut terminal_guard = if native_raw {
+        setup_native_attach_terminal(mouse_capture)
+    } else if direct_attach {
         setup_direct_attach_terminal(mouse_capture)
     } else {
         setup_terminal(mouse_capture)
@@ -312,13 +331,48 @@ fn run_client_with_mode(
                 ));
             }
             if let Some((terminal_id, takeover)) = attach_request {
-                write_to_server(
-                    &mut stream,
-                    &ClientMessage::AttachTerminal {
-                        terminal_id,
-                        takeover,
-                    },
-                )?;
+                if native_raw {
+                    write_to_server(
+                        &mut stream,
+                        &ClientMessage::EndpointControl {
+                            kind: crate::server::terminal_attach::NATIVE_ATTACH_KIND.into(),
+                            data: terminal_id,
+                        },
+                    )?;
+                    stream.set_recv_timeout(Some(Duration::from_secs(3)))?;
+                    loop {
+                        match protocol::read_message::<_, ServerMessage>(
+                            &mut stream,
+                            crate::protocol::MAX_FRAME_SIZE,
+                        ) {
+                            Ok(ServerMessage::EndpointControl { kind, .. })
+                                if kind == crate::server::terminal_attach::NATIVE_READY_KIND =>
+                            {
+                                break;
+                            }
+                            Ok(ServerMessage::ServerShutdown { reason }) => {
+                                return Err(io::Error::other(reason.unwrap_or_else(|| {
+                                    "native terminal attach was rejected".into()
+                                })));
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                return Err(io::Error::other(format!(
+                                    "server did not negotiate native terminal attach: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    stream.set_recv_timeout(None)?;
+                } else {
+                    write_to_server(
+                        &mut stream,
+                        &ClientMessage::AttachTerminal {
+                            terminal_id,
+                            takeover,
+                        },
+                    )?;
+                }
             }
             Ok((stream, handshake))
         })
@@ -346,33 +400,43 @@ fn run_client_with_mode(
         .build()
         .map_err(io::Error::other)?;
 
-    let should_quit = Arc::new(AtomicBool::new(false));
-
-    // ctrlc's "termination" feature also catches SIGTERM/SIGHUP so direct
-    // termination signals still run the quit path and TerminalGuard::Drop.
-    let quit_flag = should_quit.clone();
-    if let Err(err) = ctrlc::set_handler(move || {
-        quit_flag.store(true, Ordering::Release);
-    }) {
-        warn!(%err, "failed to install termination handler; terminal restore relies on TerminalGuard::Drop and the panic hook");
-    }
-
+    #[cfg(unix)]
+    let mut native_stdin_thread = None;
     let result = rt.block_on(async {
         run_client_loop(
             initial,
             endpoint_catalog,
-            cols,
-            rows,
-            cell_width_px,
-            cell_height_px,
+            (cols, rows),
+            (cell_width_px, cell_height_px),
             exact_cell_size,
-            should_quit,
+            should_quit.clone(),
             loop_config,
             attach_escape,
             &terminal_guard,
+            native_raw,
+            #[cfg(unix)]
+            &mut native_stdin_thread,
         )
         .await
     });
+    should_quit.store(true, Ordering::Release);
+    #[cfg(unix)]
+    let native_cleanup = {
+        // The async receiver has already dropped, unblocking a backpressured send.
+        let reader_result = native_stdin_thread.map_or(Ok(()), |thread| {
+            thread
+                .join()
+                .map_err(|_| io::Error::other("native stdin reader panicked"))
+        });
+        let frontend_result = if native_raw {
+            terminal_setup::reset_native_frontend()
+        } else {
+            Ok(())
+        };
+        reader_result.and(frontend_result)
+    };
+    #[cfg(unix)]
+    let result = result.and_then(|()| native_cleanup.map_err(ClientError::ConnectionFailed));
 
     // Restore the terminal before printing any final status message.
     let terminal_restore_failed = terminal_guard.restore().is_err();
@@ -437,16 +501,18 @@ fn graphics_owner_is_active(
 async fn run_client_loop(
     initial: Option<(LocalStream, handshake::HandshakeResult)>,
     mut endpoint_catalog: endpoint::EndpointCatalog,
-    cols: u16,
-    rows: u16,
-    initial_cell_width_px: u32,
-    initial_cell_height_px: u32,
+    initial_size: (u16, u16),
+    initial_cell_size: (u32, u32),
     initial_pixel_geometry_exact: bool,
     should_quit: Arc<AtomicBool>,
     mut config: ClientLoopConfig,
     attach_escape: Option<AttachEscapeState>,
     _terminal_guard: &TerminalGuard,
+    native_raw: bool,
+    #[cfg(unix)] native_stdin_thread: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<(), ClientError> {
+    let (cols, rows) = initial_size;
+    let (initial_cell_width_px, initial_cell_height_px) = initial_cell_size;
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
@@ -561,7 +627,31 @@ async fn run_client_loop(
         .lock()
         .map(|matcher| matcher.active_handle())
         .unwrap_or_default();
-    std::thread::spawn(move || {
+    #[cfg(unix)]
+    let mut native_target = if native_raw {
+        input::NativeAttachTarget::from_env().map_err(ClientError::ConnectionFailed)?
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    if let Some(target) = &mut native_target {
+        // The server approved native ownership and the frontend isolation
+        // barrier has completed. Input can now queue safely on the raw TTY.
+        target
+            .publish_ready()
+            .map_err(ClientError::ConnectionFailed)?;
+    }
+    let stdin_thread = std::thread::spawn(move || {
+        #[cfg(unix)]
+        if native_raw {
+            input::native_stdin_reader_loop(
+                stdin_tx,
+                &stdin_quit,
+                stdin_initial_host_input,
+                native_target,
+            );
+            return;
+        }
         input::stdin_reader_loop(
             stdin_tx,
             &stdin_quit,
@@ -578,6 +668,12 @@ async fn run_client_loop(
             stdin_direct_response_active,
         );
     });
+    #[cfg(unix)]
+    if native_raw {
+        *native_stdin_thread = Some(stdin_thread);
+    }
+    #[cfg(not(unix))]
+    drop(stdin_thread);
 
     #[cfg(unix)]
     if will_query_host_terminal_theme {
@@ -850,6 +946,13 @@ async fn run_client_loop(
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                if native_raw {
+                    // TSP input is an opaque stream. Host reply framing, attach
+                    // escape keys and clipboard shortcuts all alter that stream.
+                    write_to_server(&mut write_stream, &ClientMessage::Input { data })
+                        .map_err(ClientError::ConnectionLost)?;
+                    continue;
+                }
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1276,6 +1379,9 @@ async fn run_client_loop(
             ClientLoopEvent::TerminalUnavailable(err) => {
                 info!(err = %err, "client terminal unavailable; detaching");
                 let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                if native_raw {
+                    return Err(ClientError::ConnectionLost(err));
+                }
                 return Ok(());
             }
             ClientLoopEvent::Resize(
@@ -1623,6 +1729,9 @@ async fn run_client_loop(
                         crate::render_prof::flush_if_due();
                     }
                     ServerMessage::Terminal(frame) => {
+                        if native_raw {
+                            continue;
+                        }
                         if state.kitty_graphics_enabled
                             && contains_kitty_graphics_bytes(&frame.bytes)
                         {
@@ -1633,6 +1742,9 @@ async fn run_client_loop(
                         let _ = stdout.flush();
                     }
                     ServerMessage::Graphics { bytes } => {
+                        if native_raw {
+                            continue;
+                        }
                         if state.kitty_graphics_enabled {
                             record_received_kitty_graphics(&bytes);
                             let mut stdout = io::stdout();
@@ -1641,6 +1753,9 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::TerminalBell { count } => {
+                        if native_raw {
+                            continue;
+                        }
                         if let Err(err) =
                             crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
                         {
@@ -2022,6 +2137,9 @@ async fn run_client_loop(
                         let _ = io::stdout().flush();
                     }
                     ServerMessage::WindowTitle { title } => {
+                        if native_raw {
+                            continue;
+                        }
                         let _ = crate::terminal_effects::write_window_title(
                             &mut io::stdout(),
                             title.as_deref(),
@@ -2074,7 +2192,7 @@ async fn run_client_loop(
                         flags,
                         modify_other_keys_level,
                     } => {
-                        if state.attach_escape.is_some() {
+                        if state.attach_escape.is_some() && !native_raw {
                             crate::terminal_modes::set_direct_host_keyboard_protocol(
                                 &mut io::stdout(),
                                 &mut state.direct_keyboard_protocol,
@@ -2091,6 +2209,25 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::EndpointControl { kind, data } => {
+                        if native_raw && kind == crate::server::terminal_attach::NATIVE_BYTES_KIND {
+                            use base64::Engine as _;
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(data)
+                                .map_err(|error| {
+                                    ClientError::ConnectionFailed(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        error,
+                                    ))
+                                })?;
+                            io::stdout()
+                                .write_all(&bytes)
+                                .map_err(ClientError::ConnectionFailed)?;
+                            _terminal_guard.observe_native_output(&bytes);
+                            io::stdout()
+                                .flush()
+                                .map_err(ClientError::ConnectionFailed)?;
+                            continue;
+                        }
                         if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
                             let progress = pending_activation.as_mut().map(|activation| {
                                 activation.receive_presentation_effects_ready(

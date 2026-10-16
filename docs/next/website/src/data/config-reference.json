@@ -1476,6 +1476,12 @@
           "description": "Resume supported AI-agent panes into their native conversation sessions when restoring a Herdr session."
         },
         {
+          "key": "session.resume_max_age_hours",
+          "type": "integer",
+          "default": "0",
+          "description": "Optional automatic-resume age limit in hours for existing file-backed session references; 0 keeps restores unrestricted. A positive limit excludes stale, missing, future-dated and ID-only references. Does not restrict reported resume commands or live handoff. Restart the server to apply."
+        },
+        {
           "key": "session.startup_per_agent_delay_ms",
           "type": "integer",
           "default": "100",

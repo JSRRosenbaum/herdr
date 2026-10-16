@@ -222,9 +222,9 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// Unsupported platform stub.
-pub fn session_processes(_child_pid: u32) -> Vec<u32> {
-    Vec::new()
+/// Unsupported platform fallback: terminate the pane shell itself.
+pub fn pane_processes(child_pid: u32) -> Vec<u32> {
+    (child_pid > 0).then_some(child_pid).into_iter().collect()
 }
 
 /// Unsupported platform stub.

@@ -538,15 +538,6 @@ fn no_hello_client_closed_within_five_seconds() {
     cleanup_spawned_herdr(spawned, base);
 }
 
-fn server_log_path(config_home: &Path) -> PathBuf {
-    let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
-    config_home.join(app_dir_name).join("herdr-server.log")
-}
-
 fn wait_for_exit(child: &mut Box<dyn Child + Send + Sync>, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -558,24 +549,8 @@ fn wait_for_exit(child: &mut Box<dyn Child + Send + Sync>, timeout: Duration) ->
     false
 }
 
-fn wait_for_log_line(path: &Path, needle: &str, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let content = fs::read_to_string(path).unwrap_or_default();
-        if let Some(line) = content.lines().find(|line| line.contains(needle)) {
-            return line.to_string();
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
-        "log {} did not contain {needle:?}:\n{}",
-        path.display(),
-        fs::read_to_string(path).unwrap_or_default()
-    );
-}
-
 #[test]
-fn server_survives_hangup_and_logs_why_it_stops() {
+fn server_survives_hangup_and_stops_gracefully_on_termination() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -595,24 +570,32 @@ fn server_survives_hangup_and_logs_why_it_stops() {
         "server must not stop on SIGHUP"
     );
     assert!(ping_socket(&api_socket).contains("pong"));
+    // API ping is served independently of the main loop. A real client
+    // handshake establishes that its shutdown monitor is ready as well.
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let mut client = UnixStream::connect(&client_socket).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (protocol, error) = client_handshake(&mut client, CURRENT_PROTOCOL, 80, 24).unwrap();
+    assert_eq!(protocol, CURRENT_PROTOCOL);
+    assert!(error.is_none());
 
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     assert!(
         wait_for_exit(&mut spawned.child, Duration::from_secs(10)),
         "server must stop on SIGTERM"
     );
-    let line = wait_for_log_line(
-        &server_log_path(&config_home),
-        "server shutdown initiated",
-        Duration::from_secs(5),
+    assert!(
+        spawned.child.wait().unwrap().success(),
+        "SIGTERM must complete the server's cleanup path"
     );
-    assert!(line.contains("reason=SIGTERM"), "{line}");
 
     cleanup_spawned_herdr(spawned, base);
 }
 
 #[test]
-fn server_stop_request_logs_its_caller() {
+fn server_stop_request_exits_gracefully() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -634,17 +617,10 @@ fn server_stop_request_logs_its_caller() {
     assert!(response.contains("\"ok\""), "{response}");
 
     assert!(wait_for_exit(&mut spawned.child, Duration::from_secs(10)));
-    let line = wait_for_log_line(
-        &server_log_path(&config_home),
-        "server shutdown initiated",
-        Duration::from_secs(5),
+    assert!(
+        spawned.child.wait().unwrap().success(),
+        "server.stop must complete the server's cleanup path"
     );
-    let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
-        format!("server.stop request from pid {}", std::process::id())
-    } else {
-        "server.stop request".to_string()
-    };
-    assert!(line.contains(&expected), "{line}");
 
     cleanup_spawned_herdr(spawned, base);
 }

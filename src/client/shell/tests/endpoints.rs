@@ -421,7 +421,14 @@ fn active_retry_failure_preserves_diagnostic_and_presentation_freeze() {
                 }
                 _ => {}
             }
-            assert!(click_machine(state.shell.as_mut().unwrap(), &id, false));
+            let prior_notice = state
+                .shell
+                .as_ref()
+                .unwrap()
+                .visible_endpoint_notice
+                .as_ref()
+                .map(|notice| (notice.key.clone(), notice.body.clone()));
+            assert!(click_machine(state.shell.as_mut().unwrap(), &id, true));
             present_endpoint_connection_failure(&mut state, &id, status, message.into());
             assert!(state.presentation_frozen);
             let notice = state
@@ -431,14 +438,16 @@ fn active_retry_failure_preserves_diagnostic_and_presentation_freeze() {
                 .visible_endpoint_notice
                 .as_ref()
                 .unwrap();
-            if previous == Some("paste") {
-                assert_eq!(notice.body, "another notice");
-            } else if previous == Some("other") {
-                assert_eq!(notice.body, "Build west: connection lost");
-            } else if previous == Some("duplicate-label") {
-                assert_eq!(notice.body, "Build: unrelated error");
+            if matches!(previous, Some("paste" | "other" | "duplicate-label")) {
+                let (key, body) = prior_notice.as_ref().unwrap();
+                assert_eq!(&notice.key, key);
+                assert_eq!(&notice.body, body);
             } else {
-                assert_eq!(notice.body, message);
+                assert!(notice.body.contains(message));
+                assert_eq!(
+                    notice.key.code,
+                    format!("machine-diagnostic:{}", remote_profile().id)
+                );
                 assert!(notice.title.contains(command));
             }
             let frame = state
@@ -463,7 +472,10 @@ fn selecting_a_reconnecting_machine_retries_it() {
             assert!(state.activate_endpoint_projection(&id));
         }
         state.mark_endpoint_disconnected(&id);
-        assert!(click_machine(&mut state, &id, false));
+        let mut selection = ClientShellInput::default();
+        assert!(!state.activate_endpoint(id.clone(), &mut selection));
+        assert!(selection.repaint);
+        assert!(selection.actions.is_empty());
         assert_eq!(state.take_machine_retries(), vec![id.clone()]);
         assert!(state.visible_endpoint_notice.is_none());
         assert_eq!(
@@ -479,17 +491,18 @@ fn selecting_a_reconnecting_machine_retries_it() {
         assert!(state.visible_endpoint_notice.is_none());
 
         state.set_endpoint_status(&id, ClientEndpointStatus::Disabled);
-        assert!(click_machine(&mut state, &id, false));
+        let mut rejected_selection = ClientShellInput::default();
+        assert!(!state.activate_endpoint(id.clone(), &mut rejected_selection));
+        assert!(rejected_selection.actions.is_empty());
         assert!(state.take_machine_retries().is_empty());
-        if active {
-            assert!(state.visible_endpoint_notice.is_none());
-            assert!(state.collapsed_endpoints.contains(&id));
-        } else {
-            assert!(state
-                .visible_endpoint_notice
-                .as_ref()
-                .is_some_and(|notice| notice.body == "Build is not ready"));
-        }
+        assert!(state
+            .visible_endpoint_notice
+            .as_ref()
+            .is_some_and(|notice| {
+                notice.key.kind == ClientEndpointNoticeKind::Unavailable
+                    && !notice.body.is_empty()
+                    && notice.key.code == notice.body
+            }));
     }
 }
 

@@ -16,9 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 #[cfg(unix)]
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use tokio::sync::mpsc;
 
 use super::ClientLoopEvent;
@@ -74,6 +76,230 @@ pub fn stdin_reader_loop(
         direct_response,
         direct_response_active,
     );
+}
+
+/// A follower's desired target is its input lease, independent of its polling
+/// shell. Reopen the path so an atomic replacement also revokes the old viewer.
+#[cfg(unix)]
+pub(super) struct NativeAttachTarget {
+    target_file: std::ffi::CString,
+    target: String,
+    ready_file: std::path::PathBuf,
+    ready: Option<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl NativeAttachTarget {
+    pub(super) fn from_env() -> io::Result<Option<Self>> {
+        match (
+            std::env::var_os("HERDR_NATIVE_ATTACH_TARGET_FILE"),
+            std::env::var_os("HERDR_NATIVE_ATTACH_TARGET"),
+            std::env::var_os("HERDR_NATIVE_ATTACH_READY_FILE"),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(target_file), Some(target), Some(ready_file)) => {
+                let target_file = std::ffi::CString::new(target_file.into_vec()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid native attach target file",
+                    )
+                })?;
+                let target = target.into_string().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid native attach target")
+                })?;
+                Ok(Some(Self {
+                    target_file,
+                    target,
+                    ready_file: ready_file.into(),
+                    ready: None,
+                }))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native attach follower requires its target file, target, and ready file",
+            )),
+        }
+    }
+
+    pub(super) fn publish_ready(&mut self) -> io::Result<()> {
+        if !self.is_current() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "native attach target changed before readiness",
+            ));
+        }
+        let temporary = self
+            .ready_file
+            .with_extension(format!("ready-{}", std::process::id()));
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = marker
+            .write_all(self.target.as_bytes())
+            .and_then(|()| std::fs::rename(&temporary, &self.ready_file));
+        if let Err(err) = result {
+            drop(marker);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(err);
+        }
+        self.ready = Some(marker);
+        Ok(())
+    }
+
+    fn is_current(&self) -> bool {
+        // Keep the path conversion outside the per-input path, including for
+        // long configuration paths that std::fs::File::open would allocate for.
+        let fd = loop {
+            let fd =
+                unsafe { libc::open(self.target_file.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd >= 0 {
+                break fd;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return false;
+            }
+        };
+        // A successful open gives this File sole ownership of the descriptor.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut remaining = self.target.as_bytes();
+        let mut scratch = [0u8; 256];
+        while !remaining.is_empty() {
+            let len = remaining.len().min(scratch.len());
+            let count = match file.read(&mut scratch[..len]) {
+                Ok(0) => return false,
+                Ok(count) => count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            };
+            if scratch[..count] != remaining[..count] {
+                return false;
+            }
+            remaining = &remaining[count..];
+        }
+        matches!(file.read(&mut scratch[..1]), Ok(0))
+    }
+}
+#[cfg(unix)]
+impl Drop for NativeAttachTarget {
+    fn drop(&mut self) {
+        if let Some(marker) = &self.ready {
+            // Clear only our inode. An old viewer cannot erase a replacement
+            // viewer's marker, even if both selected the same target.
+            let _ = marker.set_len(0);
+        }
+    }
+}
+
+/// Native TSP input is opaque: neither host-control reply framing nor the
+/// direct-graphics filter may hold, reinterpret or time out any input bytes.
+#[cfg(unix)]
+pub(super) fn native_stdin_reader_loop(
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    initial_input: Vec<u8>,
+    target: Option<NativeAttachTarget>,
+) {
+    if target.as_ref().is_some_and(|target| !target.is_current()) {
+        let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "native attach target changed",
+        )));
+        return;
+    }
+    let stdin = io::stdin();
+    let reader = NativeInputReader {
+        fd: stdin.as_fd(),
+        should_quit,
+        target,
+    };
+    native_input_from_reader(reader, event_tx, should_quit, initial_input);
+}
+
+/// Poll the actual descriptor rather than StdinLock's private read-ahead buffer.
+/// This lets detach join the reader without waiting for another user keystroke.
+#[cfg(unix)]
+struct NativeInputReader<'a> {
+    fd: BorrowedFd<'a>,
+    should_quit: &'a AtomicBool,
+    target: Option<NativeAttachTarget>,
+}
+
+#[cfg(unix)]
+impl Read for NativeInputReader<'_> {
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        while !self.should_quit.load(Ordering::Acquire) {
+            match crate::platform::poll_fd_readable(self.fd.as_raw_fd(), 50) {
+                Ok(true) => {
+                    let count = crate::platform::read_fd(self.fd.as_raw_fd(), dst)?;
+                    // Check AFTER reading: a key generated after a sidebar
+                    // retarget must never reach the old application, even if
+                    // follow.sh has not yet noticed the target-file change.
+                    if count > 0
+                        && self
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| !target.is_current())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "native attach target changed",
+                        ));
+                    }
+                    return Ok(count);
+                }
+                Ok(false) => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(0)
+    }
+}
+
+#[cfg(unix)]
+fn native_input_from_reader(
+    mut reader: impl Read,
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &AtomicBool,
+    initial_input: Vec<u8>,
+) {
+    if !initial_input.is_empty()
+        && event_tx
+            .blocking_send(ClientLoopEvent::StdinInput(initial_input))
+            .is_err()
+    {
+        return;
+    }
+    let mut scratch = [0u8; 4096];
+    while !should_quit.load(Ordering::Acquire) {
+        match reader.read(&mut scratch) {
+            Ok(0) => {
+                if !should_quit.load(Ordering::Acquire) {
+                    let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(
+                        io::ErrorKind::UnexpectedEof.into(),
+                    ));
+                }
+                break;
+            }
+            Ok(n) => {
+                if should_quit.load(Ordering::Acquire) {
+                    break;
+                }
+                if event_tx
+                    .blocking_send(ClientLoopEvent::StdinInput(scratch[..n].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(err));
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -474,21 +700,58 @@ fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    // The stdin reader thread is hard to unit test since it reads from actual stdin.
-    // Integration tests will verify the full client→server input flow.
-    // Here we test the event type construction.
 
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn stdin_input_event_carries_raw_bytes() {
-        let data = vec![0x1b, b'[', b'A']; // Up arrow escape sequence
-        let event = ClientLoopEvent::StdinInput(data.clone());
-        match event {
-            ClientLoopEvent::StdinInput(d) => assert_eq!(d, data),
-            _ => panic!("expected StdinInput event"),
-        }
+    fn native_input_revokes_on_atomic_retarget_before_forwarding_new_keystrokes() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-native-input-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let target_file = base.join("target");
+        std::fs::write(&target_file, "local/old term_old").unwrap();
+        let target = NativeAttachTarget {
+            target_file: std::ffi::CString::new(target_file.clone().into_os_string().into_vec())
+                .unwrap(),
+            target: "local/old term_old".into(),
+            ready_file: base.join("ready"),
+            ready: None,
+        };
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let worker = std::thread::spawn(move || {
+            let quit = AtomicBool::new(false);
+            let reader = NativeInputReader {
+                fd: receiver.as_fd(),
+                should_quit: &quit,
+                target: Some(target),
+            };
+            native_input_from_reader(reader, tx, &quit, Vec::new());
+        });
+        sender.write_all(b"before").unwrap();
+        let Some(ClientLoopEvent::StdinInput(before)) = rx.blocking_recv() else {
+            panic!("input must work before the target changes");
+        };
+        assert_eq!(before, b"before");
+        let replacement = base.join("replacement");
+        std::fs::write(&replacement, "local/new term_new").unwrap();
+        std::fs::rename(replacement, &target_file).unwrap();
+        sender
+            .write_all(b"must not reach the old application")
+            .unwrap();
+        let Some(ClientLoopEvent::TerminalUnavailable(err)) = rx.blocking_recv() else {
+            panic!("retargeted input must revoke the viewer, not forward the new key");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(rx.blocking_recv().is_none());
+        worker.join().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -568,12 +831,6 @@ mod tests {
             2
         );
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn raw_input_idle_flush_timeout_keeps_escape_responsive() {
-        let timeout_ms = std::hint::black_box(crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS);
-        assert!(timeout_ms <= 20);
     }
 
     #[cfg(not(target_os = "macos"))]

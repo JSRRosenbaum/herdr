@@ -153,3 +153,21 @@ herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
 ```
 
 控制模式输出相同的帧，并从标准输入读取逐行 JSON 命令。`terminal.input` 发送文本或 base64 数据，`terminal.resize` 更改视口尺寸，`terminal.scroll` 滚动视口，`terminal.mouse` 向已开启鼠标报告的应用发送单元格位置的鼠标事件，`terminal.release` 关闭控制器。同一时间只有一个控制器能拥有输入和调整尺寸的权限。
+
+### 原生 TSP 连接
+
+对于 Tern 等直接渲染应用自身 TSP 界面的前端，应使用原生流，而不是重建的 ANSI 帧：
+
+```bash
+herdr --session agents terminal native-attach term_abc123
+herdr --machine PROFILE_ID terminal native-attach term_abc123
+```
+
+本地原生客户端运行于 Linux/macOS。保存的 SSH 配置也可连接使用完整 ConPTY 包的 Windows 服务器。同一 SSH 主机上的多个配置仍按各自保存的会话名区分。
+
+客户端和运行中的服务器都需要此分支的原生连接实现。服务器必须明确批准原生控制权；旧服务器或连接失败不会被伪装为原生 ANSI 回退，也不会自动恢复休眠终端。
+
+输入与 PTY 输出保持为不透明字节流，并使用有界背压。原生模式不解释 `ctrl+b q`。关闭前端，或仅向其连接客户端发送 SIGTERM，即可断开；服务器中的应用继续运行。断开时会等待输入线程退出，并隔离旧前端的延迟回复，避免它们进入下一次连接。
+
+重新连接的前端不会重建应用的原生界面历史。已加载伴随扩展且处于空闲状态的 OMP 可用 `/native on` 重新探测并绘制，保持 PID、会话和内存中的对话不变。安装扩展不会把它热加载到已经运行的智能体中。
+

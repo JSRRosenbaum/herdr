@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, SlavePty};
 use serde_json::Value;
 use support::{
     cleanup_test_base, client_shell_handshake, read_server_message, register_runtime_dir,
@@ -402,6 +402,317 @@ fn direct_attach_initial_mouse_capture_follows_config() {
 
     drop(spawned_server);
     cleanup_spawned_herdr(attach, base);
+}
+
+/// One PTY master models the host terminal across two sequential native clients.
+/// Unlike two independent client PTYs, input left by the first surface can become
+/// actual stdin of the second client's server-owned process.
+fn spawn_native_on_slave(
+    slave: &dyn SlavePty,
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket: &PathBuf,
+    terminal_id: &str,
+) -> SpawnedHerdr {
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.args(["terminal", "native-attach", terminal_id]);
+    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", api_socket);
+    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env_remove("HERDR_ENV");
+    let child = slave
+        .spawn_command(cmd)
+        .expect("spawn native client on shared PTY");
+    register_spawned_herdr_pid(child.process_id());
+    SpawnedHerdr {
+        _master: None,
+        child,
+    }
+}
+
+fn captured_native_bytes(output: &SharedOutput, since: usize, needle: &[u8]) -> bool {
+    let captured = output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    captured.bytes[since..]
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn wait_for_native_bytes(output: &SharedOutput, since: usize, needle: &[u8]) {
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+            captured_native_bytes(output, since, needle)
+        }),
+        "native PTY did not emit {:?}; output: {:?}",
+        String::from_utf8_lossy(needle),
+        read_output(output)
+    );
+}
+
+fn native_bytes_len(output: &SharedOutput) -> usize {
+    output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bytes
+        .len()
+}
+
+fn send_pane_text(api_socket: &PathBuf, pane_id: &str, text: &str) {
+    let response = send_json_request(
+        api_socket,
+        &serde_json::json!({
+            "id": "native-cutover-input",
+            "method": "pane.send_text",
+            "params": {"pane_id": pane_id, "text": text},
+        })
+        .to_string(),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "pane input failed: {response}"
+    );
+}
+
+/// The host peer answers only queries actually emitted by the real client.
+/// Older clients have no DA1 reset query; observing the next query still lets
+/// the consumer-boundary assertion, rather than fixture setup, catch the leak.
+fn answer_native_setup(output: &SharedOutput, since: usize, writer: &mut impl Write) {
+    let mut answered_da1 = 0;
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+            let da1_queries = {
+                let captured = output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                captured.bytes[since..]
+                    .windows(b"\x1b[c".len())
+                    .filter(|window| *window == b"\x1b[c")
+                    .count()
+            };
+            while answered_da1 < da1_queries {
+                writer.write_all(b"\x1b[?1;2c").expect("answer host DA1");
+                answered_da1 += 1;
+            }
+            if captured_native_bytes(output, since, b"\x1b[?4m") {
+                writer
+                    .write_all(b"\x1b[>4;0m")
+                    .expect("answer host modifyOtherKeys query");
+                return true;
+            }
+            false
+        }),
+        "native client did not ask for modifyOtherKeys: {:?}",
+        read_output(output)
+    );
+}
+
+#[test]
+fn native_cutover_discards_fragmented_old_control_before_second_process_input() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let create = |label: &str| {
+        let response = send_json_request(
+            &api_socket,
+            &serde_json::json!({
+                "id": label,
+                "method": "workspace.create",
+                "params": {"cwd": base, "label": label},
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            response["result"]["type"], "workspace_created",
+            "{response}"
+        );
+        (
+            response["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .expect("created pane id")
+                .to_owned(),
+            response["result"]["root_pane"]["terminal_id"]
+                .as_str()
+                .expect("created terminal id")
+                .to_owned(),
+        )
+    };
+    let (first_pane, first_terminal) = create("first-native-agent");
+    let (second_pane, second_terminal) = create("second-native-recipient");
+    let first_pid_file = base.join("first-agent.pid");
+    send_pane_text(
+        &api_socket,
+        &first_pane,
+        &format!("printf '%s' \"$$\" > '{}'\n", first_pid_file.display()),
+    );
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || { fs::read_to_string(&first_pid_file).is_ok_and(|pid| pid.parse::<u32>().is_ok()) }
+    ));
+    let first_pid: i32 = fs::read_to_string(&first_pid_file)
+        .unwrap()
+        .parse()
+        .expect("first agent process id");
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open shared host PTY");
+    let output = spawn_pty_drain(pair.master.try_clone_reader().expect("read host PTY"));
+    let mut writer = pair.master.take_writer().expect("write host PTY");
+
+    let first_since = native_bytes_len(&output);
+    let mut first = spawn_native_on_slave(
+        pair.slave.as_ref(),
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &first_terminal,
+    );
+    answer_native_setup(&output, first_since, &mut writer);
+    // Input through the client queues until its server subscription is ready;
+    // host setup alone precedes the handshake on current upstream.
+    writer
+        .write_all(b"printf '\\033_tsp;e;{\"ev\":\"first\"}\\033\\\\'\n")
+        .expect("send first process readiness command");
+    wait_for_native_bytes(&output, first_since, b"\x1b_tsp;e;{\"ev\":\"first\"}\x1b\\");
+
+    // Terminating the *client* detaches its subscription, not the server-owned
+    // agent. Answer the shutdown DA1 if emitted and wait for actual restoration.
+    let detach_since = native_bytes_len(&output);
+    let client_pid = first.child.process_id().expect("first client PID") as i32;
+    assert_eq!(unsafe { libc::kill(client_pid, libc::SIGTERM) }, 0);
+    let mut answered_detach_da1 = false;
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+            if !answered_detach_da1 && captured_native_bytes(&output, detach_since, b"\x1b[c") {
+                writer.write_all(b"\x1b[?1;2c").expect("answer detach DA1");
+                answered_detach_da1 = true;
+            }
+            first.child.try_wait().expect("poll first client").is_some()
+        }),
+        "native client must detach after SIGTERM; output: {:?}",
+        read_output(&output)
+    );
+    wait_for_native_bytes(&output, detach_since, b"\x1b[?2004l");
+    assert_eq!(
+        unsafe { libc::kill(first_pid, 0) },
+        0,
+        "first agent must survive detach"
+    );
+    drop(first);
+
+    // Arm a byte-exact consumer in a *different* server-owned PTY before the
+    // second native client starts. A leaked APC becomes dd's input, not merely
+    // a visible substring on the outer host terminal.
+    let received = base.join("second-agent-input");
+    let recipient_ready = base.join("second-agent-ready");
+    send_pane_text(
+        &api_socket,
+        &second_pane,
+        &format!(
+            "stty raw -echo; printf ready > '{}'; dd bs=1 count=12 of='{}' status=none; stty sane\n",
+            recipient_ready.display(),
+            received.display()
+        ),
+    );
+    let read_second = || {
+        send_json_request(
+            &api_socket,
+            &serde_json::json!({
+                "id": "read-native-consumer",
+                "method": "pane.read",
+                "params": {"pane_id": second_pane, "source": "recent"},
+            })
+            .to_string(),
+        )["result"]["read"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            fs::read(&recipient_ready).is_ok_and(|bytes| bytes == b"ready")
+        }),
+        "second PTY reader must be armed before cutover; pane: {:?}",
+        read_second()
+    );
+
+    let second_since = native_bytes_len(&output);
+    let second = spawn_native_on_slave(
+        pair.slave.as_ref(),
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &second_terminal,
+    );
+    wait_for_native_bytes(&output, second_since, b"\x1b[?7l");
+    // A Tern-like peer releases an old resize reply at the second ownership
+    // boundary. Deliberately fragment the opaque APC for >10ms; this is a
+    // protocol fixture delay, never the condition used to detect readiness.
+    writer
+        .write_all(b"\x1b_tsp;e;{\"ev\":\"resize\",\"sf\":\"old-agent\"")
+        .expect("emit first old control fragment");
+    // This delay exercises control strings split across reads; readiness is
+    // synchronized above by the real client's PTY output, never a timer.
+    thread::sleep(Duration::from_millis(20));
+    writer
+        .write_all(b",\"cols\":80}\x1b\\")
+        .expect("emit final old control fragment");
+    answer_native_setup(&output, second_since, &mut writer);
+
+    let fresh = b"FRESH_INPUT\n";
+    writer.write_all(fresh).expect("send new recipient input");
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(10), || {
+            fs::read(&received).is_ok_and(|bytes| bytes.len() == fresh.len())
+        }),
+        "second process did not receive input; output: {:?}; pane: {:?}",
+        read_output(&output),
+        read_second()
+    );
+    assert_eq!(
+        fs::read(&received).expect("second process captured bytes"),
+        fresh,
+        "old native TSP reply must never enter the second process"
+    );
+    assert_eq!(
+        unsafe { libc::kill(first_pid, 0) },
+        0,
+        "first agent must survive cutover"
+    );
+    let first_alive = base.join("first-agent-still-alive");
+    send_pane_text(
+        &api_socket,
+        &first_pane,
+        &format!("printf alive > '{}'\n", first_alive.display()),
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            fs::read(&first_alive).is_ok_and(|bytes| bytes == b"alive")
+        }),
+        "original agent must still execute input after native cutover"
+    );
+    drop(second);
+    drop(writer);
+    drop(pair);
+    cleanup_spawned_herdr(server, base);
 }
 
 #[test]

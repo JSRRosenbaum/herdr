@@ -351,6 +351,12 @@ impl HeadlessServer {
         // Reject only the requests already queued when shutdown reached cleanup.
         self.reject_queued_api_requests_for_shutdown();
 
+        // Cancel input before dropping output receivers, which can wake a
+        // backpressured PTY actor and free input capacity during shutdown.
+        for client in self.clients.values_mut() {
+            client.revoke_native_input();
+        }
+
         // Close all client connections.
         let staged_files = self
             .clients

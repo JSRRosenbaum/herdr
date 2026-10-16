@@ -423,6 +423,13 @@ pub(crate) enum ServerEvent {
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
+    /// Native input is opaque. The socket reader admits only one event until
+    /// the PTY's bounded queue accepts it (or this connection is cancelled).
+    ClientNativeInput {
+        client_id: u64,
+        data: Vec<u8>,
+        accepted: std::sync::mpsc::Sender<io::Result<()>>,
+    },
     /// A client reported the one armed Kitty regular-file response.
     GraphicsTransmissionResult {
         client_id: u64,
@@ -454,6 +461,8 @@ pub(crate) enum ServerEvent {
         terminal_id: String,
         takeover: bool,
     },
+    /// Optional raw terminal stream; only accepted for a pending terminal client.
+    ClientNativeAttachTerminal { client_id: u64, terminal_id: String },
     /// A client requested read-only observation of one terminal.
     ClientObserveTerminal { client_id: u64, target: String },
     /// A client requested writable control of one terminal.
@@ -1006,6 +1015,7 @@ fn client_read_loop_with_endpoint_controls(
     should_quit: &Arc<AtomicBool>,
     endpoint_control_writer: Option<&ClientControlWriter>,
 ) -> io::Result<()> {
+    let mut native_mode = false;
     while !should_quit.load(Ordering::Acquire) {
         #[cfg(unix)]
         let message = protocol::read_message(
@@ -1039,10 +1049,28 @@ fn client_read_loop_with_endpoint_controls(
             }
         };
 
+        let mut native_input_ack = None;
         let event = match msg {
             ClientMessage::Input { data } => {
-                // Validate input size.
-                if data.len() > MAX_INPUT_PAYLOAD {
+                if native_mode {
+                    if data.len() > MAX_INPUT_PAYLOAD {
+                        warn!(
+                            client_id,
+                            size = data.len(),
+                            "oversized native input, closing"
+                        );
+                        let _ = server_event_tx
+                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        break;
+                    }
+                    let (accepted, ack) = std::sync::mpsc::channel();
+                    native_input_ack = Some(ack);
+                    ServerEvent::ClientNativeInput {
+                        client_id,
+                        data,
+                        accepted,
+                    }
+                } else if data.len() > MAX_INPUT_PAYLOAD {
                     if crate::raw_input::is_complete_text_bracketed_paste(&data) {
                         warn!(
                             client_id,
@@ -1339,6 +1367,14 @@ fn client_read_loop_with_endpoint_controls(
                 }
             }
             ClientMessage::EndpointControl { kind, data }
+                if kind == crate::server::terminal_attach::NATIVE_ATTACH_KIND =>
+            {
+                ServerEvent::ClientNativeAttachTerminal {
+                    client_id,
+                    terminal_id: data,
+                }
+            }
+            ClientMessage::EndpointControl { kind, data }
                 if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_SYNC_KIND =>
             {
                 ServerEvent::ClientShellPresentationSync {
@@ -1411,8 +1447,50 @@ fn client_read_loop_with_endpoint_controls(
             }
         };
 
+        let attaching_native = matches!(&event, ServerEvent::ClientNativeAttachTerminal { .. });
         if server_event_tx.blocking_send(event).is_err() {
             break; // Main loop gone.
+        }
+        if attaching_native {
+            native_mode = true;
+        }
+        if let Some(ack) = native_input_ack {
+            loop {
+                match ack.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Ok(())) => break,
+                    Ok(Err(err)) => {
+                        warn!(client_id, err = %err, "native input was not accepted by PTY");
+                        let _ = server_event_tx
+                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        return Err(err);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = server_event_tx
+                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "native input cancelled",
+                        ));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if should_quit.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        #[cfg(unix)]
+                        if crate::platform::client_stream_disconnected(&stream)? {
+                            let _ = server_event_tx
+                                .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                            return Ok(());
+                        }
+                        #[cfg(windows)]
+                        if crate::ipc::client_stream_disconnected(&stream)? {
+                            let _ = server_event_tx
+                                .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2189,6 +2267,122 @@ mod tests {
             .expect("read thread join")
             .expect("read thread result");
         assert!(server_event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_reader_waits_for_pty_admission_before_next_input_message() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("native-input-credit");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let reader = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind: crate::server::terminal_attach::NATIVE_ATTACH_KIND.into(),
+                data: "term_1".into(),
+            },
+        )
+        .expect("native attach");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "native attach"),
+            ServerEvent::ClientNativeAttachTerminal { client_id: 7, .. }
+        ));
+        let fragments = [
+            b"\x1b[20".as_slice(),
+            b"0~\n\x1b_Ga=T;data\x1b\\".as_slice(),
+        ];
+        for fragment in fragments {
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::Input {
+                    data: fragment.to_vec(),
+                },
+            )
+            .expect("native input");
+        }
+        let accepted = match recv_server_event(&mut server_event_rx, "first native fragment") {
+            ServerEvent::ClientNativeInput {
+                client_id: 7,
+                data,
+                accepted,
+            } => {
+                assert_eq!(data, fragments[0]);
+                accepted
+            }
+            other => panic!("unexpected native input event: {other:?}"),
+        };
+        assert!(matches!(
+            server_event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        accepted.send(Ok(())).expect("admit first fragment");
+        match recv_server_event(&mut server_event_rx, "second native fragment") {
+            ServerEvent::ClientNativeInput {
+                client_id: 7,
+                data,
+                accepted,
+            } => {
+                assert_eq!(data, fragments[1]);
+                accepted.send(Ok(())).expect("admit second fragment");
+            }
+            other => panic!("unexpected native input event: {other:?}"),
+        }
+        protocol::write_message(&mut client_stream, &ClientMessage::Detach).expect("detach");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "detach"),
+            ServerEvent::ClientDetach { client_id: 7 }
+        ));
+        reader
+            .join()
+            .expect("reader thread")
+            .expect("reader returned");
+    }
+
+    #[test]
+    fn native_reader_detects_disconnect_while_waiting_for_pty_capacity() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("native-disconnect");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let reader = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind: crate::server::terminal_attach::NATIVE_ATTACH_KIND.into(),
+                data: "term_1".into(),
+            },
+        )
+        .expect("native attach");
+        let _attach = recv_server_event(&mut server_event_rx, "native attach");
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Input {
+                data: b"pending".to_vec(),
+            },
+        )
+        .expect("native input");
+        let pending = recv_server_event(&mut server_event_rx, "pending input");
+        let ServerEvent::ClientNativeInput { accepted, .. } = pending else {
+            panic!("expected native input");
+        };
+        drop(client_stream);
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "disconnect while waiting"),
+            ServerEvent::ClientDisconnected { client_id: 7 }
+        ));
+        reader
+            .join()
+            .expect("reader thread")
+            .expect("reader returned");
+        assert!(
+            accepted.send(Ok(())).is_err(),
+            "disconnected reader retained ack"
+        );
     }
 
     #[test]

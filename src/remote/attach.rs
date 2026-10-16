@@ -105,6 +105,57 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     )
 }
 
+/// Opens a saved remote session through the existing SSH client-socket bridge.
+/// The interactive client stays local, so Windows servers need no Windows
+/// direct-attach implementation. Discovery and status are read-only: never
+/// install, restart, or take over a remote server as a side effect of follow.
+#[cfg(unix)]
+pub(crate) fn run_saved_terminal_attach(
+    profile: &crate::client::endpoint::SavedSshEndpoint,
+    terminal_id: &str,
+    takeover: bool,
+    native: bool,
+) -> io::Result<()> {
+    let mut ssh = RemoteSsh::new_noninteractive(profile.target.clone());
+    ssh.session_name = profile.session.clone();
+    let remote_herdr = find_installed_remote_herdr(&ssh)?;
+    if !matches!(
+        remote_server_status(&ssh, &remote_herdr, false)?,
+        RemoteServerStatus::Running { .. }
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "Herdr session '{}' on machine '{}' is not running",
+                profile.session, profile.label
+            ),
+        ));
+    }
+    let local_socket = local_forward_socket_path(&profile.target, &profile.session);
+    let bridge = SshStdioBridge::start(
+        profile.target.clone(),
+        remote_herdr,
+        local_socket.clone(),
+        profile.session.clone(),
+        ssh.options(),
+        true,
+        Arc::new(AtomicBool::new(false)),
+    )?;
+    let attach = if native {
+        crate::client::run_native_terminal_attach_on_socket(
+            Some(&local_socket),
+            terminal_id.to_owned(),
+        )
+    } else {
+        crate::client::run_terminal_attach_on_socket(
+            Some(&local_socket),
+            terminal_id.to_owned(),
+            takeover,
+        )
+    };
+    attach.map_err(|error| bridge.reported_failure().unwrap_or(error))
+}
+
 pub(crate) fn check_saved_ssh(target: &str, session: &str) -> io::Result<()> {
     super::validate_remote_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -200,7 +251,7 @@ impl SavedSshSetup {
                             session.running && crate::session::validate_name(&session.name).is_ok()
                         })
                         .map(|session| session.name)
-                        .collect())
+                        .collect());
                 }
                 Err(error) => failure = format!("invalid remote session list: {error}"),
             }
@@ -773,7 +824,10 @@ pub(crate) fn ssh_authentication_command(target: &str) -> io::Result<SshAuthenti
         ));
     }
     if !crate::platform::remote_ssh_config_paths().multiplexing {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "interactive SSH recovery requires Unix OpenSSH multiplexing; authenticate outside Herdr on this platform"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "interactive SSH recovery requires Unix OpenSSH multiplexing; authenticate outside Herdr on this platform",
+        ));
     }
     if !crate::config::Config::load()
         .config
@@ -2327,7 +2381,9 @@ fn confirm_remote_install_with_running_server(
     eprintln!(
         "To complete the remote update, Herdr must stop the running remote server after installing."
     );
-    eprintln!("This stops active remote pane processes, including shells, agents, dev servers, and tests.");
+    eprintln!(
+        "This stops active remote pane processes, including shells, agents, dev servers, and tests."
+    );
     eprintln!();
     eprint!(
         "Install {} and stop the remote server now? [y/N] ",
@@ -2565,7 +2621,9 @@ fn confirm_remote_server_stop(
         }
     }
 
-    eprintln!("This stops active remote pane processes, including shells, agents, dev servers, and tests.");
+    eprintln!(
+        "This stops active remote pane processes, including shells, agents, dev servers, and tests."
+    );
     let prompt = if required_upgrade {
         "stop and update the remote server, then continue attaching? [y/N] "
     } else {
@@ -5162,12 +5220,26 @@ mod tests {
             ),
             (
                 "API bridge with explicit default session",
-                remote_api_bridge_command(&RemoteHerdr::for_platform(RemotePlatform { os: "windows", arch: "x86_64" }), "default", false),
+                remote_api_bridge_command(
+                    &RemoteHerdr::for_platform(RemotePlatform {
+                        os: "windows",
+                        arch: "x86_64",
+                    }),
+                    "default",
+                    false,
+                ),
                 "$process = Start-Process -FilePath herdr.exe -ArgumentList '--session default remote-api-bridge' -NoNewWindow -PassThru -ErrorAction Stop; $null = $process.Handle; $process.WaitForExit(); exit $process.ExitCode",
             ),
             (
                 "API bridge capability probe",
-                remote_api_bridge_command(&RemoteHerdr::for_platform(RemotePlatform { os: "windows", arch: "x86_64" }), "agents", true),
+                remote_api_bridge_command(
+                    &RemoteHerdr::for_platform(RemotePlatform {
+                        os: "windows",
+                        arch: "x86_64",
+                    }),
+                    "agents",
+                    true,
+                ),
                 "$process = Start-Process -FilePath herdr.exe -ArgumentList '--session agents remote-api-bridge --check' -NoNewWindow -PassThru -ErrorAction Stop; $null = $process.Handle; $process.WaitForExit(); exit $process.ExitCode",
             ),
             (

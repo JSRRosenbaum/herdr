@@ -270,6 +270,10 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Maximum age in hours for automatic restoration of file-backed agent
+    /// sessions. Zero leaves restore age unrestricted; a nonzero value requires
+    /// a recent existing session file and skips opaque session IDs.
+    pub resume_max_age_hours: u32,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +281,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            resume_max_age_hours: 0,
         }
     }
 }
@@ -1449,15 +1454,18 @@ new_cwd = "~/Projects"
         let default_config = Config::default();
         assert!(default_config.session.resume_agents_on_restore);
         assert_eq!(default_config.session.startup_per_agent_delay_ms, 100);
+        assert_eq!(default_config.session.resume_max_age_hours, 0);
 
         let toml = r#"
 [session]
 resume_agents_on_restore = false
 startup_per_agent_delay_ms = 0
+resume_max_age_hours = 8
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+        assert_eq!(config.session.resume_max_age_hours, 8);
     }
 
     #[test]

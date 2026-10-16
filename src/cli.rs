@@ -429,6 +429,7 @@ fn run_terminal_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "attach" => terminal_attach(&args[1..]),
+        "native-attach" => terminal_native_attach(&args[1..]),
         "session" => terminal_session(&args[1..]),
         "title" => terminal_title(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -561,6 +562,20 @@ fn terminal_attach(args: &[String]) -> std::io::Result<i32> {
         Err(code) => return Ok(code),
     };
     crate::client::run_terminal_attach(terminal_id, takeover)?;
+    Ok(0)
+}
+
+fn terminal_native_attach(args: &[String]) -> std::io::Result<i32> {
+    let (terminal_id, takeover) =
+        match parse_attach_target(args, "usage: herdr terminal native-attach <terminal_id>") {
+            Ok(parsed) => parsed,
+            Err(code) => return Ok(code),
+        };
+    if takeover {
+        eprintln!("native terminal attach cannot take over an occupied controller");
+        return Ok(2);
+    }
+    crate::client::run_native_terminal_attach(terminal_id)?;
     Ok(0)
 }
 
@@ -987,6 +1002,9 @@ fn print_config_help() {
 fn print_terminal_help() {
     eprintln!("herdr terminal commands:");
     eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
+    eprintln!(
+        "  herdr terminal native-attach <terminal_id>  stream the native TSP application on the main screen"
+    );
     eprintln!("  herdr terminal session control <target> [--takeover] [--cols N] [--rows N]");
     eprintln!("  herdr terminal session observe <target> [--cols N] [--rows N]");
     eprintln!("  herdr terminal title set <title>");

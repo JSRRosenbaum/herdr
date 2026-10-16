@@ -79,6 +79,7 @@ mod client_views;
 mod endpoint_requests;
 mod lifecycle;
 mod native_graphics;
+mod native_terminal;
 mod notifications;
 mod render;
 mod retained_surface;
@@ -505,6 +506,9 @@ impl HeadlessServer {
             if self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
+            // Native output is ordered and reliable, unlike virtual render frames.
+            // Drain it even for hidden panes and without forcing a full UI render.
+            self.stream_native_output();
 
             // 6. Handle scheduled tasks.
             let now = Instant::now();
@@ -623,6 +627,15 @@ impl HeadlessServer {
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
                 });
+            let next_deadline = if self.native_output_waiting() {
+                Some(
+                    next_deadline.map_or(now + Duration::from_millis(2), |deadline| {
+                        deadline.min(now + Duration::from_millis(2))
+                    }),
+                )
+            } else {
+                next_deadline
+            };
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -966,6 +979,12 @@ impl HeadlessServer {
         self.tab_geometry_controllers
             .retain(|_, controller_id| *controller_id != client_id);
         if let Some(mut removed) = removed {
+            // Revoke before releasing ownership or dropping the output
+            // receiver: abort alone cannot stop an in-progress task poll.
+            removed.revoke_native_input();
+            // Disconnect the receiver before clearing its sender: a PTY reader
+            // may already be blocked sending into the full bounded channel.
+            let native_attached = removed.native_output.take().is_some();
             let held_inputs = removed.drain_shell_held_inputs();
             self.release_client_shell_inputs(client_id, held_inputs);
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
@@ -976,6 +995,11 @@ impl HeadlessServer {
                         .state
                         .direct_attach_resize_locks
                         .remove(&terminal_id);
+                    if native_attached {
+                        if let Some(runtime) = self.app.terminal_runtimes.get(&terminal_id) {
+                            runtime.unsubscribe_native_output();
+                        }
+                    }
                 }
             }
         }
@@ -1767,6 +1791,26 @@ impl HeadlessServer {
             return false;
         };
 
+        // A native surface is byte-for-byte PTY output, not a request to wake
+        // an agent. Reject dormant terminals before taking attach ownership.
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.native_requesting)
+            && self.app.terminal_runtimes.get(&real_terminal_id).is_none()
+        {
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some(format!(
+                        "native terminal attach failed: terminal {terminal_id} has no running runtime; resume it explicitly"
+                    )),
+                },
+            );
+            self.remove_client_and_resize_if_needed(client_id);
+            return false;
+        }
+
         if self
             .pending_alt_screen_reads
             .iter()
@@ -1831,8 +1875,34 @@ impl HeadlessServer {
             .state
             .direct_attach_resize_locks
             .insert(real_terminal_id.clone());
-        self.app
-            .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.native_requesting)
+        {
+            if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
+                let receiver = runtime.subscribe_native_output();
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.native_output = Some(receiver);
+                    client.native_input_lease = Some(crate::pty::actor::NativeInputLease::new());
+                }
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::EndpointControl {
+                        kind: crate::server::terminal_attach::NATIVE_READY_KIND.into(),
+                        data: terminal_id.clone(),
+                    },
+                );
+            }
+        }
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.native_requesting)
+        {
+            self.app
+                .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+        }
         if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
             runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
         }
@@ -2047,6 +2117,17 @@ impl HeadlessServer {
                 self.native_started(client_id, transfer_id, image_id);
                 false
             }
+            ServerEvent::ClientNativeAttachTerminal {
+                client_id,
+                terminal_id,
+            } => {
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    if matches!(client.mode, ClientConnectionMode::TerminalPending) {
+                        client.native_requesting = true;
+                    }
+                }
+                self.attach_terminal_client(client_id, terminal_id, false)
+            }
             ServerEvent::ClientAttachTerminal {
                 client_id,
                 terminal_id,
@@ -2081,6 +2162,57 @@ impl HeadlessServer {
             } => self.handle_terminal_attach_mouse(
                 client_id, kind, position, geometry, modifiers, lines,
             ),
+            ServerEvent::ClientNativeInput {
+                client_id,
+                data,
+                accepted,
+            } => {
+                // Never wait on the PTY queue on the main server loop. The
+                // reader sends only one event until this task acknowledges
+                // admission, so memory stays bounded even under backpressure.
+                let input = self.clients.get(&client_id).and_then(|client| {
+                    client.native_output.as_ref()?;
+                    let ClientConnectionMode::TerminalAttach { terminal_id } = &client.mode else {
+                        return None;
+                    };
+                    let lease = client.native_input_lease.as_ref()?.clone();
+                    self.runtime_for_terminal_id_string(terminal_id)
+                        .map(|runtime| {
+                            (runtime.native_input_handle(), lease, client.writer.clone())
+                        })
+                });
+                if let Some((input, lease, writer)) = input {
+                    let task = tokio::spawn(async move {
+                        let result = input.send(Bytes::from(data), &lease).await;
+                        if let Err(err) = &result {
+                            if let Some(writer) = writer {
+                                if let Ok(message) = HeadlessServer::frame_server_message(
+                                    &ServerMessage::ServerShutdown {
+                                        reason: Some(format!(
+                                            "native terminal input failed: {err}"
+                                        )),
+                                    },
+                                ) {
+                                    let _ = writer.control.send(message);
+                                }
+                            }
+                        }
+                        let _ = accepted.send(result);
+                    });
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        // The previous ack was sent before the reader could
+                        // submit this message. Dropping a completed task's
+                        // handle does not affect its admitted bytes.
+                        client.native_input_task.replace(task);
+                    }
+                } else {
+                    let _ = accepted.send(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "native terminal is no longer attached",
+                    )));
+                }
+                false
+            }
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
                     debug!(

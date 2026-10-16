@@ -15,12 +15,12 @@ use super::{
 };
 
 pub(crate) use super::unix_common::{
-    configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
-    create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
-    remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, set_default_plugin_pane_pwd, shutdown_client_stream,
-    status_commands_supported, wait_client_stream_readable, write_client_stream,
-    ClientStreamReader, PinnedSshControlSocket, StatusCommandGuard,
+    client_stream_disconnected, configure_status_command, create_remote_private_dir,
+    create_remote_ssh_config_dir, create_remote_ssh_config_file, hostname, local_datetime,
+    remote_bridge_endpoint_path, remote_private_temp_base, remote_reattach_argument,
+    remote_reattach_program, remote_ssh_config_paths, set_default_plugin_pane_pwd,
+    shutdown_client_stream, status_commands_supported, wait_client_stream_readable,
+    write_client_stream, ClientStreamReader, PinnedSshControlSocket, StatusCommandGuard,
 };
 
 #[cfg(test)]
@@ -797,29 +797,22 @@ pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     super::parse_agent_env_hint(&environ)
 }
 
-pub fn session_processes(child_pid: u32) -> Vec<u32> {
-    let Some(session_id) = process_session_id(child_pid) else {
-        return Vec::new();
-    };
-
-    let mut pids = Vec::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let file_name = entry.file_name();
-        let Some(pid_str) = file_name.to_str() else {
-            continue;
-        };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        if process_session_id(pid) == Some(session_id) {
-            pids.push(pid);
-        }
-    }
-    pids
+pub fn pane_processes(child_pid: u32) -> Vec<u32> {
+    let session_pids = process_session_id(child_pid)
+        .map(|session_id| {
+            std::fs::read_dir("/proc")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let pid = numeric_file_name(&entry)?;
+                    (process_session_id(pid) == Some(session_id)).then_some(pid)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let descendants = process_tree_pids([child_pid], process_task_ids, process_task_children);
+    super::pane_processes_from_parts(child_pid, session_pids, descendants)
 }
 
 pub fn signal_processes(pids: &[u32], signal: Signal) {
@@ -1256,6 +1249,29 @@ mod tests {
         assert_eq!(socket_peer_pid(local.as_raw_fd()), Some(pid));
         let (_, parent) = process_name_and_parent(pid).unwrap();
         assert_eq!(parent, std::os::unix::process::parent_id());
+    }
+
+    #[test]
+    fn pane_processes_include_descendant_that_starts_new_session() {
+        let mut shell = Command::new("sh")
+            .args(["-c", "setsid sleep 30 & printf '%s\\n' \"$!\"; wait"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn shell");
+        let mut output = std::io::BufReader::new(shell.stdout.take().expect("shell stdout"));
+        let mut pid = String::new();
+        std::io::BufRead::read_line(&mut output, &mut pid).expect("read detached child PID");
+        let detached_pid = pid.trim().parse::<u32>().expect("parse detached child PID");
+
+        let contains_detached_descendant = pane_processes(shell.id()).contains(&detached_pid);
+
+        unsafe {
+            libc::kill(detached_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+
+        assert!(contains_detached_descendant);
     }
 
     #[test]
