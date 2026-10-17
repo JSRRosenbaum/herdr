@@ -10,6 +10,7 @@
 ### Fixed
 - Native terminal input remains opaque and bounded under backpressure; detach, takeover and shutdown revoke pending input before releasing ownership.
 - Follower retargets revoke old input independently of the shell observer in both classic and native modes. Readiness follows native approval or the first displayed classic terminal frame.
+- Initial client handshakes honor termination so superseded viewers can disconnect without waiting for a stalled server's Welcome timeout.
 - Linux pane shutdown includes detached descendants. Compact herds, herd-scoped workspace navigation, per-herd focus and stable workspace-ID display are preserved on the rebased engine.
 
 

@@ -8,7 +8,7 @@ mod terminal_screen;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -257,6 +257,53 @@ fn app_dir_name() -> &'static str {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn client_sigterm_cancels_pending_handshake() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let runtime_dir = base.join("runtime");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let listener = UnixListener::bind(runtime_dir.join("herdr-client.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut client = spawn_client_process_with_args(
+        &base.join("config"),
+        &runtime_dir,
+        &runtime_dir.join("herdr.sock"),
+        &["terminal", "attach", "term_pending_handshake"],
+    );
+    let mut connection = None;
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || match listener.accept() {
+            Ok((stream, _)) => {
+                connection = Some(stream);
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("accept client: {error}"),
+        }
+    ));
+    let mut connection = connection.unwrap();
+    connection
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    // Receive the client's hello, but withhold Welcome to keep startup pending.
+    connection.read_exact(&mut [0u8; 4]).unwrap();
+    let pid = client.child.process_id().unwrap() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let cancelled = wait_until(Duration::from_secs(2), Duration::from_millis(10), || {
+        client.child.try_wait().unwrap().is_some()
+    });
+    drop(connection);
+    drop(listener);
+    cleanup_spawned_herdr(client, base);
+    assert!(
+        cancelled,
+        "SIGTERM must cancel startup without waiting for the server's Welcome timeout"
+    );
+}
 
 #[test]
 fn client_connects_and_receives_pane_surface() {
