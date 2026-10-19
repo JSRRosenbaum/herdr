@@ -7,6 +7,10 @@
 - Optional `[session] resume_max_age_hours` filters automatic file-backed agent restores. Zero retains unrestricted restore; file-backed candidates are considered newest first.
 - Explicit ANSI screen presentation reuses classic terminal attach for preserved idle applications; native TSP remains a separate, explicitly selected stream.
 
+### Changed
+- The unofficial fork's landing pages now document pinned fork downloads, separate named sessions and the compact sidebar settings, rather than directing readers to upstream installers and updates.
+- Custom integration pushes run CI and distribution checks. Manual artifacts carry a local build identity, validate static Linux ELF files without invoking `ldd`, and probe the bundled Windows ConPTY package. Upstream-only website and issue-maintenance jobs do not run in forks.
+
 ### Fixed
 - Native terminal input remains opaque and bounded under backpressure; detach, takeover and shutdown revoke pending input before releasing ownership.
 - Follower retargets revoke old input independently of the shell observer in both classic and native modes. Readiness follows native approval or the first displayed classic terminal frame.

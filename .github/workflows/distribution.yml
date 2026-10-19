@@ -20,7 +20,7 @@ on:
       - "src/detect/manifest_update.rs"
       - "src/detect/manifests/**"
   push:
-    branches: [master]
+    branches: [master, integration/native-main-20261016]
     paths:
       - ".github/workflows/distribution.yml"
       - "distribution/**"

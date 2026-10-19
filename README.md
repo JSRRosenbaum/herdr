@@ -1,85 +1,51 @@
-# herdr
+# Herdr — unofficial compact-herds fork
 
+[English](README.md) · [简体中文](README.zh-CN.md) · [Fork release](https://github.com/JSRRosenbaum/herdr/releases/tag/compact-herds-v0.9.5-20261018) · [Original Herdr](https://github.com/herdrdev/herdr)
 
-<p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
-</p>
+This is **JSRRosenbaum's unofficial custom fork** of [Herdr](https://github.com/herdrdev/herdr), the terminal runtime for coding agents. It is not an upstream Herdr release or a sidebar plugin. The [shared screenshot](https://pbs.twimg.com/media/HUw9wCvXcAIHsIz.png?name=orig) ([post](https://x.com/JezzickRose/status/2111131042123792478)) shows the fork's built-in sidebar with a particular configuration and live workspaces. Herdr provides the underlying agent terminals, status, machines and worktrees; this fork adds numbered herd pages with per-herd focus/navigation, a compact worktree presentation and optional visible workspace IDs. It does not ship the screenshot's agents, projects, machine connections or personal configuration.
 
-<p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
-</p>
+## Get this exact fork
 
-<p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
-</p>
+Get the **unofficial** [`compact-herds-v0.9.5-20261018` release](https://github.com/JSRRosenbaum/herdr/releases/tag/compact-herds-v0.9.5-20261018) from this repository and check its source commit and SHA-256 checksums before using an asset. Choose the artifact for your OS/architecture (Linux x86_64 or aarch64, macOS x86_64 or aarch64, Windows x86_64). Run its `herdr` binary directly and keep it separate from an upstream installation. On Windows, extract the **complete `herdr-windows-x86_64.zip`**, keeping the bundled `conpty/` directory alongside `herdr.exe`; do not copy out the executable alone.
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
-</p>
-
----
-
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
-
-**the runtime your coding agents live on.**
-
-- **detach without stopping work** — herdr keeps terminals running in a background server when you close the client or lose your SSH connection. after a server or machine restart, herdr restores the saved layout and can resume supported agent sessions; the original processes do not survive. [session state →](https://herdr.dev/docs/session-state/)
-- **several machines, one window** — keep local work and saved ssh machines together, with a combined agent list and independent reconnects. [remote machines →](https://herdr.dev/docs/connecting-machines/)
-- **never hunt for the stuck one** — every pane is marked working, blocked, or idle. when an agent stops and needs an answer, herdr says so.
-- **agent-native** — agents drive herdr through the cli and socket api: they can spawn panes, prompt each other, and wait until another agent is genuinely blocked. [agent skill →](https://herdr.dev/docs/agent-skill/)
-- **runs what you already run** — claude code, codex, cursor, opencode, grok and the rest. herdr doesn't wrap or replace them; it owns their terminals. building an agent? [add herdr support →](https://herdr.dev/docs/add-herdr-support/)
-- **keyboard and mouse, both first-class** — tmux-style prefix keys *and* click, drag, split. pick per moment, not per tool.
-- **plugins** — extend panes and workflows. [browse the marketplace →](https://herdr.dev/plugins/)
-- **one rust binary, no electron** — runs in whatever terminal you already use.
-
----
-
-## install
+**Do not use** `herdr.dev/install.sh`, `install.ps1`, `brew install herdr`, `mise use -g herdr`, upstream GitHub releases, or `herdr update` to obtain or keep this fork: those install/update **upstream Herdr**, not this custom build. This fork has no separate automatic update channel. Installing both against the same default session can mix versions; launch the fork in an isolated named session while evaluating it:
 
 ```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+/path/to/this-fork/herdr --session compact-herds-demo
 ```
 
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
+On Windows, from the extracted ZIP in PowerShell, use `./herdr.exe --session compact-herds-demo`. The named session prevents attaching to your usual default session; keep the extracted Windows files together. Do not use the fork to update an existing upstream server.
 
-then start it where the work lives:
+### Build the tagged fork from source
+
+Install [Rust 1.96.1](https://www.rust-lang.org/tools/install) (including Cargo), [Zig 0.16.0](https://ziglang.org/download/), CMake, Ninja, Git, and a native C/C++ toolchain; ensure `zig`, `cmake`, and `ninja` are on `PATH`. On Linux, install your distribution's C/C++ build tools; for the release's musl targets also install musl tools (and an aarch64 cross compiler if cross-building). macOS needs Xcode Command Line Tools. Native Windows builds need Visual Studio C++ Build Tools and Windows SDK; set `ZIG` to the Zig 0.16.0 executable if a different Zig is on `PATH`. The Windows executable built by Cargo alone is **not** the complete packaged ConPTY ZIP; use the release ZIP for the packaged Windows runtime.
 
 ```bash
-herdr
+git clone https://github.com/JSRRosenbaum/herdr.git herdr-compact-herds
+cd herdr-compact-herds
+git fetch origin tag compact-herds-v0.9.5-20261018
+git checkout --detach compact-herds-v0.9.5-20261018
+cargo +1.96.1 --config 'env.HERDR_BUILD_CHANNEL="local"' --config 'env.HERDR_BUILD_ID="compact-herds-20261018"' build --release --locked
+# Linux/macOS executable: target/release/herdr
 ```
 
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
+These commands deliberately pin this fork's tag rather than `master` or the upstream repository. For release-equivalent target builds, the repository's [manual artifact workflow](.github/workflows/build-artifacts-manual.yml) documents the exact Rust targets, toolchain and Windows ConPTY packaging procedure. Run a locally built binary by its explicit path with `--session compact-herds-demo`, not a different `herdr` on your `PATH`.
 
-## docs
+## Sidebar setup
 
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [connecting machines](https://herdr.dev/docs/connecting-machines/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [add herdr support to your agent](https://herdr.dev/docs/add-herdr-support/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
+Put the following in `~/.config/herdr/config.toml` on Linux/macOS or `%APPDATA%\herdr\config.toml` on Windows (merge with any existing `[ui.sidebar.spaces]` section):
 
-## thanks
-
-every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
-
-enterprise / partnership: hey@herdr.dev
-
-## agent instructions
-
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
-
-## development
-
-```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
-cargo build --release
-
-just test        # unit tests
-just check       # formatting, tests, and maintenance checks
+```toml
+[ui.sidebar.spaces]
+worktree_layout = "compact"
+show_workspace_ids = true
+worktree_group_separator = "none"
 ```
 
-## license
+`worktree_layout = "compact"` selects the fork's shallow worktree connectors and single-row default space layout; `show_workspace_ids = true` right-aligns stable `w…` workspace tags on space rows. `worktree_group_separator` accepts `"none"` (default), `"collapsed"` or `"always"`; it controls separator spacing after worktree groups. Explicit `rows` settings override the compact default row layout. Worktree grouping, saved SSH machines and agent status build on Herdr's existing functionality. This fork's numbered herd pages group machines and retain their focus/navigation context; switch with `prefix+,` and `prefix+.` (by default Ctrl+B then comma/period). These are built-in client features, not an OMP plugin. Your own machines, worktrees and agents determine what appears. The [upstream configuration](https://herdr.dev/docs/configuration/) and [remote machines](https://herdr.dev/docs/connecting-machines/) guides cover the general Herdr model, not this fork's extra herd/compact/ID settings.
 
-Herdr is licensed under the [Apache License 2.0](LICENSE).
+Tern's native/ANSI presentation integration is **separate experimental work**, not required for this sidebar and not included as a `terminal.presentation.get` policy in this source snapshot.
+
+## Upstream documentation and credit
+
+Original project: [herdrdev/herdr](https://github.com/herdrdev/herdr), [upstream quick start](https://herdr.dev/docs/quick-start/), [upstream documentation](https://herdr.dev/docs/), [upstream plugins](https://herdr.dev/plugins/). These resources document upstream Herdr; their downloads and installers do not install this fork. The original project's sponsors are listed in [SPONSORS.md](SPONSORS.md). This fork is licensed under [Apache 2.0](LICENSE). Agents editing this repository should read [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
