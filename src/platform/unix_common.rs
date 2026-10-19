@@ -51,6 +51,22 @@ impl std::io::Write for ChildPipe {
     }
 }
 
+/// Shared bridge-cancellation boundary; Unix sockets do not need native pipe
+/// disconnection to release cloned streams.
+pub(crate) struct RemoteBridgePipeAbort;
+
+impl RemoteBridgePipeAbort {
+    pub(crate) fn new(_stream: &crate::ipc::LocalStream) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn abort(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn complete(self) {}
+}
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {
         super::ChildExitReason::Interrupted

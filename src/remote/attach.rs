@@ -15,6 +15,7 @@ use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+#[cfg(not(windows))]
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::ListenerNonblockingMode;
@@ -2968,6 +2969,38 @@ exit 2"#,
 }
 
 pub(super) const STALE_API_METADATA: &str = "herdr-machine-metadata-stale-v1";
+pub(super) const STALE_SSH_METADATA: &str = "herdr-ssh-metadata-stale-v1";
+
+pub(super) fn cached_remote_client_command(
+    metadata: &crate::client::endpoint::SshMachineMetadata,
+    session: &str,
+) -> String {
+    let session_args = RemoteExecutable::session_args(session, &["remote-client-bridge"]);
+    if metadata.os == "windows" {
+        let path = crate::platform::quote_powershell_arg(&metadata.executable);
+        let stale = crate::platform::quote_powershell_arg(STALE_SSH_METADATA);
+        return windows_powershell_script_command(&format!(
+            "if (-not (Test-Path -LiteralPath {path} -PathType Leaf)) {{ [Console]::Error.WriteLine({stale}); exit 78 }}; {}",
+            windows_powershell_streaming_application_script(
+                &metadata.executable,
+                &session_args,
+            ),
+        ));
+    }
+
+    let path = shell_quote(&metadata.executable);
+    let mut bridge_command = format!("exec {path}");
+    for arg in session_args {
+        bridge_command.push(' ');
+        bridge_command.push_str(&shell_quote(arg));
+    }
+    bridge_command.push_str(" <&3");
+    let script = format!(
+        "if test -x {path}; then\n{}\nelse\n    printf '%s\\n' '{STALE_SSH_METADATA}' >&2\n    exit 78\nfi",
+        posix_remote_output_command(&bridge_command),
+    );
+    posix_base64_command(&script)
+}
 
 pub(super) fn cached_remote_api_command(
     metadata: &crate::client::endpoint::SshMachineMetadata,
@@ -2983,7 +3016,7 @@ pub(super) fn cached_remote_api_command(
             "{probe}{}",
             windows_powershell_streaming_application_script(
                 &metadata.executable,
-                &["--session", session, "remote-api-bridge"]
+                &["--session", session, "remote-api-bridge"],
             ),
         ));
     }
@@ -3346,6 +3379,7 @@ fn bridge_child(
     mut command: Command,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let mut pipe_abort = crate::platform::RemoteBridgePipeAbort::new(&stream)?;
     let upload_stop = Arc::new(BridgeUploadStop::new()?);
 
     let mut child =
@@ -3450,9 +3484,15 @@ fn bridge_child(
         thread::sleep(BRIDGE_ACCEPT_POLL);
     };
     upload_stop.cancel();
-    if !child_exited {
+    let abandoned_before_join = !child_exited
+        || bridge_stop.load(Ordering::Acquire)
+        || client_closed.load(Ordering::Acquire);
+    if abandoned_before_join {
         connection_stop.store(true, Ordering::Release);
         pipe_control.stop();
+        if let Err(error) = pipe_abort.abort() {
+            tracing::debug!(%error, "remote bridge named-pipe abort failed");
+        }
     }
     let upload_result = upload
         .join()
@@ -3470,6 +3510,11 @@ fn bridge_child(
 
     let stopping = bridge_stop.load(Ordering::Acquire);
     let client_closed = client_closed.load(Ordering::Acquire);
+    if stopping || client_closed {
+        if let Err(error) = pipe_abort.abort() {
+            tracing::debug!(%error, "remote bridge named-pipe abort failed");
+        }
+    }
     if child_exited && !status.success() && !stopping && !client_closed {
         return Err(ssh_bridge_exit_error(status, &stderr));
     }
@@ -3483,6 +3528,7 @@ fn bridge_child(
     }
 
     if status.success() || stopping || client_closed {
+        pipe_abort.complete();
         Ok(())
     } else {
         Err(ssh_bridge_exit_error(status, &stderr))
@@ -3788,7 +3834,7 @@ mod tests {
             let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
             let server = listener.accept().unwrap();
             drop(listener);
-            fs::remove_file(socket).unwrap();
+            fs::remove_file(&socket).unwrap();
             client.set_nonblocking(true).unwrap();
             let fixture = super::super::process::tests::PipeFixture::new(mode);
             let mut command = fixture.command();
@@ -3823,6 +3869,14 @@ mod tests {
                 crate::platform::process_exists(descendant),
                 "{mode}: cleanup waited for or killed the independent holder"
             );
+            #[cfg(windows)]
+            {
+                drop(client);
+                let rebound = crate::ipc::bind_private_local_listener(&socket)
+                    .expect("cancelled bridge endpoint can be rebound");
+                drop(rebound);
+                fs::remove_file(&socket).unwrap();
+            }
         }
     }
 
@@ -3834,7 +3888,7 @@ mod tests {
         let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
         let server = listener.accept().unwrap();
         drop(listener);
-        fs::remove_file(socket).unwrap();
+        fs::remove_file(&socket).unwrap();
         let fixture = super::super::process::tests::PipeFixture::new("bridge-final");
         let mut command = fixture.command();
         command
@@ -3852,6 +3906,14 @@ mod tests {
             "cleanup waited for or killed the independent holder"
         );
         assert!(String::from_utf8_lossy(&output).contains("final child output"));
+        #[cfg(windows)]
+        {
+            drop(client);
+            let rebound = crate::ipc::bind_private_local_listener(&socket)
+                .expect("completed bridge endpoint can be rebound");
+            drop(rebound);
+            fs::remove_file(&socket).unwrap();
+        }
     }
 
     #[test]
@@ -5179,6 +5241,49 @@ mod tests {
         assert_eq!(output.status.code(), Some(78), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(STALE_API_METADATA),
+            "{output:?}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_posix_client_command_preserves_exit_status_and_marks_missing_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("herdr-posix-client-bridge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("herdr cached's executable");
+        fs::write(&executable, "#!/bin/sh\nexit 23\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run = |command: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+
+        let metadata = crate::client::endpoint::SshMachineMetadata {
+            os: "linux".into(),
+            executable: executable.display().to_string(),
+        };
+        let output = run(&cached_remote_client_command(&metadata, "fleet"));
+        assert_eq!(output.status.code(), Some(23), "{output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains(STALE_SSH_METADATA),
+            "{output:?}"
+        );
+
+        fs::remove_file(&executable).unwrap();
+        let output = run(&cached_remote_client_command(&metadata, "fleet"));
+        assert_eq!(output.status.code(), Some(78), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(STALE_SSH_METADATA),
             "{output:?}"
         );
         let _ = fs::remove_dir_all(&directory);

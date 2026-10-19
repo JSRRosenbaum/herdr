@@ -12,9 +12,35 @@ pub(crate) struct SavedSshBridge {
     _bridge: SshStdioBridge,
 }
 
+impl SavedSshBridge {
+    pub(crate) fn reported_failure(&self) -> Option<io::Error> {
+        self._bridge.reported_failure()
+    }
+}
+
 pub(crate) struct SavedSshStream {
     pub(crate) stream: crate::ipc::LocalStream,
     pub(crate) bridge: SavedSshBridge,
+    metadata_cache: crate::client::endpoint::SshMetadataCache,
+    used_cached_metadata: bool,
+}
+
+impl SavedSshStream {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::ipc::LocalStream,
+        SavedSshBridge,
+        crate::client::endpoint::SshMetadataCache,
+        bool,
+    ) {
+        (
+            self.stream,
+            self.bridge,
+            self.metadata_cache,
+            self.used_cached_metadata,
+        )
+    }
 }
 
 pub(crate) fn connect_saved_ssh(
@@ -22,38 +48,79 @@ pub(crate) fn connect_saved_ssh(
     target: &str,
     session: &str,
     cancelled: Arc<AtomicBool>,
+    use_cached_metadata: bool,
 ) -> io::Result<SavedSshStream> {
     let mut ssh = validated_saved_ssh(profile_id, target, session)?;
     ssh.cancelled = Arc::clone(&cancelled);
-    ssh.prepare_shared_transport()?;
-    let remote_herdr = find_installed_remote_herdr(&ssh)?;
-    let metadata = remote_herdr.machine_metadata();
-    if cancelled.load(Ordering::Acquire) {
-        return Err(super::process::cancelled());
+    let metadata_cache =
+        crate::client::endpoint::SshMetadataCache::new(profile_id, target, session)?;
+    // The cache is target/session-fingerprinted; it only supplies the executable path.
+    let cached = use_cached_metadata.then(|| metadata_cache.load()).flatten();
+    let used_cached_metadata = cached.is_some();
+    if !used_cached_metadata {
+        // Discovery retains the existing managed-transport recovery probe; a
+        // cached executable can let the bridge's SSH connection be first.
+        ssh.prepare_shared_transport()?;
     }
+
     let path = saved_bridge_path(profile_id);
-    let bridge = SshStdioBridge::start(
-        target.to_owned(),
-        remote_herdr,
-        path.clone(),
-        session.to_owned(),
-        ssh.options(),
-        true,
-        Arc::clone(&cancelled),
-    )?;
-    let stream = crate::ipc::connect_local_stream_cancellable(
-        &path,
-        &cancelled,
-        Instant::now() + Duration::from_secs(5),
-    )?;
+    // Bridge shutdown owns this token; attempt cancellation is observed by the
+    // cancellable SSH probes and endpoint handshake without being reset here.
+    let bridge_stop = Arc::new(AtomicBool::new(false));
+    let (bridge, stream, metadata) = if let Some(metadata) = cached {
+        let command = super::attach::cached_remote_client_command(&metadata, session);
+        let bridge = SshStdioBridge::start_command(
+            target.to_owned(),
+            command,
+            path.clone(),
+            ssh.options(),
+            true,
+            Arc::clone(&bridge_stop),
+        )?;
+        let stream = crate::ipc::connect_local_stream_cancellable(
+            &path,
+            &cancelled,
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        (bridge, stream, None)
+    } else {
+        let remote_herdr = find_installed_remote_herdr(&ssh)?;
+        let metadata = remote_herdr.machine_metadata();
+        if cancelled.load(Ordering::Acquire) {
+            return Err(super::process::cancelled());
+        }
+        let bridge = SshStdioBridge::start(
+            target.to_owned(),
+            remote_herdr,
+            path.clone(),
+            session.to_owned(),
+            ssh.options(),
+            true,
+            Arc::clone(&bridge_stop),
+        )?;
+        let stream = crate::ipc::connect_local_stream_cancellable(
+            &path,
+            &cancelled,
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        (bridge, stream, metadata)
+    };
+
     if let Some(metadata) = metadata {
-        crate::client::endpoint::SshMetadataCache::new(profile_id, target, session)?
-            .store(&metadata);
+        metadata_cache.store(&metadata);
     }
     Ok(SavedSshStream {
         stream,
         bridge: SavedSshBridge { _bridge: bridge },
+        metadata_cache,
+        used_cached_metadata,
     })
+}
+
+pub(crate) fn stale_metadata_failure(error: &io::Error) -> bool {
+    error
+        .to_string()
+        .contains(super::attach::STALE_SSH_METADATA)
 }
 
 pub(crate) struct SavedSshApiBridge {

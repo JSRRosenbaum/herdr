@@ -39,7 +39,7 @@ pub(crate) enum EndpointSupervisorEvent {
     Connected {
         endpoint_id: ClientEndpointId,
         generation: u64,
-        reader: crate::ipc::LocalStream,
+        reader: EndpointReaderStream,
         writer: NativeEndpointTransport,
         negotiation: EndpointNegotiation,
     },
@@ -85,11 +85,59 @@ impl Drop for ReconnectState {
     }
 }
 
-struct AttemptCompletion(Arc<AtomicBool>);
+struct CompletionState {
+    completed: Arc<AtomicBool>,
+}
 
-impl Drop for AttemptCompletion {
+pub(crate) struct AttemptCompletion(Arc<CompletionState>);
+
+impl AttemptCompletion {
+    fn new(completed: Arc<AtomicBool>) -> Self {
+        Self(Arc::new(CompletionState { completed }))
+    }
+
+    fn hold(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Drop for CompletionState {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.completed.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) struct EndpointReaderStream {
+    stream: Option<crate::ipc::LocalStream>,
+    completion: Option<AttemptCompletion>,
+}
+
+impl EndpointReaderStream {
+    fn new(stream: crate::ipc::LocalStream, completion: AttemptCompletion) -> Self {
+        Self {
+            stream: Some(stream),
+            completion: Some(completion),
+        }
+    }
+
+    pub(crate) fn into_parts(mut self) -> (crate::ipc::LocalStream, AttemptCompletion) {
+        (
+            self.stream
+                .take()
+                .expect("endpoint reader stream already taken"),
+            self.completion
+                .take()
+                .expect("endpoint reader completion already taken"),
+        )
+    }
+}
+
+impl Drop for EndpointReaderStream {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            crate::ipc::abort_local_stream(stream);
+        }
+        drop(self.completion.take());
     }
 }
 
@@ -446,95 +494,134 @@ fn connect_once(
     cancelled: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
 ) -> Result<EndpointSupervisorEvent, std::io::Error> {
-    let completion = AttemptCompletion(completed);
+    let completion = AttemptCompletion::new(completed);
     if cancelled.load(Ordering::Acquire) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
             "connection attempt cancelled",
         ));
     }
-    let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
-        ConnectTarget::Local(path) => {
-            let stream = crate::ipc::connect_local_stream_cancellable(
-                path,
-                &cancelled,
-                Instant::now() + super::super::handshake::LOCAL_HANDSHAKE_READ_TIMEOUT,
-            )
-            .map_err(|error| {
-                // An absent Local socket is transient, unlike a missing SSH install.
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        "Local is unavailable; start its server to reconnect",
-                    )
-                } else {
-                    error
+    let mut rediscovered = false;
+    loop {
+        let mut saved_bridge = None;
+        let mut saved_cache = None;
+        let mut saved_used_cache = false;
+        let mut stream = match target {
+            ConnectTarget::Local(path) => {
+                crate::ipc::connect_local_stream_cancellable(
+                    path,
+                    &cancelled,
+                    Instant::now() + super::super::handshake::LOCAL_HANDSHAKE_READ_TIMEOUT,
+                )
+                .map_err(|error| {
+                    // An absent Local socket is transient, unlike a missing SSH install.
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "Local is unavailable; start its server to reconnect",
+                        )
+                    } else {
+                        error
+                    }
+                })?
+            }
+            ConnectTarget::Ssh(profile) => {
+                let connected = crate::remote::connect_saved_ssh(
+                    profile.id.as_str(),
+                    &profile.target,
+                    &profile.session,
+                    Arc::clone(&cancelled),
+                    !rediscovered,
+                )?;
+                let (stream, bridge, cache, used_cache) = connected.into_parts();
+                saved_bridge = Some(bridge);
+                saved_cache = Some(cache);
+                saved_used_cache = used_cache;
+                stream
+            }
+        };
+        let handshake = super::super::do_handshake(
+            &mut stream,
+            options.cols,
+            options.rows,
+            options.cell_width_px,
+            options.cell_height_px,
+            super::super::HandshakePixelCapabilities {
+                exact_geometry: options.pixel_geometry_exact,
+                sgr_mouse: options.pixel_mouse,
+            },
+            Some(options.surface_size),
+            options.endpoint_keybindings,
+            options.mouse_capture,
+            false,
+            matches!(target, ConnectTarget::Local(_)),
+            &cancelled,
+        );
+        let handshake = match handshake {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                let handshake_error = handshake_error(error);
+                let bridge_failure = saved_bridge
+                    .as_ref()
+                    .and_then(crate::remote::SavedSshBridge::reported_failure);
+                let stale_metadata = saved_used_cache
+                    && bridge_failure
+                        .as_ref()
+                        .is_some_and(crate::remote::stale_metadata_failure);
+                // A cache marker is the only pre-handshake failure that permits one
+                // rediscovery; protocol and transport failures remain authoritative.
+                if stale_metadata && !rediscovered && !cancelled.load(Ordering::Acquire) {
+                    if let Some(cache) = saved_cache.as_ref() {
+                        cache.invalidate();
+                    }
+                    drop(saved_bridge.take());
+                    drop(stream);
+                    rediscovered = true;
+                    continue;
                 }
-            })?;
-            (stream, Box::new(()))
+                return Err(bridge_failure.unwrap_or(handshake_error));
+            }
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "connection attempt cancelled",
+            ));
         }
-        ConnectTarget::Ssh(profile) => {
-            let connected = crate::remote::connect_saved_ssh(
-                profile.id.as_str(),
-                &profile.target,
-                &profile.session,
-                Arc::clone(&cancelled),
-            )?;
-            (connected.stream, Box::new(connected.bridge))
+        if handshake.encoding != RenderEncoding::SemanticFrame {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "endpoint did not negotiate the semantic client shell",
+            ));
         }
-    };
-    let handshake = super::super::do_handshake(
-        &mut stream,
-        options.cols,
-        options.rows,
-        options.cell_width_px,
-        options.cell_height_px,
-        super::super::HandshakePixelCapabilities {
-            exact_geometry: options.pixel_geometry_exact,
-            sgr_mouse: options.pixel_mouse,
-        },
-        Some(options.surface_size),
-        options.endpoint_keybindings,
-        options.mouse_capture,
-        false,
-        matches!(target, ConnectTarget::Local(_)),
-        &cancelled,
-    )
-    .map_err(handshake_error)?;
-    if cancelled.load(Ordering::Acquire) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionAborted,
-            "connection attempt cancelled",
-        ));
+        let negotiation = EndpointNegotiation::new(
+            handshake.endpoint_methods.unwrap_or_default(),
+            handshake.endpoint_capabilities.unwrap_or_default(),
+        );
+        if !negotiation.supports_surface_interest()
+            || (!endpoint_id.is_local() && !negotiation.supports_health_check())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this machine needs a server update before it can participate in multi-machine viewing",
+            ));
+        }
+        let reader = EndpointReaderStream::new(stream.try_clone()?, completion.hold());
+        let lifetime: Box<dyn Send> = saved_bridge
+            .take()
+            .map(|bridge| Box::new(bridge) as Box<dyn Send>)
+            .unwrap_or_else(|| Box::new(()));
+        // Completion is held by both writer and reader ownership. Obsolete unflushed paths abort
+        // both handles; a completed Flush keeps interprocess's normal final-output close behavior.
+        let writer = NativeEndpointTransport::with_lifetime(stream, (lifetime, completion))?;
+        return Ok(EndpointSupervisorEvent::Connected {
+            endpoint_id,
+            generation,
+            reader,
+            writer,
+            negotiation,
+        });
     }
-    if handshake.encoding != RenderEncoding::SemanticFrame {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "endpoint did not negotiate the semantic client shell",
-        ));
-    }
-    let negotiation = EndpointNegotiation::new(
-        handshake.endpoint_methods.unwrap_or_default(),
-        handshake.endpoint_capabilities.unwrap_or_default(),
-    );
-    if !negotiation.supports_surface_interest()
-        || (!endpoint_id.is_local() && !negotiation.supports_health_check())
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "this machine needs a server update before it can participate in multi-machine viewing",
-        ));
-    }
-    let reader = stream.try_clone()?;
-    // The completion barrier follows the bridge through queued and active transports.
-    let writer = NativeEndpointTransport::with_lifetime(stream, (lifetime, completion))?;
-    Ok(EndpointSupervisorEvent::Connected {
-        endpoint_id,
-        generation,
-        reader,
-        writer,
-        negotiation,
-    })
 }
 
 fn failure_needs_attention(error: &std::io::Error) -> bool {
@@ -592,7 +679,9 @@ mod tests {
     async fn replacement_waits_for_queued_connection_teardown() {
         use crate::protocol::endpoint::{EndpointServerWelcome, ENDPOINT_WELCOME_KIND};
         use crate::protocol::{self, ClientMessage, ServerMessage};
-        use interprocess::local_socket::traits::{Listener as _, Stream as _};
+        #[cfg(not(windows))]
+        use interprocess::local_socket::traits::Listener as _;
+        use interprocess::local_socket::traits::Stream as _;
         let path = std::env::temp_dir().join(format!("hretired-{}.sock", std::process::id()));
         let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
         let now = Instant::now();
@@ -672,7 +761,9 @@ mod tests {
     async fn wake_replacement_waits_for_the_obsolete_attempt_to_close() {
         use crate::platform::HostPowerEvent::*;
         use crate::protocol::{self, ClientMessage};
-        use interprocess::local_socket::traits::{Listener as _, Stream as _};
+        #[cfg(not(windows))]
+        use interprocess::local_socket::traits::Listener as _;
+        use interprocess::local_socket::traits::Stream as _;
         for observed_suspend in [true, false] {
             let path = std::env::temp_dir().join(format!(
                 "hwake-{}-{observed_suspend}.sock",
@@ -759,7 +850,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retiring_or_shutting_down_a_silent_attempt_closes_its_connection() {
         use crate::protocol::{self, ClientMessage};
-        use interprocess::local_socket::traits::{Listener as _, Stream as _};
+        #[cfg(not(windows))]
+        use interprocess::local_socket::traits::Listener as _;
+        use interprocess::local_socket::traits::Stream as _;
         for shutdown in [false, true] {
             let path = std::env::temp_dir()
                 .join(format!("hcancel-{}-{shutdown}.sock", std::process::id()));
