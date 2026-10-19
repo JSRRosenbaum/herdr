@@ -2069,24 +2069,17 @@ mod tests {
             panic!("expected worktree_created response");
         };
         let target = PathBuf::from(&worktree.path);
-        let parent = app
-            .state
-            .workspaces
-            .iter()
-            .find(|workspace| {
+        assert!(
+            app.state.workspaces.iter().any(|workspace| {
                 workspace.worktree_space().is_some_and(|membership| {
                     !membership.is_linked_worktree
                         && crate::worktree::canonical_or_original(&membership.repo_root)
                             == crate::worktree::canonical_or_original(&repo)
+                        && crate::worktree::canonical_or_original(&membership.checkout_path)
+                            == crate::worktree::canonical_or_original(&repo)
                 })
-            })
-            .expect("a missing parent workspace should be created");
-        assert_eq!(
-            parent
-                .worktree_space()
-                .expect("parent membership")
-                .checkout_path,
-            repo
+            }),
+            "a missing parent workspace should be created at the repository root"
         );
         assert!(app.state.workspaces.iter().any(|workspace| {
             workspace.worktree_space().is_some_and(|membership| {

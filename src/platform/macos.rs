@@ -1130,14 +1130,14 @@ pub fn pane_processes(child_pid: u32) -> Vec<u32> {
     }
 
     let session_id = unsafe { libc::getsid(child_pid as libc::c_int) };
-    let session_pids = (session_id > 0)
-        .then(|| {
-            all_pids()
-                .into_iter()
-                .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == session_id)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let session_pids = if session_id > 0 {
+        all_pids()
+            .into_iter()
+            .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == session_id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     super::pane_processes_from_parts(child_pid, session_pids, descendant_processes(child_pid))
 }
 
@@ -1146,7 +1146,7 @@ fn descendant_processes(root_pid: u32) -> Vec<u32> {
     for pid in all_pids() {
         if let Some(info) = process_bsdinfo(pid) {
             children_by_parent
-                .entry(info.pbi_ppid as u32)
+                .entry(info.pbi_ppid)
                 .or_default()
                 .push(pid);
         }

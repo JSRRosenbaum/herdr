@@ -1,12 +1,12 @@
 # Herdr — 非官方 compact-herds 分支
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [本分支发行版](https://github.com/JSRRosenbaum/herdr/releases/tag/compact-herds-v0.9.5-20261018) · [原版 Herdr](https://github.com/herdrdev/herdr)
+[English](README.md) · [简体中文](README.zh-CN.md) · [本分支发行版](https://github.com/JSRRosenbaum/herdr/releases/tag/compact-herds-v0.9.5-20261018-r1) · [原版 Herdr](https://github.com/herdrdev/herdr)
 
 这是 [Herdr](https://github.com/herdrdev/herdr)（运行编程智能体的终端环境）的 **JSRRosenbaum 非官方定制分支**，不是 Herdr 官方发行版，也不是侧栏插件。[公开截图](https://pbs.twimg.com/media/HUw9wCvXcAIHsIz.png?name=orig)（[原帖](https://x.com/JezzickRose/status/2111131042123792478)）展示的是本分支内置侧栏、特定配置和实际运行的工作区。Herdr 提供底层智能体终端、状态、机器与工作树功能；本分支增加了编号 herd 分页及各页的焦点与导航状态、紧凑工作树布局和可选工作区 ID。截图中的智能体、项目、机器连接和个人配置并不随发行版提供。
 
 ## 获取这个定制版本
 
-从**本仓库的非官方** [`compact-herds-v0.9.5-20261018` 发行版](https://github.com/JSRRosenbaum/herdr/releases/tag/compact-herds-v0.9.5-20261018)下载，并核对源码提交及 SHA-256 校验值。按系统与架构选择文件（Linux x86_64/aarch64、macOS x86_64/aarch64、Windows x86_64），直接运行该版本的 `herdr`，不要覆盖原版安装。Windows 请解压**完整的 `herdr-windows-x86_64.zip`**，将附带的 `conpty/` 目录与 `herdr.exe` 保持在一起；不能只复制可执行文件。
+从**本仓库的非官方** [`compact-herds-v0.9.5-20261018-r1` 发行版](https://github.com/JSRRosenbaum/herdr/releases/tag/compact-herds-v0.9.5-20261018-r1)下载，并核对源码提交及 SHA-256 校验值。按系统与架构选择文件（Linux x86_64/aarch64、macOS x86_64/aarch64、Windows x86_64），直接运行该版本的 `herdr`，不要覆盖原版安装。Windows 请解压**完整的 `herdr-windows-x86_64.zip`**，将附带的 `conpty/` 目录与 `herdr.exe` 保持在一起；不能只复制可执行文件。
 
 **不要通过** `herdr.dev/install.sh`、`install.ps1`、`brew install herdr`、`mise use -g herdr`、原版 GitHub 发行页或 `herdr update` 获取或更新此分支：它们安装/更新的是**原版 Herdr**。此分支没有单独的自动更新通道。为避免与默认会话的原版混用，体验时使用隔离的命名会话：
 
@@ -23,9 +23,9 @@ Windows 下，在解压后的目录用 PowerShell 运行 `./herdr.exe --session 
 ```bash
 git clone https://github.com/JSRRosenbaum/herdr.git herdr-compact-herds
 cd herdr-compact-herds
-git fetch origin tag compact-herds-v0.9.5-20261018
-git checkout --detach compact-herds-v0.9.5-20261018
-cargo +1.96.1 --config 'env.HERDR_BUILD_CHANNEL="local"' --config 'env.HERDR_BUILD_ID="compact-herds-20261018"' build --release --locked
+git fetch origin tag compact-herds-v0.9.5-20261018-r1
+git checkout --detach compact-herds-v0.9.5-20261018-r1
+cargo +1.96.1 --config 'env.HERDR_BUILD_CHANNEL="local"' --config 'env.HERDR_BUILD_ID="compact-herds-20261018-r1"' build --release --locked
 # Linux/macOS 可执行文件：target/release/herdr
 ```
 

@@ -399,6 +399,36 @@ Space 行支持以下内置 token：
 
 token 会按配置顺序渲染。Herdr 通常使用 ` · ` 分隔相邻值，并在 `state_icon` 后使用一个空格。缺失值及其分隔符会消失；当一行中的所有 token 都没有值时，该行会消失。已有的自定义行不会改变；如果希望在自定义的多机器布局中显示机器标识，请显式添加 `machine`。每个布局最多可包含 16 行，每行最多可包含 16 个 token。
 
+### 工作树布局
+
+展开的侧边栏默认使用两行 `tree` 布局：父工作区不缩进，子工作区使用较深的 `   ├─`/`   └─` 连接符。设置 `worktree_layout = "compact"` 可压缩显示：
+
+```toml
+[ui.sidebar.spaces]
+worktree_layout = "compact"
+```
+
+紧凑模式将子工作区连接符缩短为 `├─`/`└─`；未显式设置 `rows` 时，Space 行会合并为一行（`state_icon`、`workspace`、`branch`、`git_status`），工作区与分支之间使用 ` - ` 而不是 ` · `。显式 `rows` 始终优先，并保留 ` · ` 分隔符。默认 `worktree_layout = "tree"` 与原版布局完全一致。未知值会在加载时被拒绝，错误信息会列出可接受值；修改通过常规的 `reload config` 操作生效。
+
+紧凑模式下，`worktree_group_separator` 默认为 `"none"`：折叠的工作树组与下一个 Space 紧邻，不增加空行或分隔线。设置 `"collapsed"` 会在折叠组的最后一个可见 Space 后添加弱化的分隔线（包括仍可见的已聚焦子工作区）；`"always"` 则在每个组后添加：
+
+```toml
+[ui.sidebar.spaces]
+worktree_layout = "compact"
+worktree_group_separator = "none" # 也可为 "collapsed" 或 "always"
+```
+
+此策略在 `tree` 布局中不起作用。最后一个 Space 后以及机器边界之间不会添加组分隔线。`row_gap` 独立控制普通空行：设置它不会绘制分隔线，配置的组分隔线会在空行之外再占一行。
+
+设置 `show_workspace_ids = true` 可在每个 Space 行的组折叠按钮后，右对齐显示稳定的工作区 ID（例如 `wAB`）：
+
+```toml
+[ui.sidebar.spaces]
+show_workspace_ids = true
+```
+
+默认值为 `show_workspace_ids = false`；关闭时，侧栏布局与点击区域和原版完全一致。标识使用固定宽度列，其宽度取当前视图中最长工作区 ID 的长度，使各工作区的行保持对齐。
+
 也可以用内联样式表定义 token：
 
 ```toml
