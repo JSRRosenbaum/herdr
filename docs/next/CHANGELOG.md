@@ -13,6 +13,7 @@
 - Fork documentation validation fetches the official upstream version tags required by the committed versioned-documentation snapshots.
 
 ### Fixed
+- Native lifecycle regression tests use explicitly blocking fake-peer reads and await queued readiness controls instead of depending on platform-specific socket inheritance or thread scheduling.
 - Cross-platform checks compare repository identity instead of Windows path spelling, and macOS process enumeration satisfies the pinned Rust lint rules without changing its traversal behavior.
 - Chinese compact-worktree configuration documentation covers layout, group separators and workspace-ID display alongside the English guide.
 - Native terminal input remains opaque and bounded under backpressure; detach, takeover and shutdown revoke pending input before releasing ownership.

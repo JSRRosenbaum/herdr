@@ -4250,8 +4250,11 @@ fn native_attach_ready_requires_live_output_subscription() {
             })
         );
         assert!(server.clients[&7].native_output.is_some());
+        let ready = control
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native ready");
         assert!(matches!(
-            read_server_message(control.try_recv().expect("native ready")),
+            read_server_message(ready),
             ServerMessage::EndpointControl { kind, data }
                 if kind == crate::server::terminal_attach::NATIVE_READY_KIND && data == target
         ));

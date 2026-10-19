@@ -286,6 +286,7 @@ fn client_sigterm_cancels_pending_handshake() {
         }
     ));
     let mut connection = connection.unwrap();
+    connection.set_nonblocking(false).unwrap();
     connection
         .set_read_timeout(Some(Duration::from_secs(8)))
         .unwrap();
