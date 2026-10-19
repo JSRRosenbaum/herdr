@@ -472,6 +472,8 @@ fn spawn_native_on_slave(
     terminal_id: &str,
 ) -> SpawnedHerdr {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // The host owns this shared PTY; an exiting client must not revoke it.
+    cmd.set_controlling_tty(false);
     cmd.args(["terminal", "native-attach", terminal_id]);
     cmd.env("HERDR_DISABLE_SOUND", "1");
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
@@ -684,7 +686,7 @@ fn native_cutover_discards_fragmented_old_control_before_second_process_input() 
         &api_socket,
         &second_pane,
         &format!(
-            "stty raw -echo; printf ready > '{}'; dd bs=1 count=12 of='{}' status=none; stty sane\n",
+            "stty raw -echo; printf ready > '{}'; dd bs=1 count=12 of='{}'; stty sane\n",
             recipient_ready.display(),
             received.display()
         ),

@@ -13,6 +13,7 @@
 - Fork documentation validation fetches the official upstream version tags required by the committed versioned-documentation snapshots.
 
 ### Fixed
+- Shared-PTY cutover checks leave terminal ownership with the simulated host and use portable byte-consumer commands. CI executes the complete selected suite before reporting failures.
 - Pending-handshake lifecycle checks consume real PTY output during setup and restoration, preserving the existing cancellation deadline and retaining terminal diagnostics on failure.
 - Native lifecycle regression tests use explicitly blocking fake-peer reads and await queued readiness controls instead of depending on platform-specific socket inheritance or thread scheduling.
 - Cross-platform checks compare repository identity instead of Windows path spelling, and macOS process enumeration satisfies the pinned Rust lint rules without changing its traversal behavior.
