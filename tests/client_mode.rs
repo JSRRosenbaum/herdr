@@ -1417,8 +1417,10 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         |path: &std::path::Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
     let ssh_commands = base.join("ssh-commands");
     let bridge_pid = base.join("bridge-pid");
+    // Keep each fake SSH command in its own process group: cached commands may add shell
+    // wrappers, but terminating the recorded group must still close the whole SSH session.
     fs::write(bin.join("ssh"), format!(
-        "#!/bin/sh\nexport HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\ncontrol=; previous=; configuration=\nfor arg do\n  if [ \"$previous\" = -S ]; then control=$arg; fi\n  if [ \"$arg\" = -G ]; then configuration=yes; fi\n  previous=$arg; last=$arg\ndone\nif [ -n \"$configuration\" ]; then printf 'controlpath %s\\n' \"$control\"; exit 0; fi\nprintf '%s\\n' \"$last\" >> {}\ncase \"$last\" in *remote-client-bridge*) printf '%s\\n' \"$$\" > {};; esac\nexec /bin/sh -c \"$last\"\n",
+        "#!/bin/sh\nexport HOME={} XDG_CONFIG_HOME={} XDG_RUNTIME_DIR={} HERDR_SOCKET_PATH={}\nunset HERDR_CLIENT_SOCKET_PATH HERDR_SESSION\ncontrol=; previous=; configuration=\nfor arg do\n  if [ \"$previous\" = -S ]; then control=$arg; fi\n  if [ \"$arg\" = -G ]; then configuration=yes; fi\n  previous=$arg; last=$arg\ndone\nif [ -n \"$configuration\" ]; then printf 'controlpath %s\\n' \"$control\"; exit 0; fi\nprintf '%s\\n' \"$last\" >> {}\nexec python3 -c 'import os,sys; os.getpgrp()!=os.getpid() and os.setpgid(0,0); f=open(sys.argv[2],\"w\"); f.write(str(os.getpid())); f.close(); os.execl(\"/bin/sh\",\"sh\",\"-c\",sys.argv[1])' \"$last\" {}\n",
         quote(&base.join("home")), quote(&remote_config), quote(&remote_runtime), quote(&remote_api), quote(&ssh_commands), quote(&bridge_pid),
     )).unwrap();
     fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1465,14 +1467,17 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
             .trim()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        assert_eq!(unsafe { libc::kill(-pid, libc::SIGTERM) }, 0);
         let marker = format!("REMOTE_RECONNECTED_{cycle}");
         send_pane_shell_command(&remote_api, remote_pane, &format!("printf '{marker}\\n'"));
         assert!(
             wait_until(Duration::from_secs(15), Duration::from_millis(20), || {
                 screen_text().contains(&marker)
             }),
-            "remote reconnect {cycle} must restore the visible screen without switching machines"
+            "remote reconnect {cycle} must restore the visible screen without switching machines; screen={:?}; ssh_commands={}",
+            screen_text(),
+            fs::read_to_string(&ssh_commands)
+                .unwrap_or_else(|error| format!("<unavailable: {error}>")),
         );
         assert!(
             wait_until(REMOTE_INPUT_TIMEOUT, Duration::from_millis(100), || {
@@ -1562,7 +1567,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         struct ResumeBridge(libc::pid_t);
         impl Drop for ResumeBridge {
             fn drop(&mut self) {
-                unsafe { libc::kill(self.0, libc::SIGCONT) };
+                unsafe { libc::kill(-self.0, libc::SIGCONT) };
             }
         }
         let bridge: libc::pid_t = fs::read_to_string(&bridge_pid)
@@ -1570,7 +1575,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
             .trim()
             .parse()
             .unwrap();
-        assert_eq!(unsafe { libc::kill(bridge, libc::SIGSTOP) }, 0);
+        assert_eq!(unsafe { libc::kill(-bridge, libc::SIGSTOP) }, 0);
         let _resume_bridge = ResumeBridge(bridge);
         input
             .write_all(&sidebar_row_click(&screen_text(), "local-returned"))

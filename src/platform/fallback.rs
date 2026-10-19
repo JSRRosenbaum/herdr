@@ -1,6 +1,22 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Shared bridge-cancellation boundary for platforms without native pipe
+/// retirement.
+pub(crate) struct RemoteBridgePipeAbort;
+
+impl RemoteBridgePipeAbort {
+    pub(crate) fn new(_stream: &crate::ipc::LocalStream) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn abort(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn complete(self) {}
+}
+
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 #[cfg(unix)]
