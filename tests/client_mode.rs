@@ -272,6 +272,14 @@ fn client_sigterm_cancels_pending_handshake() {
         &runtime_dir.join("herdr.sock"),
         &["terminal", "attach", "term_pending_handshake"],
     );
+    let output = spawn_pty_drain(
+        client
+            ._master
+            .as_ref()
+            .expect("pending handshake client PTY")
+            .try_clone_reader()
+            .expect("clone pending handshake PTY reader"),
+    );
     let mut connection = None;
     assert!(wait_until(
         Duration::from_secs(8),
@@ -302,7 +310,8 @@ fn client_sigterm_cancels_pending_handshake() {
     cleanup_spawned_herdr(client, base);
     assert!(
         cancelled,
-        "SIGTERM must cancel startup without waiting for the server's Welcome timeout"
+        "SIGTERM must cancel startup without waiting for the server's Welcome timeout; output: {:?}",
+        read_output(&output)
     );
 }
 
