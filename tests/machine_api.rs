@@ -59,13 +59,13 @@ case "$last" in
         esac
         if [ "$TEST_MODE" = offline ]; then echo 'test remote connection failed' >&2; exit 255; fi
         printf 'login banner\n'
-        PATH="$TEST_ROOT/remote bin:/usr/bin:/bin" exec /bin/sh -c "$last" ;;
+        PATH="$TEST_ROOT/remote bin:$TEST_ROOT/remote guard:/usr/bin:/bin" exec /bin/sh -c "$last" ;;
     '/bin/sh -s')
         script=$(cat)
         printf 'login banner\n'
         case "$script" in
             *'uname -s'*) printf 'herdr-remote-output-ready:1\n'; uname -s; uname -m ;;
-            *) PATH="$TEST_ROOT/remote bin:/usr/bin:/bin" exec /bin/sh -c "$script" ;;
+            *) PATH="$TEST_ROOT/remote bin:$TEST_ROOT/remote guard:/usr/bin:/bin" exec /bin/sh -c "$script" ;;
         esac ;;
     *) echo "unexpected command: $last" >&2; exit 2 ;;
 esac
@@ -99,6 +99,15 @@ impl Harness {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::write(root.join("bin/ssh"), SSH).unwrap();
         fs::set_permissions(root.join("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Missing fixture binaries must not discover an ambient installed Herdr.
+        let remote_guard = root.join("remote guard");
+        fs::create_dir(&remote_guard).unwrap();
+        fs::write(remote_guard.join("herdr"), "#!/bin/sh\nexit 127\n").unwrap();
+        fs::set_permissions(
+            remote_guard.join("herdr"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_herdr"), root.join("remote herdr")).unwrap();
         fs::create_dir_all(root.join("remote bin")).unwrap();
         let remote_wrapper = root.join("remote bin/herdr");

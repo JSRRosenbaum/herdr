@@ -194,6 +194,18 @@ pub(crate) struct ClientConnection {
     pub(crate) shell_uses_endpoint_keybindings: bool,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
+    /// Reliable raw PTY stream for a negotiated TSP-capable frontend.
+    pub(crate) native_output: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    /// One encoded chunk waiting for the bounded ordered writer slot.
+    pub(crate) native_pending: Option<Vec<u8>>,
+    /// The pending terminal client explicitly requested native raw output.
+    pub(crate) native_requesting: bool,
+    /// Unique to this native attachment. Revocation is synchronous with PTY
+    /// admission, so an aborted task cannot enqueue bytes after takeover.
+    pub(crate) native_input_lease: Option<crate::pty::actor::NativeInputLease>,
+    /// At most one accepted-but-not-yet-admitted native input message.
+    /// Aborted on detach/handoff; dropping its ack wakes the socket reader.
+    pub(crate) native_input_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ClientConnection {
@@ -255,7 +267,21 @@ impl ClientConnection {
             shell_deferred_navigation_request_id: None,
             shell_deferred_navigation_response: None,
             shell_uses_endpoint_keybindings: false,
+            native_output: None,
+            native_pending: None,
+            native_requesting: false,
+            native_input_lease: None,
+            native_input_task: None,
             writer,
+        }
+    }
+
+    pub(crate) fn revoke_native_input(&mut self) {
+        if let Some(lease) = self.native_input_lease.take() {
+            lease.revoke();
+        }
+        if let Some(task) = self.native_input_task.take() {
+            task.abort();
         }
     }
 

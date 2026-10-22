@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+- Native `terminal native-attach` for TSP frontends on Linux/macOS, including saved SSH profiles and named remote sessions. Native ownership is negotiated explicitly; unsupported servers do not fall back to ANSI frames.
+- Optional `[session] resume_max_age_hours` filters automatic file-backed agent restores. Zero retains unrestricted restore; file-backed candidates are considered newest first.
+- Explicit ANSI screen presentation reuses classic terminal attach for preserved idle applications; native TSP remains a separate, explicitly selected stream.
+
+### Changed
+- The unofficial fork's landing pages now document pinned fork downloads, separate named sessions and the compact sidebar settings, rather than directing readers to upstream installers and updates.
+- Custom integration pushes run CI and distribution checks. Manual artifacts carry a local build identity, validate static Linux ELF files without invoking `ldd`, and probe the bundled Windows ConPTY package. Upstream-only website and issue-maintenance jobs do not run in forks.
+- Fork documentation validation fetches the official upstream version tags required by the committed versioned-documentation snapshots.
+
+### Fixed
+- Shared-PTY cutover checks leave terminal ownership with the simulated host and use portable byte-consumer commands. CI executes the complete selected suite before reporting failures.
+- Pending-handshake lifecycle checks consume real PTY output during setup and restoration, preserving the existing cancellation deadline and retaining terminal diagnostics on failure.
+- Native lifecycle regression tests use explicitly blocking fake-peer reads and await queued readiness controls instead of depending on platform-specific socket inheritance or thread scheduling.
+- Cross-platform checks compare repository identity instead of Windows path spelling, and macOS process enumeration satisfies the pinned Rust lint rules without changing its traversal behavior.
+- Chinese compact-worktree configuration documentation covers layout, group separators and workspace-ID display alongside the English guide.
+- Native terminal input remains opaque and bounded under backpressure; detach, takeover and shutdown revoke pending input before releasing ownership.
+- Follower retargets revoke old input independently of the shell observer in both classic and native modes. Readiness follows native approval or the first displayed classic terminal frame.
+- Initial client handshakes honor termination so superseded viewers can disconnect without waiting for a stalled server's Welcome timeout.
+- Linux pane shutdown includes detached descendants. Compact herds, herd-scoped workspace navigation, per-herd focus and stable workspace-ID display are preserved on the rebased engine.
+
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4

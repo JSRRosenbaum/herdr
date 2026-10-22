@@ -51,6 +51,22 @@ impl std::io::Write for ChildPipe {
     }
 }
 
+/// Shared bridge-cancellation boundary; Unix sockets do not need native pipe
+/// disconnection to release cloned streams.
+pub(crate) struct RemoteBridgePipeAbort;
+
+impl RemoteBridgePipeAbort {
+    pub(crate) fn new(_stream: &crate::ipc::LocalStream) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn abort(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn complete(self) {}
+}
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {
         super::ChildExitReason::Interrupted
@@ -90,6 +106,64 @@ pub(crate) fn poll_fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> std::
         Err(std::io::Error::last_os_error())
     } else {
         Ok(result > 0)
+    }
+}
+
+/// Probe a native reader stalled on PTY input backpressure without consuming
+/// (or reordering) even one byte of its framed socket stream.
+pub(crate) fn client_stream_disconnected(
+    stream: &crate::ipc::LocalStream,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let mut descriptor = libc::pollfd {
+        fd: socket.inner().as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        descriptor.events |= libc::POLLRDHUP;
+    }
+    let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if status < 0 {
+        let err = std::io::Error::last_os_error();
+        return if err.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(err)
+        };
+    }
+    if status == 0 {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    if descriptor.revents & libc::POLLRDHUP != 0 {
+        return Ok(true);
+    }
+    if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return Ok(true);
+    }
+    let mut byte = 0u8;
+    let result = unsafe {
+        libc::recv(
+            descriptor.fd,
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if result < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock
+            || err.kind() == std::io::ErrorKind::Interrupted
+        {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    } else {
+        Ok(result == 0)
     }
 }
 

@@ -270,6 +270,10 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Maximum age in hours for automatic restoration of file-backed agent
+    /// sessions. Zero leaves restore age unrestricted; a nonzero value requires
+    /// a recent existing session file and skips opaque session IDs.
+    pub resume_max_age_hours: u32,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +281,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            resume_max_age_hours: 0,
         }
     }
 }
@@ -375,6 +380,10 @@ pub struct KeysConfig {
     pub reload_config: BindingConfig,
     /// Focus the currently visible notification target. Default: "prefix+o".
     pub open_notification_target: BindingConfig,
+    /// Show the previous herd without changing the active pane. Default: "prefix+,".
+    pub previous_herd: BindingConfig,
+    /// Show the next herd without changing the active pane. Default: "prefix+.".
+    pub next_herd: BindingConfig,
     /// Select the previous workspace. Unset by default.
     pub previous_workspace: BindingConfig,
     /// Select the next workspace. Unset by default.
@@ -512,6 +521,10 @@ pub(crate) struct KeysConfigOverlay {
     reload_config: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     open_notification_target: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_herd: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_herd: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_workspace: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -663,6 +676,8 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(detach);
         apply_field!(reload_config);
         apply_field!(open_notification_target);
+        apply_field!(previous_herd);
+        apply_field!(next_herd);
         apply_field!(previous_workspace);
         apply_field!(next_workspace);
         apply_field!(previous_agent);
@@ -768,6 +783,8 @@ impl KeysConfig {
         copy_effective_action_field!(detach, keybinds.detach);
         copy_effective_action_field!(reload_config, keybinds.reload_config);
         copy_effective_action_field!(open_notification_target, keybinds.open_notification_target);
+        copy_effective_action_field!(previous_herd, keybinds.previous_herd);
+        copy_effective_action_field!(next_herd, keybinds.next_herd);
         copy_effective_action_field!(previous_workspace, keybinds.previous_workspace);
         copy_effective_action_field!(next_workspace, keybinds.next_workspace);
         copy_effective_action_field!(previous_agent, keybinds.previous_agent);
@@ -1140,6 +1157,8 @@ impl Default for KeysConfig {
             detach: BindingConfig::one("prefix+q"),
             reload_config: BindingConfig::one("prefix+shift+r"),
             open_notification_target: BindingConfig::one("prefix+o"),
+            previous_herd: BindingConfig::one("prefix+,"),
+            next_herd: BindingConfig::one("prefix+."),
             previous_workspace: BindingConfig::empty(),
             next_workspace: BindingConfig::empty(),
             previous_agent: BindingConfig::empty(),
@@ -1435,15 +1454,18 @@ new_cwd = "~/Projects"
         let default_config = Config::default();
         assert!(default_config.session.resume_agents_on_restore);
         assert_eq!(default_config.session.startup_per_agent_delay_ms, 100);
+        assert_eq!(default_config.session.resume_max_age_hours, 0);
 
         let toml = r#"
 [session]
 resume_agents_on_restore = false
 startup_per_agent_delay_ms = 0
+resume_max_age_hours = 8
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+        assert_eq!(config.session.resume_max_age_hours, 8);
     }
 
     #[test]

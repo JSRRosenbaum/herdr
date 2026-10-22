@@ -295,6 +295,29 @@ fn client_owned_sidebar_dividers_resize_live() {
 }
 
 #[test]
+fn linked_workspace_context_menu_exposes_new_worktree_only() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut projection = snapshot();
+    projection.workspaces[0].worktree = Some(crate::protocol::ClientShellWorktree {
+        key: "repo-key".into(),
+        label: "repo".into(),
+        is_linked_worktree: true,
+    });
+    state.set_snapshot(Box::new(projection));
+    state.open_workspace_context_menu("ws_1".into(), 0, 0);
+    let items = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+        _ => panic!("workspace context menu"),
+    };
+    assert!(items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::NewWorktree));
+    assert!(!items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::OpenWorktree));
+}
+
+#[test]
 fn context_menus_capture_stable_targets_and_route_actions() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));

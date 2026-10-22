@@ -16,9 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 #[cfg(unix)]
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use tokio::sync::mpsc;
 
 use super::ClientLoopEvent;
@@ -35,18 +37,18 @@ pub(super) mod windows_vti;
 /// This runs on a dedicated thread because stdin reading is blocking.
 /// The main loop receives the raw bytes and forwards them as
 /// `ClientMessage::Input` to the server.
-pub fn stdin_reader_loop(
+pub(super) fn stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
-    host_color_query_sent: bool,
+    (host_color_query_sent, host_cell_size_query_sent): (bool, bool),
     host_theme_query_pending: Arc<AtomicU32>,
-    host_cell_size_query_sent: bool,
     host_mouse_capture_active: Arc<AtomicBool>,
     host_sgr_pixels_active: Arc<AtomicBool>,
     host_escape_disambiguation_active: bool,
     initial_host_input: Vec<u8>,
     #[cfg(unix)] direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
     #[cfg(unix)] direct_response_active: Arc<AtomicBool>,
+    #[cfg(unix)] target: Option<AttachTarget>,
 ) {
     #[cfg(windows)]
     {
@@ -64,25 +66,335 @@ pub fn stdin_reader_loop(
     unix_stdin_reader_loop(
         event_tx,
         should_quit,
-        host_color_query_sent,
+        (host_color_query_sent, host_cell_size_query_sent),
         host_theme_query_pending,
-        host_cell_size_query_sent,
         host_mouse_capture_active,
         host_sgr_pixels_active,
         host_escape_disambiguation_active,
         initial_host_input,
         direct_response,
         direct_response_active,
+        target,
     );
+}
+
+/// A follower's desired target is its input lease, independent of its polling
+/// shell. Reopen the path so an atomic replacement also revokes the old viewer.
+#[cfg(unix)]
+pub(super) struct AttachTarget {
+    target_file: std::ffi::CString,
+    target: String,
+    ready_file: std::path::PathBuf,
+    ready: Option<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl AttachTarget {
+    pub(super) fn from_env() -> io::Result<Option<Self>> {
+        match (
+            std::env::var_os("HERDR_ATTACH_TARGET_FILE"),
+            std::env::var_os("HERDR_ATTACH_TARGET"),
+            std::env::var_os("HERDR_ATTACH_READY_FILE"),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(target_file), Some(target), Some(ready_file)) => {
+                let target_file = std::ffi::CString::new(target_file.into_vec()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid attach target file")
+                })?;
+                let target = target.into_string().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid attach target")
+                })?;
+                Ok(Some(Self {
+                    target_file,
+                    target,
+                    ready_file: ready_file.into(),
+                    ready: None,
+                }))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attach follower requires its target file, target, and ready file",
+            )),
+        }
+    }
+    pub(super) fn input_guard(&self) -> Self {
+        Self {
+            target_file: self.target_file.clone(),
+            target: self.target.clone(),
+            ready_file: self.ready_file.clone(),
+            ready: None,
+        }
+    }
+
+    pub(super) fn publish_ready(&mut self) -> io::Result<()> {
+        if self.ready.is_some() {
+            return Ok(());
+        }
+        if !self.is_current() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "attach target changed before readiness",
+            ));
+        }
+        let temporary = self
+            .ready_file
+            .with_extension(format!("ready-{}", std::process::id()));
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = marker
+            .write_all(self.target.as_bytes())
+            .and_then(|()| std::fs::rename(&temporary, &self.ready_file));
+        if let Err(err) = result {
+            drop(marker);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(err);
+        }
+        self.ready = Some(marker);
+        Ok(())
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        // Keep the path conversion outside the per-input path, including for
+        // long configuration paths that std::fs::File::open would allocate for.
+        let fd = loop {
+            let fd =
+                unsafe { libc::open(self.target_file.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd >= 0 {
+                break fd;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return false;
+            }
+        };
+        // A successful open gives this File sole ownership of the descriptor.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut remaining = self.target.as_bytes();
+        let mut scratch = [0u8; 256];
+        while !remaining.is_empty() {
+            let len = remaining.len().min(scratch.len());
+            let count = match file.read(&mut scratch[..len]) {
+                Ok(0) => return false,
+                Ok(count) => count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            };
+            if scratch[..count] != remaining[..count] {
+                return false;
+            }
+            remaining = &remaining[count..];
+        }
+        matches!(file.read(&mut scratch[..1]), Ok(0))
+    }
+}
+#[cfg(unix)]
+impl Drop for AttachTarget {
+    fn drop(&mut self) {
+        if let Some(marker) = &self.ready {
+            // Clear only our inode. An old viewer cannot erase a replacement
+            // viewer's marker, even if both selected the same target.
+            let _ = marker.set_len(0);
+        }
+    }
+}
+
+/// Native TSP input is opaque: neither host-control reply framing nor the
+/// direct-graphics filter may hold, reinterpret or time out any input bytes.
+#[cfg(unix)]
+pub(super) fn native_stdin_reader_loop(
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    initial_input: Vec<u8>,
+    target: Option<AttachTarget>,
+) {
+    if target.as_ref().is_some_and(|target| !target.is_current()) {
+        let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "attach target changed",
+        )));
+        return;
+    }
+    let stdin = io::stdin();
+    let reader = GuardedInputReader {
+        fd: stdin.as_fd(),
+        should_quit,
+        target,
+    };
+    native_input_from_reader(reader, event_tx, should_quit, initial_input);
+}
+
+/// Poll the actual descriptor rather than StdinLock's private read-ahead buffer.
+/// This lets detach join the reader without waiting for another user keystroke.
+#[cfg(unix)]
+struct GuardedInputReader<'a> {
+    fd: BorrowedFd<'a>,
+    should_quit: &'a AtomicBool,
+    target: Option<AttachTarget>,
+}
+
+#[cfg(unix)]
+impl AsRawFd for GuardedInputReader<'_> {
+    fn as_raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl Read for GuardedInputReader<'_> {
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        while !self.should_quit.load(Ordering::Acquire) {
+            if self
+                .target
+                .as_ref()
+                .is_some_and(|target| !target.is_current())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "attach target changed",
+                ));
+            }
+            match crate::platform::poll_fd_readable(self.fd.as_raw_fd(), 50) {
+                Ok(true) => {
+                    let count = crate::platform::read_fd(self.fd.as_raw_fd(), dst)?;
+                    // Check AFTER the actual descriptor read, before either
+                    // input path interprets or forwards the returned bytes.
+                    if self
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| !target.is_current())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "attach target changed",
+                        ));
+                    }
+                    return Ok(count);
+                }
+                Ok(false) => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(0)
+    }
+}
+
+#[cfg(unix)]
+fn native_input_from_reader(
+    mut reader: impl Read,
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &AtomicBool,
+    initial_input: Vec<u8>,
+) {
+    if !initial_input.is_empty()
+        && event_tx
+            .blocking_send(ClientLoopEvent::StdinInput(initial_input))
+            .is_err()
+    {
+        return;
+    }
+    let mut scratch = [0u8; 4096];
+    while !should_quit.load(Ordering::Acquire) {
+        match reader.read(&mut scratch) {
+            Ok(0) => {
+                if !should_quit.load(Ordering::Acquire) {
+                    let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(
+                        io::ErrorKind::UnexpectedEof.into(),
+                    ));
+                }
+                break;
+            }
+            Ok(n) => {
+                if should_quit.load(Ordering::Acquire) {
+                    break;
+                }
+                if event_tx
+                    .blocking_send(ClientLoopEvent::StdinInput(scratch[..n].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(err));
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn target_changed(target: Option<&AttachTarget>, event_tx: &mpsc::Sender<ClientLoopEvent>) -> bool {
+    if target.is_none_or(|target| target.is_current()) {
+        return false;
+    }
+    let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "attach target changed",
+    )));
+    true
 }
 
 #[cfg(unix)]
 fn unix_stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
-    host_color_query_sent: bool,
+    (host_color_query_sent, host_cell_size_query_sent): (bool, bool),
     host_theme_query_pending: Arc<AtomicU32>,
-    host_cell_size_query_sent: bool,
+    host_mouse_capture_active: Arc<AtomicBool>,
+    host_sgr_pixels_active: Arc<AtomicBool>,
+    host_escape_disambiguation_active: bool,
+    initial_host_input: Vec<u8>,
+    direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
+    direct_response_active: Arc<AtomicBool>,
+    target: Option<AttachTarget>,
+) {
+    let stdin = io::stdin();
+    if let Some(target) = target {
+        let reader = GuardedInputReader {
+            fd: stdin.as_fd(),
+            should_quit,
+            target: Some(target.input_guard()),
+        };
+        unix_input_from_reader(
+            (reader, Some(target)),
+            event_tx,
+            should_quit,
+            (host_color_query_sent, host_cell_size_query_sent),
+            host_theme_query_pending,
+            host_mouse_capture_active,
+            host_sgr_pixels_active,
+            host_escape_disambiguation_active,
+            initial_host_input,
+            direct_response,
+            direct_response_active,
+        );
+    } else {
+        unix_input_from_reader(
+            (stdin.lock(), None),
+            event_tx,
+            should_quit,
+            (host_color_query_sent, host_cell_size_query_sent),
+            host_theme_query_pending,
+            host_mouse_capture_active,
+            host_sgr_pixels_active,
+            host_escape_disambiguation_active,
+            initial_host_input,
+            direct_response,
+            direct_response_active,
+        );
+    }
+}
+
+#[cfg(unix)]
+fn unix_input_from_reader(
+    (mut reader, target): (impl Read + AsRawFd, Option<AttachTarget>),
+    event_tx: mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    (host_color_query_sent, host_cell_size_query_sent): (bool, bool),
+    host_theme_query_pending: Arc<AtomicU32>,
     host_mouse_capture_active: Arc<AtomicBool>,
     host_sgr_pixels_active: Arc<AtomicBool>,
     host_escape_disambiguation_active: bool,
@@ -90,8 +402,6 @@ fn unix_stdin_reader_loop(
     direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
     direct_response_active: Arc<AtomicBool>,
 ) {
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
     let mut scratch = [0u8; 4096];
     let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
     framer.set_host_escape_disambiguation_active(host_escape_disambiguation_active);
@@ -108,6 +418,9 @@ fn unix_stdin_reader_loop(
     let mut last_geometry = None;
     let mut direct_filter = super::direct_graphics::InputFilter::default();
 
+    if target_changed(target.as_ref(), &event_tx) {
+        return;
+    }
     if !initial_host_input.is_empty() {
         let sgr_pixels = host_sgr_pixels_active.load(Ordering::Acquire);
         if sgr_pixels {
@@ -129,6 +442,9 @@ fn unix_stdin_reader_loop(
                 framer.idle_flush_timeout_ms(host_mouse_capture_active.load(Ordering::Acquire)),
             ) == Some(false)
         {
+            if target_changed(target.as_ref(), &event_tx) {
+                return;
+            }
             let had_pending = framer.has_pending_input();
             let chunks = framer.flush_timeout();
             let held_escape = had_pending && chunks.is_empty();
@@ -159,10 +475,16 @@ fn unix_stdin_reader_loop(
     }
 
     while !should_quit.load(Ordering::Acquire) {
+        if target_changed(target.as_ref(), &event_tx) {
+            return;
+        }
         if direct_filter.has_pending()
             && stdin_read_ready(&reader, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
                 == Some(false)
         {
+            if target_changed(target.as_ref(), &event_tx) {
+                return;
+            }
             let released = direct_response
                 .lock()
                 .ok()
@@ -231,6 +553,9 @@ fn unix_stdin_reader_loop(
                 let timeout_ms =
                     framer.idle_flush_timeout_ms(host_mouse_capture_active.load(Ordering::Acquire));
                 if stdin_read_ready(&reader, timeout_ms) == Some(false) {
+                    if target_changed(target.as_ref(), &event_tx) {
+                        return;
+                    }
                     let had_pending = framer.has_pending_input();
                     let chunks = framer.flush_timeout();
                     let held_escape = had_pending && chunks.is_empty();
@@ -253,6 +578,9 @@ fn unix_stdin_reader_loop(
                         && stdin_read_ready(&reader, framer.held_input_flush_timeout_ms())
                             == Some(false)
                     {
+                        if target_changed(target.as_ref(), &event_tx) {
+                            return;
+                        }
                         let chunks = framer.flush_timeout();
                         if !framer.has_pending_input() {
                             pending_mode = None;
@@ -269,9 +597,10 @@ fn unix_stdin_reader_loop(
                     }
                 }
             }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+                if target.is_some() {
+                    let _ = event_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(err));
                 }
                 break;
             }
@@ -474,21 +803,130 @@ fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    // The stdin reader thread is hard to unit test since it reads from actual stdin.
-    // Integration tests will verify the full client→server input flow.
-    // Here we test the event type construction.
 
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn stdin_input_event_carries_raw_bytes() {
-        let data = vec![0x1b, b'[', b'A']; // Up arrow escape sequence
-        let event = ClientLoopEvent::StdinInput(data.clone());
-        match event {
-            ClientLoopEvent::StdinInput(d) => assert_eq!(d, data),
-            _ => panic!("expected StdinInput event"),
+    fn native_input_revokes_on_atomic_retarget_before_forwarding_new_keystrokes() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-native-input-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let target_file = base.join("target");
+        std::fs::write(&target_file, "local/old term_old native").unwrap();
+        let target = AttachTarget {
+            target_file: std::ffi::CString::new(target_file.clone().into_os_string().into_vec())
+                .unwrap(),
+            target: "local/old term_old native".into(),
+            ready_file: base.join("ready"),
+            ready: None,
+        };
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let worker = std::thread::spawn(move || {
+            let quit = AtomicBool::new(false);
+            let reader = GuardedInputReader {
+                fd: receiver.as_fd(),
+                should_quit: &quit,
+                target: Some(target),
+            };
+            native_input_from_reader(reader, tx, &quit, Vec::new());
+        });
+        sender.write_all(b"before").unwrap();
+        let Some(ClientLoopEvent::StdinInput(before)) = rx.blocking_recv() else {
+            panic!("input must work before the target changes");
+        };
+        assert_eq!(before, b"before");
+        let replacement = base.join("replacement");
+        std::fs::write(&replacement, "local/old term_old ansi").unwrap();
+        std::fs::rename(replacement, &target_file).unwrap();
+        sender
+            .write_all(b"must not reach the old application")
+            .unwrap();
+        let Some(ClientLoopEvent::TerminalUnavailable(err)) = rx.blocking_recv() else {
+            panic!("retargeted input must revoke the viewer, not forward the new key");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(rx.blocking_recv().is_none());
+        worker.join().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn classic_input_revokes_on_mode_switch_before_framing_or_forwarding() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-classic-input-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let target_file = base.join("target");
+        std::fs::write(&target_file, "local/default term_1 ansi").unwrap();
+        let target = AttachTarget {
+            target_file: std::ffi::CString::new(target_file.clone().into_os_string().into_vec())
+                .unwrap(),
+            target: "local/default term_1 ansi".into(),
+            ready_file: base.join("ready"),
+            ready: None,
+        };
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let worker = std::thread::spawn(move || {
+            let quit = Arc::new(AtomicBool::new(false));
+            let reader = GuardedInputReader {
+                fd: receiver.as_fd(),
+                should_quit: &quit,
+                target: Some(target.input_guard()),
+            };
+            unix_input_from_reader(
+                (reader, Some(target)),
+                tx,
+                &quit,
+                (false, false),
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                false,
+                Vec::new(),
+                Arc::new(std::sync::Mutex::new(
+                    super::super::direct_graphics::ResponseMatcher::default(),
+                )),
+                Arc::new(AtomicBool::new(false)),
+            );
+        });
+        sender.write_all(b"before").unwrap();
+        let mut before = Vec::new();
+        while before.len() < b"before".len() {
+            let Some(ClientLoopEvent::StdinInput(bytes)) = rx.blocking_recv() else {
+                panic!("classic input must work before the mode switch");
+            };
+            before.extend(bytes);
         }
+        assert_eq!(before, b"before");
+        let replacement = base.join("replacement");
+        std::fs::write(&replacement, "local/default term_1 native").unwrap();
+        std::fs::rename(replacement, &target_file).unwrap();
+        if let Err(err) = sender.write_all(b"must not reach the old application") {
+            assert!(matches!(
+                err.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ));
+        }
+        let Some(ClientLoopEvent::TerminalUnavailable(err)) = rx.blocking_recv() else {
+            panic!("mode switch must revoke classic input");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(rx.blocking_recv().is_none());
+        worker.join().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -568,12 +1006,6 @@ mod tests {
             2
         );
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn raw_input_idle_flush_timeout_keeps_escape_responsive() {
-        let timeout_ms = std::hint::black_box(crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS);
-        assert!(timeout_ms <= 20);
     }
 
     #[cfg(not(target_os = "macos"))]

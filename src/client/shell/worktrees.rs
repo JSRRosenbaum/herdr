@@ -194,9 +194,9 @@ impl ClientShellState {
             .and_then(|workspace| workspace.worktree.as_ref())
             .is_some_and(|worktree| worktree.is_linked_worktree);
         let kind = match action {
-            KeybindAction::NewWorktree | KeybindAction::OpenWorktree if linked => {
+            KeybindAction::OpenWorktree if linked => {
                 self.set_endpoint_error(
-                    "New and open worktree actions start from the repo parent workspace.",
+                    "Open worktree actions start from the repo parent workspace.",
                 );
                 outcome.repaint = true;
                 return;

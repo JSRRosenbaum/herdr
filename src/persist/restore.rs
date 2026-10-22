@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
@@ -26,6 +27,7 @@ use super::{
 struct AgentRestoreState<'a> {
     enabled: bool,
     resumed_sessions: &'a mut HashSet<String>,
+    max_age: Duration,
 }
 
 struct PaneRestoreStartup<'a> {
@@ -39,6 +41,7 @@ struct RestoreRuntimeContext<'a> {
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
+    resume_max_age: Duration,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -69,27 +72,32 @@ pub fn restore(
     rows: u16,
     cols: u16,
     scrollback_limit_bytes: usize,
-    default_shell: &str,
-    shell_mode: crate::config::ShellModeConfig,
+    shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
+    resume_max_age_hours: u32,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes,
+        shell_config,
+        resume_agents_on_restore,
+        resume_max_age: Duration::from_secs(u64::from(resume_max_age_hours) * 60 * 60),
+        events,
+        render_notify,
+        render_dirty,
+    };
     let mut imported_panes = HashMap::new();
-    restore_with_imports(
+    restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        resume_agents_on_restore,
+        &runtime_context,
         &mut imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     )
+    .0
 }
 
 #[cfg(unix)]
@@ -199,18 +207,22 @@ fn restore_with_imports_strict(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes,
+        shell_config,
+        resume_agents_on_restore,
+        resume_max_age: Duration::ZERO,
+        events,
+        render_notify,
+        render_dirty,
+    };
     let (restored, failed_imports) = restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
+        &runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     );
     if failed_imports > 0 {
         return Err(std::io::Error::other(format!(
@@ -226,47 +238,13 @@ fn restore_with_imports_strict(
     Ok(restored)
 }
 
-fn restore_with_imports(
-    snapshot: &SessionSnapshot,
-    history: Option<&SessionHistorySnapshot>,
-    rows: u16,
-    cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
-    imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
-) -> RestoredSession {
-    restore_with_imports_and_failures(
-        snapshot,
-        history,
-        rows,
-        cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
-        imported_panes,
-        events,
-        render_notify,
-        render_dirty,
-    )
-    .0
-}
-
 fn restore_with_imports_and_failures(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
     let history = history.filter(|history| {
         let matches = history.layout_fingerprint.is_some()
@@ -282,20 +260,12 @@ fn restore_with_imports_and_failures(
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
-        let runtime_context = RestoreRuntimeContext {
-            scrollback_limit_bytes,
-            shell_config,
-            resume_agents_on_restore,
-            events: events.clone(),
-            render_notify: render_notify.clone(),
-            render_dirty: render_dirty.clone(),
-        };
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
             cols,
-            &runtime_context,
+            runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
         );
@@ -545,6 +515,7 @@ fn restore_tab(
         let startup = {
             let mut agent_restore = AgentRestoreState {
                 enabled: runtime_context.resume_agents_on_restore,
+                max_age: runtime_context.resume_max_age,
                 resumed_sessions: resumed_agent_sessions,
             };
             pane_restore_startup(
@@ -826,7 +797,7 @@ fn pane_restore_startup<'a>(
     } else if let Some(resume) = reported_resume {
         Some(reported_resume_from_snapshot(resume).plan(cwd))
     } else {
-        session.and_then(|session| restore_plan_for_snapshot(session, true))
+        session.and_then(|session| restore_plan_for_snapshot(session, true, agent_restore.max_age))
     };
     let has_native_agent_restore = restore_plan.is_some();
     // Reserve before spawning so later panes in the same restore pass cannot
@@ -881,12 +852,35 @@ fn reported_resume_from_snapshot(
 fn restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
+    max_age: Duration,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     if !resume_agents_on_restore {
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
+    if !max_age.is_zero() && !agent_session_is_recent(&persisted, max_age, SystemTime::now()) {
+        return None;
+    }
     crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+}
+
+fn agent_session_is_recent(
+    session: &crate::agent_resume::PersistedAgentSession,
+    max_age: Duration,
+    now: SystemTime,
+) -> bool {
+    let crate::agent_resume::AgentSessionRefKind::Path = session.session_ref.kind else {
+        return false;
+    };
+    let Ok(modified) =
+        std::fs::metadata(&session.session_ref.value).and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    let Ok(age) = now.duration_since(modified) else {
+        return false;
+    };
+    age <= max_age
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -916,7 +910,7 @@ fn take_restore_plan_for_snapshot(
     resume_agents_on_restore: bool,
     resumed_agent_sessions: &mut HashSet<String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
-    restore_plan_for_snapshot(session, resume_agents_on_restore)
+    restore_plan_for_snapshot(session, resume_agents_on_restore, Duration::ZERO)
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
 }
 
@@ -1178,9 +1172,11 @@ mod tests {
             value: pi_session_path.clone(),
         };
 
-        assert!(restore_plan_for_snapshot(&session, false).is_none());
+        assert!(restore_plan_for_snapshot(&session, false, Duration::ZERO).is_none());
         assert_eq!(
-            restore_plan_for_snapshot(&session, true).unwrap().argv,
+            restore_plan_for_snapshot(&session, true, Duration::ZERO)
+                .unwrap()
+                .argv,
             vec!["pi", "--session", pi_session_path.as_str()]
         );
 
@@ -1190,7 +1186,64 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
         };
-        assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+        assert!(restore_plan_for_snapshot(&unsupported_path, true, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn restore_age_limit_requires_recent_path_and_leaves_unlimited_id_restore_unchanged() {
+        let max_age = Duration::from_secs(8 * 60 * 60);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-restore-age-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: path.display().to_string(),
+        };
+        let persisted = persisted_agent_session_from_snapshot(&session).unwrap();
+        assert!(restore_plan_for_snapshot(&session, true, max_age).is_some());
+
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - max_age))
+            .unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        assert!(agent_session_is_recent(
+            &persisted,
+            max_age,
+            modified + max_age
+        ));
+        assert!(!agent_session_is_recent(
+            &persisted,
+            max_age,
+            modified + max_age + Duration::from_secs(1)
+        ));
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() - max_age - Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert!(restore_plan_for_snapshot(&session, true, max_age).is_none());
+        assert!(restore_plan_for_snapshot(&session, true, Duration::ZERO).is_some());
+
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+        assert!(restore_plan_for_snapshot(&session, true, max_age).is_none());
+        assert!(restore_plan_for_snapshot(&session, true, Duration::ZERO).is_some());
+
+        let opaque_id = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "opaque-session".into(),
+        };
+        assert!(restore_plan_for_snapshot(&opaque_id, true, max_age).is_none());
+        assert!(restore_plan_for_snapshot(&opaque_id, true, Duration::ZERO).is_some());
     }
 
     #[test]
@@ -1231,6 +1284,7 @@ mod tests {
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
             enabled: true,
+            max_age: Duration::ZERO,
             resumed_sessions: &mut resumed,
         };
 
@@ -1262,6 +1316,7 @@ mod tests {
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
             enabled: true,
+            max_age: Duration::ZERO,
             resumed_sessions: &mut resumed,
         };
 
@@ -1312,6 +1367,7 @@ mod tests {
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
             enabled: true,
+            max_age: Duration::ZERO,
             resumed_sessions: &mut resumed,
         };
 
@@ -1347,6 +1403,7 @@ mod tests {
         let mut resumed = HashSet::new();
         let mut disabled = AgentRestoreState {
             enabled: false,
+            max_age: Duration::ZERO,
             resumed_sessions: &mut resumed,
         };
         let startup = pane_restore_startup(
@@ -1375,6 +1432,7 @@ mod tests {
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
             enabled: false,
+            max_age: Duration::ZERO,
             resumed_sessions: &mut resumed,
         };
 
@@ -1465,13 +1523,16 @@ mod tests {
                 24,
                 80,
                 0,
-                if missing_shell {
-                    "__herdr_missing_restore_shell__"
-                } else {
-                    test_restore_shell()
-                },
-                crate::config::ShellModeConfig::NonLogin,
+                crate::pane::PaneShellConfig::new(
+                    if missing_shell {
+                        "__herdr_missing_restore_shell__"
+                    } else {
+                        test_restore_shell()
+                    },
+                    crate::config::ShellModeConfig::NonLogin,
+                ),
                 false,
+                0,
                 events,
                 Arc::new(Notify::new()),
                 Arc::new(RenderSignal::new()),
@@ -1576,9 +1637,12 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
+            0,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1671,9 +1735,12 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
+            0,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1780,9 +1847,12 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
+            0,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1892,9 +1962,12 @@ mod tests {
             24,
             80,
             0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             true,
+            0,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1954,9 +2027,12 @@ mod tests {
                 24,
                 80,
                 4096,
-                test_restore_shell(),
-                crate::config::ShellModeConfig::NonLogin,
+                crate::pane::PaneShellConfig::new(
+                    test_restore_shell(),
+                    crate::config::ShellModeConfig::NonLogin,
+                ),
                 false,
+                0,
                 events.clone(),
                 Arc::new(Notify::new()),
                 Arc::new(RenderSignal::new()),
@@ -2057,9 +2133,12 @@ mod tests {
             5,
             40,
             4096,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
+            0,
             events,
             render_notify,
             render_dirty,
@@ -2095,9 +2174,12 @@ mod tests {
             5,
             40,
             4096,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
+            crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
             false,
+            0,
             events,
             render_notify,
             render_dirty,
@@ -2143,9 +2225,12 @@ mod tests {
                 5,
                 80,
                 4096,
-                test_restore_shell(),
-                crate::config::ShellModeConfig::NonLogin,
+                crate::pane::PaneShellConfig::new(
+                    test_restore_shell(),
+                    crate::config::ShellModeConfig::NonLogin,
+                ),
                 false,
+                0,
                 events,
                 Arc::new(Notify::new()),
                 Arc::new(RenderSignal::new()),

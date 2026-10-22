@@ -106,6 +106,57 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     )
 }
 
+/// Opens a saved remote session through the existing SSH client-socket bridge.
+/// The interactive client stays local, so Windows servers need no Windows
+/// direct-attach implementation. Discovery and status are read-only: never
+/// install, restart, or take over a remote server as a side effect of follow.
+#[cfg(unix)]
+pub(crate) fn run_saved_terminal_attach(
+    profile: &crate::client::endpoint::SavedSshEndpoint,
+    terminal_id: &str,
+    takeover: bool,
+    native: bool,
+) -> io::Result<()> {
+    let mut ssh = RemoteSsh::new_noninteractive(profile.target.clone());
+    ssh.session_name = profile.session.clone();
+    let remote_herdr = find_installed_remote_herdr(&ssh)?;
+    if !matches!(
+        remote_server_status(&ssh, &remote_herdr, false)?,
+        RemoteServerStatus::Running { .. }
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "Herdr session '{}' on machine '{}' is not running",
+                profile.session, profile.label
+            ),
+        ));
+    }
+    let local_socket = local_forward_socket_path(&profile.target, &profile.session);
+    let bridge = SshStdioBridge::start(
+        profile.target.clone(),
+        remote_herdr,
+        local_socket.clone(),
+        profile.session.clone(),
+        ssh.options(),
+        true,
+        Arc::new(AtomicBool::new(false)),
+    )?;
+    let attach = if native {
+        crate::client::run_native_terminal_attach_on_socket(
+            Some(&local_socket),
+            terminal_id.to_owned(),
+        )
+    } else {
+        crate::client::run_terminal_attach_on_socket(
+            Some(&local_socket),
+            terminal_id.to_owned(),
+            takeover,
+        )
+    };
+    attach.map_err(|error| bridge.reported_failure().unwrap_or(error))
+}
+
 pub(crate) fn check_saved_ssh(target: &str, session: &str) -> io::Result<()> {
     super::validate_remote_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -201,7 +252,7 @@ impl SavedSshSetup {
                             session.running && crate::session::validate_name(&session.name).is_ok()
                         })
                         .map(|session| session.name)
-                        .collect())
+                        .collect());
                 }
                 Err(error) => failure = format!("invalid remote session list: {error}"),
             }
@@ -774,7 +825,10 @@ pub(crate) fn ssh_authentication_command(target: &str) -> io::Result<SshAuthenti
         ));
     }
     if !crate::platform::remote_ssh_config_paths().multiplexing {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "interactive SSH recovery requires Unix OpenSSH multiplexing; authenticate outside Herdr on this platform"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "interactive SSH recovery requires Unix OpenSSH multiplexing; authenticate outside Herdr on this platform",
+        ));
     }
     if !crate::config::Config::load()
         .config
@@ -2328,7 +2382,9 @@ fn confirm_remote_install_with_running_server(
     eprintln!(
         "To complete the remote update, Herdr must stop the running remote server after installing."
     );
-    eprintln!("This stops active remote pane processes, including shells, agents, dev servers, and tests.");
+    eprintln!(
+        "This stops active remote pane processes, including shells, agents, dev servers, and tests."
+    );
     eprintln!();
     eprint!(
         "Install {} and stop the remote server now? [y/N] ",
@@ -2566,7 +2622,9 @@ fn confirm_remote_server_stop(
         }
     }
 
-    eprintln!("This stops active remote pane processes, including shells, agents, dev servers, and tests.");
+    eprintln!(
+        "This stops active remote pane processes, including shells, agents, dev servers, and tests."
+    );
     let prompt = if required_upgrade {
         "stop and update the remote server, then continue attaching? [y/N] "
     } else {
@@ -2911,6 +2969,38 @@ exit 2"#,
 }
 
 pub(super) const STALE_API_METADATA: &str = "herdr-machine-metadata-stale-v1";
+pub(super) const STALE_SSH_METADATA: &str = "herdr-ssh-metadata-stale-v1";
+
+pub(super) fn cached_remote_client_command(
+    metadata: &crate::client::endpoint::SshMachineMetadata,
+    session: &str,
+) -> String {
+    let session_args = RemoteExecutable::session_args(session, &["remote-client-bridge"]);
+    if metadata.os == "windows" {
+        let path = crate::platform::quote_powershell_arg(&metadata.executable);
+        let stale = crate::platform::quote_powershell_arg(STALE_SSH_METADATA);
+        return windows_powershell_script_command(&format!(
+            "if (-not (Test-Path -LiteralPath {path} -PathType Leaf)) {{ [Console]::Error.WriteLine({stale}); exit 78 }}; {}",
+            windows_powershell_streaming_application_script(
+                &metadata.executable,
+                &session_args,
+            ),
+        ));
+    }
+
+    let path = shell_quote(&metadata.executable);
+    let mut bridge_command = format!("exec {path}");
+    for arg in session_args {
+        bridge_command.push(' ');
+        bridge_command.push_str(&shell_quote(arg));
+    }
+    bridge_command.push_str(" <&3");
+    let script = format!(
+        "if test -x {path}; then\n{}\nelse\n    printf '%s\\n' '{STALE_SSH_METADATA}' >&2\n    exit 78\nfi",
+        posix_remote_output_command(&bridge_command),
+    );
+    posix_base64_command(&script)
+}
 
 pub(super) fn cached_remote_api_command(
     metadata: &crate::client::endpoint::SshMachineMetadata,
@@ -2926,7 +3016,7 @@ pub(super) fn cached_remote_api_command(
             "{probe}{}",
             windows_powershell_streaming_application_script(
                 &metadata.executable,
-                &["--session", session, "remote-api-bridge"]
+                &["--session", session, "remote-api-bridge"],
             ),
         ));
     }
@@ -3289,6 +3379,7 @@ fn bridge_child(
     mut command: Command,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let mut pipe_abort = crate::platform::RemoteBridgePipeAbort::new(&stream)?;
     let upload_stop = Arc::new(BridgeUploadStop::new()?);
 
     let mut child =
@@ -3393,9 +3484,15 @@ fn bridge_child(
         thread::sleep(BRIDGE_ACCEPT_POLL);
     };
     upload_stop.cancel();
-    if !child_exited {
+    let abandoned_before_join = !child_exited
+        || bridge_stop.load(Ordering::Acquire)
+        || client_closed.load(Ordering::Acquire);
+    if abandoned_before_join {
         connection_stop.store(true, Ordering::Release);
         pipe_control.stop();
+        if let Err(error) = pipe_abort.abort() {
+            tracing::debug!(%error, "remote bridge named-pipe abort failed");
+        }
     }
     let upload_result = upload
         .join()
@@ -3413,6 +3510,11 @@ fn bridge_child(
 
     let stopping = bridge_stop.load(Ordering::Acquire);
     let client_closed = client_closed.load(Ordering::Acquire);
+    if stopping || client_closed {
+        if let Err(error) = pipe_abort.abort() {
+            tracing::debug!(%error, "remote bridge named-pipe abort failed");
+        }
+    }
     if child_exited && !status.success() && !stopping && !client_closed {
         return Err(ssh_bridge_exit_error(status, &stderr));
     }
@@ -3426,6 +3528,7 @@ fn bridge_child(
     }
 
     if status.success() || stopping || client_closed {
+        pipe_abort.complete();
         Ok(())
     } else {
         Err(ssh_bridge_exit_error(status, &stderr))
@@ -3731,7 +3834,7 @@ mod tests {
             let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
             let server = listener.accept().unwrap();
             drop(listener);
-            fs::remove_file(socket).unwrap();
+            fs::remove_file(&socket).unwrap();
             client.set_nonblocking(true).unwrap();
             let fixture = super::super::process::tests::PipeFixture::new(mode);
             let mut command = fixture.command();
@@ -3766,6 +3869,14 @@ mod tests {
                 crate::platform::process_exists(descendant),
                 "{mode}: cleanup waited for or killed the independent holder"
             );
+            #[cfg(windows)]
+            {
+                drop(client);
+                let rebound = crate::ipc::bind_private_local_listener(&socket)
+                    .expect("cancelled bridge endpoint can be rebound");
+                drop(rebound);
+                fs::remove_file(&socket).unwrap();
+            }
         }
     }
 
@@ -3777,7 +3888,7 @@ mod tests {
         let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
         let server = listener.accept().unwrap();
         drop(listener);
-        fs::remove_file(socket).unwrap();
+        fs::remove_file(&socket).unwrap();
         let fixture = super::super::process::tests::PipeFixture::new("bridge-final");
         let mut command = fixture.command();
         command
@@ -3795,6 +3906,14 @@ mod tests {
             "cleanup waited for or killed the independent holder"
         );
         assert!(String::from_utf8_lossy(&output).contains("final child output"));
+        #[cfg(windows)]
+        {
+            drop(client);
+            let rebound = crate::ipc::bind_private_local_listener(&socket)
+                .expect("completed bridge endpoint can be rebound");
+            drop(rebound);
+            fs::remove_file(&socket).unwrap();
+        }
     }
 
     #[test]
@@ -5127,6 +5246,49 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cached_posix_client_command_preserves_exit_status_and_marks_missing_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("herdr-posix-client-bridge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("herdr cached's executable");
+        fs::write(&executable, "#!/bin/sh\nexit 23\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run = |command: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+
+        let metadata = crate::client::endpoint::SshMachineMetadata {
+            os: "linux".into(),
+            executable: executable.display().to_string(),
+        };
+        let output = run(&cached_remote_client_command(&metadata, "fleet"));
+        assert_eq!(output.status.code(), Some(23), "{output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains(STALE_SSH_METADATA),
+            "{output:?}"
+        );
+
+        fs::remove_file(&executable).unwrap();
+        let output = run(&cached_remote_client_command(&metadata, "fleet"));
+        assert_eq!(output.status.code(), Some(78), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(STALE_SSH_METADATA),
+            "{output:?}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn windows_remote_commands_use_one_encoded_powershell_grammar() {
         let executable = RemoteExecutable::WindowsPath("herdr.exe".to_string());
@@ -5163,12 +5325,26 @@ mod tests {
             ),
             (
                 "API bridge with explicit default session",
-                remote_api_bridge_command(&RemoteHerdr::for_platform(RemotePlatform { os: "windows", arch: "x86_64" }), "default", false),
+                remote_api_bridge_command(
+                    &RemoteHerdr::for_platform(RemotePlatform {
+                        os: "windows",
+                        arch: "x86_64",
+                    }),
+                    "default",
+                    false,
+                ),
                 "$process = Start-Process -FilePath herdr.exe -ArgumentList '--session default remote-api-bridge' -NoNewWindow -PassThru -ErrorAction Stop; $null = $process.Handle; $process.WaitForExit(); exit $process.ExitCode",
             ),
             (
                 "API bridge capability probe",
-                remote_api_bridge_command(&RemoteHerdr::for_platform(RemotePlatform { os: "windows", arch: "x86_64" }), "agents", true),
+                remote_api_bridge_command(
+                    &RemoteHerdr::for_platform(RemotePlatform {
+                        os: "windows",
+                        arch: "x86_64",
+                    }),
+                    "agents",
+                    true,
+                ),
                 "$process = Start-Process -FilePath herdr.exe -ArgumentList '--session agents remote-api-bridge --check' -NoNewWindow -PassThru -ErrorAction Stop; $null = $process.Handle; $process.WaitForExit(); exit $process.ExitCode",
             ),
             (

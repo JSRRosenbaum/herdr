@@ -600,10 +600,12 @@ impl WindowsInputPump {
                 if let Some(decoded) = decoded {
                     *text = decoded;
                 } else {
+                    if !self.paste_from_win32_key_records {
+                        decode_win32_mixed_paste_groups(text);
+                    }
                     decode_windows_terminal_paste_enters(text);
                 }
                 self.paste_from_win32_key_records = false;
-            }
         }
 
         let accepted_default_mouse = self.default_mouse_candidate.active
@@ -720,8 +722,9 @@ impl PlatformInputItem {
 
 /// WezTerm can put serialized key records inside raw bracketed-paste markers.
 /// Only recognize a complete payload of matching text press/release pairs and
-/// modifier-only reports. Mixed, incomplete, or unsupported payloads stay opaque.
-fn decode_win32_paste_payload(text: &str) -> Option<String> {
+/// modifier-only reports. Mixed, incomplete, or unsupported payloads stay
+/// opaque here; the boundary normalizer below handles only the captured
+/// balanced Ctrl+Enter group.
     let mut reports = text.split_inclusive('_');
     let mut units = Vec::new();
     while let Some(report) = reports.next() {
@@ -764,6 +767,22 @@ fn parse_win32_paste_record(report: &str) -> Option<WindowsKeyRecord> {
     // This compatibility exception covers the captured one-unit records, not
     // repeated key streams that could expand a small paste into large output.
     (record.repeat_count == 1).then_some(record)
+}
+
+const WIN32_CTRL_ENTER_PASTE_GROUP: &str = concat!(
+    "\x1b[17;29;0;1;8;1_",
+    "\x1b[13;28;10;1;8;1_",
+    "\x1b[13;28;10;0;8;1_",
+    "\x1b[17;29;0;0;0;1_",
+);
+
+/// WezTerm can put a complete Ctrl+Enter report group inside ordinary paste
+/// text. Replace only the exact balanced group; report-shaped text that does
+/// not match the captured sequence remains opaque.
+fn decode_win32_mixed_paste_groups(text: &mut String) {
+    if text.contains(WIN32_CTRL_ENTER_PASTE_GROUP) {
+        *text = text.replace(WIN32_CTRL_ENTER_PASTE_GROUP, "\n");
+    }
 }
 
 fn decode_windows_terminal_paste_enters(text: &mut String) {
@@ -2240,6 +2259,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn win32_mixed_paste_groups_preserve_unicode_and_multiple_newlines() {
+        let mut text = format!(
+            "before 前置 {WIN32_CTRL_ENTER_PASTE_GROUP} 中间 \
+             {WIN32_CTRL_ENTER_PASTE_GROUP} after 后置"
+        );
+
+        decode_win32_mixed_paste_groups(&mut text);
+
+        assert_eq!(text, "before 前置 \n 中间 \n after 后置");
+    }
+
+    #[test]
+    fn win32_mixed_paste_groups_leave_nonmatching_reports_opaque() {
+        let payloads = [
+            // A prose fragment without ESC bytes is not a report group.
+            "[17;29;0;1;8;1_[13;28;10;1;8;1_",
+            // Missing the Ctrl release.
+            concat!(
+                "\x1b[17;29;0;1;8;1_",
+                "\x1b[13;28;10;1;8;1_",
+                "\x1b[13;28;10;0;8;1_",
+            ),
+            // Unsupported repeat count.
+            concat!(
+                "\x1b[17;29;0;1;8;2_",
+                "\x1b[13;28;10;1;8;1_",
+                "\x1b[13;28;10;0;8;1_",
+                "\x1b[17;29;0;0;0;1_",
+            ),
+            // Unsupported modifier state on Enter.
+            concat!(
+                "\x1b[17;29;0;1;8;1_",
+                "\x1b[13;28;10;1;16;1_",
+                "\x1b[13;28;10;0;16;1_",
+                "\x1b[17;29;0;0;0;1_",
+            ),
+            // Malformed report body.
+            concat!(
+                "\x1b[17;29;0;1;8;1_",
+                "\x1b[13;28;10;1;8;",
+                "\x1b[13;28;10;0;8;1_",
+                "\x1b[17;29;0;0;0;1_",
+            ),
+        ];
+
+        for payload in payloads {
+            let mut text = format!("before{payload}after");
+            let expected = text.clone();
+            decode_win32_mixed_paste_groups(&mut text);
+            assert_eq!(text, expected, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn vti_mixed_win32_paste_normalizes_split_report_groups() {
+        let batches = vec![
+            concat!(
+                "\x1b[200~前置 ",
+                "\x1b[17;29;0;1;8;1_",
+                "\x1b[13;28;10;1;8;1_",
+            )
+            .to_owned(),
+            format!(
+                "\x1b[13;28;10;0;8;1_\x1b[17;29;0;0;0;1_ 中間 \
+                 {WIN32_CTRL_ENTER_PASTE_GROUP}"
+            ),
+            " 后置\x1b[201~".to_owned(),
+        ];
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for batch in batches {
+            for record in batch.chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+        }
+
+        assert_eq!(
+            events,
+            vec![crate::protocol::ClientInputEvent::Paste {
+                text: "前置 \n 中間 \n 后置".into(),
+            }]
+        );
+    }
+
     fn serialized_paste_text(text: &str) -> String {
         text.encode_utf16()
             .map(|unit| format!("\x1b[0;0;{unit};1;0;1_\x1b[0;0;{unit};0;0;1_"))
@@ -2276,17 +2380,24 @@ mod tests {
 
     #[test]
     fn vti_encoded_paste_preserves_reports_then_raw_paste_decodes() {
-        let text = serialized_paste_text("a");
-        let framed = format!("\x1b[200~{text}\x1b[201~");
-        let mut records = win32_input_mode_encoded_key_bytes(framed.as_bytes());
-        records.extend(framed.chars().map(key_char));
-        assert_eq!(
-            translate(records),
-            vec![
-                crate::protocol::ClientInputEvent::Paste { text },
-                crate::protocol::ClientInputEvent::Paste { text: "a".into() },
-            ]
-        );
+        for (text, raw_text) in [
+            (serialized_paste_text("a"), "a".to_owned()),
+            (
+                format!("before{WIN32_CTRL_ENTER_PASTE_GROUP}after"),
+                "before\nafter".to_owned(),
+            ),
+        ] {
+            let framed = format!("\x1b[200~{text}\x1b[201~");
+            let mut records = win32_input_mode_encoded_key_bytes(framed.as_bytes());
+            records.extend(framed.chars().map(key_char));
+            assert_eq!(
+                translate(records),
+                vec![
+                    crate::protocol::ClientInputEvent::Paste { text },
+                    crate::protocol::ClientInputEvent::Paste { text: raw_text },
+                ]
+            );
+        }
     }
 
     #[test]

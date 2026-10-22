@@ -4201,6 +4201,298 @@ fn connect_pending_terminal_client_with_control_rx(
 }
 
 #[test]
+fn native_attach_rejects_dormant_terminal_without_waking_it() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        server.app.terminal_runtimes.remove(&terminal_id);
+        let control = connect_pending_terminal_client_with_control_rx(server, 7);
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientNativeAttachTerminal {
+                client_id: 7,
+                terminal_id: target.clone(),
+            })
+        );
+        assert_eq!(
+            read_server_shutdown_reason(control.recv().expect("native attach rejection")),
+            Some(format!(
+                "native terminal attach failed: terminal {target} has no running runtime; resume it explicitly"
+            ))
+        );
+        assert!(!server.clients.contains_key(&7));
+        assert!(server.terminal_attach_owners.is_empty());
+        assert!(!server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
+        assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
+
+        // A legacy direct controller still follows the pre-existing attach path.
+        connect_pending_terminal_client(server, 8);
+        assert!(
+            server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                client_id: 8,
+                terminal_id: target.clone(),
+                takeover: false,
+            })
+        );
+        assert_eq!(server.terminal_attach_owners.get(&target), Some(&8));
+    });
+}
+
+#[test]
+fn native_attach_ready_requires_live_output_subscription() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let control = connect_pending_terminal_client_with_control_rx(server, 7);
+        assert!(
+            server.handle_server_event(ServerEvent::ClientNativeAttachTerminal {
+                client_id: 7,
+                terminal_id: target.clone(),
+            })
+        );
+        assert!(server.clients[&7].native_output.is_some());
+        let ready = control
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native ready");
+        assert!(matches!(
+            read_server_message(ready),
+            ServerMessage::EndpointControl { kind, data }
+                if kind == crate::server::terminal_attach::NATIVE_READY_KIND && data == target
+        ));
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 }));
+        assert!(!server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_input_waits_for_capacity_preserves_fragments_and_cancels_on_detach() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("native-input");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+    let target = terminal_id.to_string();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+    runtime
+        .try_send_bytes(Bytes::from_static(b"prior"))
+        .expect("fill PTY input");
+    server
+        .app
+        .terminal_runtimes
+        .insert(terminal_id.clone(), runtime);
+    let _control = connect_pending_terminal_client_with_control_rx(&mut server, 7);
+    assert!(
+        server.handle_server_event(ServerEvent::ClientNativeAttachTerminal {
+            client_id: 7,
+            terminal_id: target,
+        })
+    );
+
+    for fragment in [
+        &b"\x1b[20"[..],
+        &b"0~\n\x1b_Ga=T;APC\x1b\\"[..],
+        &b"\x1b[201~\r"[..],
+    ] {
+        let (accepted, ack) = std::sync::mpsc::channel();
+        assert!(!server.handle_server_event(ServerEvent::ClientNativeInput {
+            client_id: 7,
+            data: fragment.to_vec(),
+            accepted,
+        }));
+        if fragment == b"\x1b[20" {
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                ack.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            // The server remains responsive while the PTY input queue is full.
+            let _other = connect_pending_terminal_client_with_control_rx(&mut server, 8);
+            assert_eq!(
+                input_rx.recv().await.expect("prior"),
+                Bytes::from_static(b"prior")
+            );
+        }
+        tokio::task::spawn_blocking(move || ack.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("ack task")
+            .expect("ack received")
+            .expect("PTY accepted");
+        assert_eq!(
+            input_rx.recv().await.expect("opaque input").as_ref(),
+            fragment
+        );
+    }
+
+    let runtime = server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .expect("runtime");
+    runtime
+        .try_send_bytes(Bytes::from_static(b"fill"))
+        .expect("fill input");
+    let (accepted, ack) = std::sync::mpsc::channel();
+    server.handle_server_event(ServerEvent::ClientNativeInput {
+        client_id: 7,
+        data: b"must-not-arrive".to_vec(),
+        accepted,
+    });
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        ack.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 });
+    assert!(matches!(
+        ack.recv_timeout(Duration::from_secs(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    assert_eq!(
+        input_rx.recv().await.expect("prior input"),
+        Bytes::from_static(b"fill")
+    );
+    assert!(matches!(
+        input_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    // A closed PTY must report failure to both the blocked socket reader and
+    // the native view, rather than silently acknowledging a dropped chunk.
+    drop(input_rx);
+    let control = connect_pending_terminal_client_with_control_rx(&mut server, 9);
+    assert!(
+        server.handle_server_event(ServerEvent::ClientNativeAttachTerminal {
+            client_id: 9,
+            terminal_id: terminal_id.to_string(),
+        })
+    );
+    let _ready = control
+        .recv_timeout(Duration::from_secs(1))
+        .expect("native ready");
+    let (accepted, ack) = std::sync::mpsc::channel();
+    server.handle_server_event(ServerEvent::ClientNativeInput {
+        client_id: 9,
+        data: b"closed".to_vec(),
+        accepted,
+    });
+    let err = tokio::task::spawn_blocking(move || ack.recv_timeout(Duration::from_secs(1)))
+        .await
+        .expect("ack task")
+        .expect("failure ack")
+        .expect_err("PTY closed");
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    assert!(matches!(
+        read_server_message(control.recv_timeout(Duration::from_secs(1)).expect("failure notice")),
+        ServerMessage::ServerShutdown { reason: Some(reason) }
+            if reason.contains("native terminal input failed")
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_input_waiter_is_cancelled_by_live_handoff() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("native-handoff");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+    let target = terminal_id.to_string();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+    runtime
+        .try_send_bytes(Bytes::from_static(b"old"))
+        .expect("fill PTY input");
+    server.app.terminal_runtimes.insert(terminal_id, runtime);
+    let _control = connect_pending_terminal_client_with_control_rx(&mut server, 7);
+    assert!(
+        server.handle_server_event(ServerEvent::ClientNativeAttachTerminal {
+            client_id: 7,
+            terminal_id: target,
+        })
+    );
+    let (accepted, ack) = std::sync::mpsc::channel();
+    server.handle_server_event(ServerEvent::ClientNativeInput {
+        client_id: 7,
+        data: b"cancelled".to_vec(),
+        accepted,
+    });
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        ack.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    server.handoff_in_progress = true;
+    server.disconnect_all_clients_for_handoff();
+    assert!(matches!(
+        ack.recv_timeout(Duration::from_secs(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    assert_eq!(
+        input_rx.recv().await.expect("prior input"),
+        Bytes::from_static(b"old")
+    );
+    assert!(matches!(
+        input_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_input_waiter_is_revoked_before_shutdown_drops_output_receiver() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("native-shutdown");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+    let target = terminal_id.to_string();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+    runtime
+        .try_send_bytes(Bytes::from_static(b"before"))
+        .expect("fill PTY input");
+    server.app.terminal_runtimes.insert(terminal_id, runtime);
+    let _control = connect_pending_terminal_client_with_control_rx(&mut server, 7);
+    assert!(
+        server.handle_server_event(ServerEvent::ClientNativeAttachTerminal {
+            client_id: 7,
+            terminal_id: target,
+        })
+    );
+    let (accepted, ack) = std::sync::mpsc::channel();
+    server.handle_server_event(ServerEvent::ClientNativeInput {
+        client_id: 7,
+        data: b"after-shutdown".to_vec(),
+        accepted,
+    });
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        ack.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    server.complete_shutdown().await.expect("shutdown cleanup");
+    assert!(matches!(
+        ack.recv_timeout(Duration::from_secs(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    assert_eq!(
+        input_rx.recv().await.expect("prior input"),
+        Bytes::from_static(b"before")
+    );
+    assert!(matches!(
+        input_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
     with_terminal_session_test_server(
         |server, terminal_id, _terminal_id_string, public_pane_id| {
@@ -4232,14 +4524,14 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
             };
 
             assert_eq!(
-                    server.agent_read_not_idle_error(&request),
-                    Some(api::schema::ErrorBody {
-                        code: "agent_not_idle".into(),
-                        message: format!(
-                            "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
-                        ),
-                    })
-                );
+                server.agent_read_not_idle_error(&request),
+                Some(api::schema::ErrorBody {
+                    code: "agent_not_idle".into(),
+                    message: format!(
+                        "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
+                    ),
+                })
+            );
 
             let mut default_request = request.clone();
             let api::schema::Method::AgentRead(params) = &mut default_request.method else {
@@ -4581,11 +4873,11 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
             .contains_key(&terminal_id_string));
         let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
         assert_eq!(
-                reason,
-                Some(format!(
-                    "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
-                ))
-            );
+            reason,
+            Some(format!(
+                "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
+            ))
+        );
     });
 }
 

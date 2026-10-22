@@ -125,6 +125,9 @@ impl HeadlessServer {
                     ))
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id } => {
+                    if client.native_output.is_some() {
+                        return None;
+                    }
                     let runtime = self.runtime_for_terminal_id_string(terminal_id);
                     let child_requests_mouse = runtime
                         .is_some_and(crate::terminal::TerminalRuntime::mouse_reporting_enabled);
@@ -233,6 +236,9 @@ impl HeadlessServer {
                 let ClientConnectionMode::TerminalAttach { terminal_id } = &client.mode else {
                     return None;
                 };
+                if client.native_output.is_some() {
+                    return None;
+                }
                 let (flags, modify_other_keys_level) = self
                     .runtime_for_terminal_id_string(terminal_id)
                     .map_or((0, 0), |runtime| {
@@ -559,6 +565,15 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
+            if self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.native_output.is_some())
+            {
+                // Raw output owns this client; never interleave virtual ANSI frames
+                // with its TSP document or overwrite the terminal's native surface.
+                continue;
+            }
             #[cfg(unix)]
             if matches!(mode, ClientConnectionMode::TerminalObserve { .. })
                 && self

@@ -21,7 +21,9 @@ use tracing::{error, info, warn};
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
-use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
+use crate::pty::actor::{
+    NativeInputLease, PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult,
+};
 use crate::render_signal::RenderSignal;
 
 mod agent_detection;
@@ -1501,6 +1503,8 @@ pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
+    /// One optional lossless raw PTY subscriber. None keeps the normal parser path allocation-free.
+    native_output: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
@@ -1521,6 +1525,7 @@ pub struct PaneRuntime {
     detect_handle: Option<tokio::task::AbortHandle>,
 }
 
+#[derive(Clone)]
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
     #[cfg(test)]
@@ -1528,6 +1533,14 @@ enum PaneRuntimeIo {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
     },
+}
+
+pub(crate) struct NativeInputHandle(PaneRuntimeIo);
+
+impl NativeInputHandle {
+    pub(crate) async fn send(&self, bytes: Bytes, lease: &NativeInputLease) -> std::io::Result<()> {
+        self.0.send_native_input(bytes, lease).await
+    }
 }
 
 impl PaneRuntimeIo {
@@ -1639,6 +1652,25 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+        }
+    }
+
+    async fn send_native_input(
+        &self,
+        bytes: Bytes,
+        lease: &NativeInputLease,
+    ) -> std::io::Result<()> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.send_user_input(bytes, lease).await,
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                let permit = sender.reserve().await.map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "test PTY closed")
+                })?;
+                lease.admit(|| {
+                    permit.send(bytes);
+                })
+            }
         }
     }
 
@@ -1766,12 +1798,7 @@ fn shutdown_pane_processes(
         return;
     }
 
-    let mut pids = crate::platform::session_processes(child_pid);
-    if pids.is_empty() {
-        pids.push(child_pid);
-    }
-    pids.sort_unstable();
-    pids.dedup();
+    let pids = crate::platform::pane_processes(child_pid);
 
     for (signal, grace) in [
         (
@@ -2230,7 +2257,42 @@ fn publish_reported_cwd(
     }
 }
 
+fn forward_native_output(
+    native_output: &Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    bytes: &[u8],
+) -> bool {
+    // Keep detach independent of a full channel: never hold the subscriber
+    // mutex while backpressuring the PTY reader.
+    let subscriber = native_output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(subscriber) = subscriber {
+        subscriber.blocking_send(bytes.to_vec()).is_ok()
+    } else {
+        false
+    }
+}
+
 impl PaneRuntime {
+    /// This subscription owns the PTY's terminal replies until detached. Output
+    /// backpressures the reader instead of dropping TSP frames or replaying input.
+    pub(crate) fn subscribe_native_output(&self) -> mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = mpsc::channel(64);
+        *self
+            .native_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+        receiver
+    }
+
+    pub(crate) fn unsubscribe_native_output(&self) {
+        *self
+            .native_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
     pub fn shutdown(mut self) {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
@@ -2563,6 +2625,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let native_output = Arc::new(Mutex::new(None::<mpsc::Sender<Vec<u8>>>));
 
         let io = {
             let terminal = terminal.clone();
@@ -2576,8 +2639,10 @@ impl PaneRuntime {
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
+            let native_output_reader = native_output.clone();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
+            let native_render_notify = render_notify.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
@@ -2585,10 +2650,19 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
+                let mut result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
+                if native_output_reader
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some()
+                {
+                    // When Tern owns the terminal, its reply to hello must arrive ahead
+                    // of DA1. Never let Ghostty's synthetic DA1 preempt that handshake.
+                    result.terminal_responses.clear();
+                }
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
@@ -2641,6 +2715,14 @@ impl PaneRuntime {
                 master_fd,
                 initially_quiesced: true,
                 on_read,
+                post_read: Some(Box::new({
+                    let native_output = native_output.clone();
+                    move |bytes| {
+                        if forward_native_output(&native_output, bytes) {
+                            native_render_notify.notify_one();
+                        }
+                    }
+                })),
                 on_reader_exit: Some(on_reader_exit),
             })?)
         };
@@ -2662,6 +2744,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            native_output,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2732,6 +2815,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let native_output = Arc::new(Mutex::new(None::<mpsc::Sender<Vec<u8>>>));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
         {
@@ -2778,9 +2862,11 @@ impl PaneRuntime {
             let detection_content_seq = detection_content_seq.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
+            let native_output_reader = native_output.clone();
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
+            let native_render_notify = render_notify.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
@@ -2788,10 +2874,17 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
+                let mut result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
+                if native_output_reader
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some()
+                {
+                    result.terminal_responses.clear();
+                }
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
@@ -2836,6 +2929,14 @@ impl PaneRuntime {
                 #[cfg(windows)]
                 master: spawned.master,
                 initially_quiesced: false,
+                post_read: Some(Box::new({
+                    let native_output = native_output.clone();
+                    move |bytes| {
+                        if forward_native_output(&native_output, bytes) {
+                            native_render_notify.notify_one();
+                        }
+                    }
+                })),
                 on_read,
                 on_reader_exit: None,
             })?)
@@ -3275,6 +3376,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            native_output,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -3351,9 +3453,17 @@ impl PaneRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
-        let terminal_responses = self
-            .terminal
-            .resize(rows, cols, cell_width_px, cell_height_px);
+        let mut terminal_responses =
+            self.terminal
+                .resize(rows, cols, cell_width_px, cell_height_px);
+        if self
+            .native_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            terminal_responses.clear();
+        }
         self.content_seq.fetch_add(1, Ordering::Release);
         drop(_content_write_guard);
         self.compression.wake();
@@ -3672,6 +3782,12 @@ impl PaneRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes(bytes)
+    }
+
+    /// Clone only the bounded PTY input sender; no terminal parser is retained
+    /// while a native client waits for queue capacity.
+    pub(crate) fn native_input_handle(&self) -> NativeInputHandle {
+        NativeInputHandle(self.io.clone())
     }
 
     /// Preflight a complete API command without changing input queue semantics.
@@ -4068,6 +4184,7 @@ impl PaneRuntime {
                     sender: tx,
                     resize_tx,
                 },
+                native_output: Arc::new(Mutex::new(None)),
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
@@ -4095,6 +4212,41 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn native_output_subscriber_can_disconnect_while_pty_send_is_backpressured() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender.try_send(b"first".to_vec()).unwrap();
+        let monitor = sender.clone();
+        let subscription = Arc::new(Mutex::new(Some(sender)));
+        let sending = subscription.clone();
+        let reader = std::thread::spawn(move || forward_native_output(&sending, b"second"));
+
+        // The PTY reader has cloned the subscriber before detach races it.
+        while monitor.strong_count() < 3 {
+            std::thread::yield_now();
+        }
+        let clearing = subscription.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let detach = std::thread::spawn(move || {
+            clearing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            done.send(()).unwrap();
+        });
+        let cleared = result.recv_timeout(std::time::Duration::from_secs(1));
+        drop(receiver); // A detached client drops the receiver before PTY writer cleanup.
+        detach.join().unwrap();
+        assert!(
+            !reader.join().unwrap(),
+            "detached receiver cannot accept native output"
+        );
+        assert!(
+            cleared.is_ok(),
+            "detach waited for a full native output channel"
+        );
+    }
 
     #[tokio::test]
     async fn unidentified_text_cache_tracks_runtime_mutations_not_viewport_scroll() {
@@ -4566,6 +4718,37 @@ mod tests {
     #[test]
     fn shutdown_liveness_treats_missing_process_as_gone() {
         assert!(!process_alive_for_shutdown(43, 42, false, |_| false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_reaps_descendant_that_left_the_pane_session() {
+        let mut shell = std::process::Command::new("setsid")
+            .args([
+                "sh",
+                "-c",
+                "setsid sh -c 'printf \"%s\\n\" \"$$\"; exec sleep 30' & wait",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn isolated shell");
+        let mut output = std::io::BufReader::new(shell.stdout.take().expect("shell stdout"));
+        let mut pid = String::new();
+        std::io::BufRead::read_line(&mut output, &mut pid).expect("read detached child PID");
+        let detached_pid = pid.trim().parse::<u32>().expect("parse detached child PID");
+        let child_wait_completed = AtomicBool::new(false);
+
+        shutdown_pane_processes(PaneId::from_raw(0), shell.id(), Some(&child_wait_completed));
+
+        let _ = shell.wait();
+        let detached_child_is_alive = crate::platform::process_exists(detached_pid);
+        if detached_child_is_alive {
+            crate::platform::signal_processes(&[detached_pid], crate::platform::Signal::Kill);
+        }
+        assert!(
+            !detached_child_is_alive,
+            "detached pane descendant must terminate"
+        );
     }
 
     #[cfg(unix)]
@@ -5423,6 +5606,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            native_output: Arc::new(Mutex::new(None)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
@@ -5463,6 +5647,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            native_output: Arc::new(Mutex::new(None)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),

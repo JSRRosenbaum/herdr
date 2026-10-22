@@ -80,7 +80,7 @@ herdr --machine "Build machine" worktree create --cwd /srv/project --branch revi
 
 The selector must match an enabled saved profile ID or a unique, case-sensitive label, not an arbitrary SSH hostname. The saved remote session is used; combining `--machine` with `--session` or `--remote` is an error. Without the prefix, commands retain their existing local session/socket behavior.
 
-Supported commands are `workspace`, `worktree`, `tab`, `pane`, `notification`, `agent` (except `attach` and local `explain --file`), `api snapshot`, `status server`, and API-backed plugin commands (`link`, `unlink`, `enable`, `disable`, `list`, `action`, `log`, `pane`). Server commands support `stop`, `reload-config`, `agent-manifests`, and `reload-agent-manifests`. Local installation/configuration commands, plugin installation, session management, and interactive terminal attachment are not forwarded.
+Supported commands are `workspace`, `worktree`, `tab`, `pane`, `notification`, `agent` (except `attach` and local `explain --file`), `api snapshot`, `status server`, and API-backed plugin commands (`link`, `unlink`, `enable`, `disable`, `list`, `action`, `log`, `pane`). Server commands support `stop`, `reload-config`, `agent-manifests`, and `reload-agent-manifests`. Local installation/configuration commands, plugin installation and session management are not forwarded. Interactive `terminal native-attach` uses a separate native stream bridge with the same saved profile and session.
 
 Requests and responses travel through the JSON API over non-interactive SSH; API payloads are not interpolated into the SSH shell command. No open TUI is required, and the bridge never installs, starts, or restarts a server. Update the local CLI and remote Herdr installation to support machine forwarding, and keep the running remote server's API protocol compatible. Authentication, unavailable machines, and incompatible versions fail without falling back to Local. Requests are not automatically retried after connection failure.
 
@@ -372,13 +372,18 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 
 ```bash
 herdr terminal attach <terminal_id> [--takeover]
+herdr terminal native-attach <terminal_id>
+herdr --machine <profile-id> terminal native-attach <terminal_id>
 herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
 herdr terminal title set <title>
 herdr terminal title clear
 ```
 
-Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
+Detach from ANSI `terminal attach` with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ctrl+b`.
+
+`terminal native-attach` requires this fork's updated Unix client and running server. It forwards raw PTY/TSP bytes after explicit native approval, including through saved SSH profiles to Windows servers. It never substitutes reconstructed ANSI output. All input stays opaque; close its frontend or SIGTERM only the attach client to detach. The application remains alive. See [Native TSP attachment](/docs/persistence-remote/#native-tsp-attachment) for redraw and companion requirements.
+
 `terminal session control` opens a writable live terminal stream for a pane,
 terminal, or agent target. It prints the same newline-delimited
 `terminal.frame` and `terminal.closed` records as observe mode. It reads

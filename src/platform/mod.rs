@@ -199,6 +199,25 @@ pub enum Signal {
     Kill,
 }
 
+/// Combine a pane shell with its original-session and live-descendant processes.
+///
+/// A program may create a new session, which drops it from the original
+/// terminal session while it remains owned by the pane shell.
+pub(crate) fn pane_processes_from_parts(
+    child_pid: u32,
+    session_pids: impl IntoIterator<Item = u32>,
+    descendant_pids: impl IntoIterator<Item = u32>,
+) -> Vec<u32> {
+    let mut pids = std::iter::once(child_pid)
+        .chain(session_pids)
+        .chain(descendant_pids)
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 /// Why a pane runtime ended, before application persistence policy is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildExitReason {
@@ -549,7 +568,8 @@ pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
-    local_stream_peer_description, spawn_server_signal_monitor, ChildPipe, RemoteBridgeWake,
+    local_stream_peer_description, spawn_server_signal_monitor, ChildPipe, RemoteBridgePipeAbort,
+    RemoteBridgeWake,
 };
 
 mod client_state;
@@ -893,6 +913,14 @@ mod tests {
 
         assert!(take_terminal_resize_signal());
         assert!(!take_terminal_resize_signal());
+    }
+
+    #[test]
+    fn pane_processes_include_descendants_outside_the_shell_session() {
+        assert_eq!(
+            pane_processes_from_parts(10, [10, 20], [10, 30, 40]),
+            vec![10, 20, 30, 40]
+        );
     }
 
     #[test]

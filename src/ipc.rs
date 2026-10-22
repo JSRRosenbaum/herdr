@@ -6,9 +6,29 @@ use std::path::Path;
 
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as _;
-
+#[cfg(not(windows))]
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
+#[cfg(windows)]
+pub(crate) type LocalListener = crate::platform::LocalListener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
+#[cfg(windows)]
+const NORMAL_LOCAL_PIPE_BUFFER_SIZE: u32 = 512;
+
+/// Closes a local stream without interprocess's Windows drop-flush behavior.
+///
+/// Retirement and cancellation revoke queued input, so their handles must not enter the
+/// background flush pool. Normal shutdown uses `Write::flush` before this boundary instead.
+pub(crate) fn abort_local_stream(stream: LocalStream) {
+    #[cfg(windows)]
+    {
+        let interprocess::local_socket::Stream::NamedPipe(stream) = stream;
+        let handle: std::os::windows::io::OwnedHandle = stream.into();
+        drop(handle);
+    }
+    #[cfg(not(windows))]
+    drop(stream);
+}
+
 #[cfg(unix)]
 type PrivateLocalListener = LocalListener;
 #[cfg(windows)]
@@ -110,16 +130,12 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
 
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
-        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
-
-        let name = path.to_string_lossy().to_string();
-        let name = name.to_ns_name::<GenericNamespaced>()?;
-        let listener = ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .security_descriptor(crate::platform::local_server_security_descriptor()?)
-            .create_sync()?;
+        let security_descriptor = crate::platform::local_server_security_descriptor()?;
+        let listener = crate::platform::create_local_listener(
+            path,
+            Some(security_descriptor),
+            NORMAL_LOCAL_PIPE_BUFFER_SIZE,
+        )?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
     }
@@ -267,7 +283,12 @@ fn probe_stream_closed(stream: &mut LocalStream) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn windows_named_pipe_available(stream: &mut LocalStream) -> io::Result<Option<u32>> {
+pub(crate) fn client_stream_disconnected(stream: &LocalStream) -> io::Result<bool> {
+    Ok(windows_named_pipe_available(stream)?.is_none())
+}
+
+#[cfg(windows)]
+fn windows_named_pipe_available(stream: &LocalStream) -> io::Result<Option<u32>> {
     use std::os::windows::io::{AsHandle, AsRawHandle};
 
     let LocalStream::NamedPipe(pipe) = stream;
@@ -373,8 +394,6 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(windows)]
-    use interprocess::local_socket::traits::Listener as _;
     #[cfg(windows)]
     use std::path::PathBuf;
 

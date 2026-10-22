@@ -1,6 +1,22 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Shared bridge-cancellation boundary for platforms without native pipe
+/// retirement.
+pub(crate) struct RemoteBridgePipeAbort;
+
+impl RemoteBridgePipeAbort {
+    pub(crate) fn new(_stream: &crate::ipc::LocalStream) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn abort(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn complete(self) {}
+}
+
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 #[cfg(unix)]
@@ -222,9 +238,9 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// Unsupported platform stub.
-pub fn session_processes(_child_pid: u32) -> Vec<u32> {
-    Vec::new()
+/// Unsupported platform fallback: terminate the pane shell itself.
+pub fn pane_processes(child_pid: u32) -> Vec<u32> {
+    (child_pid > 0).then_some(child_pid).into_iter().collect()
 }
 
 /// Unsupported platform stub.

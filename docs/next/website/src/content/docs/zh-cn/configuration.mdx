@@ -104,7 +104,7 @@ directory = "~/.herdr/worktrees"
 
 Herdr 会在 `<directory>/<repo>/<branch-slug>` 下创建检出。若要使用同级目录风格的检出，请将其设置为 `~/Projects/herdr-worktrees` 这样的目录。应用配置时，相对路径会解析为绝对路径。
 
-Git 工作区行提供 worktree 操作。`New worktree` 会创建检出：如果输入的分支已存在，则检出该本地分支，否则创建该分支；随后将其作为新的 Herdr 工作区打开，并归组到来源工作区下。`Open worktree...` 会列出该仓库现有的 Git worktree 检出；选择已打开的检出会聚焦它，选择尚未打开的检出会在同一组中打开它。
+Git 工作区行提供 worktree 操作。`New worktree` 可以从仓库 worktree 组中的任意工作区开始，包括关联的子项；Herdr 会在创建检出前将来源解析到父仓库。如果输入的分支已存在，则检出该本地分支，否则创建该分支。随后将其作为新的 Herdr 工作区打开，归组到父工作区下，并聚焦新工作区。`Open worktree...` 仍只能从父工作区使用：它会列出该仓库现有的 Git worktree 检出，因此请从仓库的父工作区启动。选择已打开的检出会聚焦它，选择尚未打开的检出会在同一组中打开它。
 
 归组的 worktree 仍像普通 Herdr 工作区一样工作：可以聚焦、重命名和关闭，也可以拥有自己的标签页和窗格。父行是原始工作区。关闭父行会关闭整个 Herdr 组，但不会删除检出目录或分支。
 
@@ -399,6 +399,36 @@ Space 行支持以下内置 token：
 
 token 会按配置顺序渲染。Herdr 通常使用 ` · ` 分隔相邻值，并在 `state_icon` 后使用一个空格。缺失值及其分隔符会消失；当一行中的所有 token 都没有值时，该行会消失。已有的自定义行不会改变；如果希望在自定义的多机器布局中显示机器标识，请显式添加 `machine`。每个布局最多可包含 16 行，每行最多可包含 16 个 token。
 
+### 工作树布局
+
+展开的侧边栏默认使用两行 `tree` 布局：父工作区不缩进，子工作区使用较深的 `   ├─`/`   └─` 连接符。设置 `worktree_layout = "compact"` 可压缩显示：
+
+```toml
+[ui.sidebar.spaces]
+worktree_layout = "compact"
+```
+
+紧凑模式将子工作区连接符缩短为 `├─`/`└─`；未显式设置 `rows` 时，Space 行会合并为一行（`state_icon`、`workspace`、`branch`、`git_status`），工作区与分支之间使用 ` - ` 而不是 ` · `。显式 `rows` 始终优先，并保留 ` · ` 分隔符。默认 `worktree_layout = "tree"` 与原版布局完全一致。未知值会在加载时被拒绝，错误信息会列出可接受值；修改通过常规的 `reload config` 操作生效。
+
+紧凑模式下，`worktree_group_separator` 默认为 `"none"`：折叠的工作树组与下一个 Space 紧邻，不增加空行或分隔线。设置 `"collapsed"` 会在折叠组的最后一个可见 Space 后添加弱化的分隔线（包括仍可见的已聚焦子工作区）；`"always"` 则在每个组后添加：
+
+```toml
+[ui.sidebar.spaces]
+worktree_layout = "compact"
+worktree_group_separator = "none" # 也可为 "collapsed" 或 "always"
+```
+
+此策略在 `tree` 布局中不起作用。最后一个 Space 后以及机器边界之间不会添加组分隔线。`row_gap` 独立控制普通空行：设置它不会绘制分隔线，配置的组分隔线会在空行之外再占一行。
+
+设置 `show_workspace_ids = true` 可在每个 Space 行的组折叠按钮后，右对齐显示稳定的工作区 ID（例如 `wAB`）：
+
+```toml
+[ui.sidebar.spaces]
+show_workspace_ids = true
+```
+
+默认值为 `show_workspace_ids = false`；关闭时，侧栏布局与点击区域和原版完全一致。标识使用固定宽度列，其宽度取当前视图中最长工作区 ID 的长度，使各工作区的行保持对齐。
+
 也可以用内联样式表定义 token：
 
 ```toml
@@ -552,9 +582,12 @@ kitty_graphics = false
 [session]
 resume_agents_on_restore = true
 startup_per_agent_delay_ms = 100
+resume_max_age_hours = 0
 ```
 
 为减少启动时的资源争用，自动恢复默认每隔 100 毫秒启动一个智能体。第一个满足条件的智能体会立即启动。设置 `startup_per_agent_delay_ms = 0` 可禁用间隔。手动启动和显式连接终端不受影响。修改后需重启 Herdr 服务器。
+
+文件型会话按修改时间从新到旧恢复。`resume_max_age_hours = 0` 保持原有的不限制时间策略；正数只自动恢复存在且在该小时数内修改的文件。过期、缺失、修改时间在未来的文件以及仅有 ID 的引用不会在此策略下启动。明确报告的恢复命令和保留进程的实时交接不受影响。
 
 只有通过官方集成获得有效原生会话引用的窗格才能恢复；其他窗格会作为普通 shell 恢复。有关受支持的智能体和持久化行为，请参阅[会话状态与恢复](/docs/session-state/)。
 

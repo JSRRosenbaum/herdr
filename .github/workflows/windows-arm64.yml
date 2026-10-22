@@ -8,7 +8,7 @@ on:
       - "scripts/windows_arm64_installer_test.ps1"
       - "distribution/install.ps1"
   push:
-    branches: [master]
+    branches: [master, integration/native-main-20261016]
     paths:
       - ".github/workflows/windows-arm64.yml"
       - "scripts/windows_arm64_installer_test.ps1"

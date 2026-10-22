@@ -34,6 +34,35 @@ fn navigation_state(mut projected: ClientShellSnapshot) -> (ClientShellState, Cl
     (state, remote)
 }
 
+fn herded_navigation_state() -> (ClientShellState, ClientEndpointId, ClientEndpointId) {
+    let (mut state, hidden) = state_with_remote();
+    let mut visible_profile = remote_profile();
+    visible_profile.id = ProfileId::parse("1123456789abcdef0123456789abcdef").unwrap();
+    visible_profile.label = "Ash".into();
+    let visible = ClientEndpointId::Ssh(visible_profile.id.clone());
+    state.set_endpoint_catalog(&[remote_profile(), visible_profile]);
+    state.set_endpoint_status(&visible, ClientEndpointStatus::Online);
+
+    let mut local = workspaces(2);
+    local.focused_workspace_id = Some("ws_2".into());
+    local.workspaces[0].focused = false;
+    local.workspaces[1].focused = true;
+    state.set_snapshot(Box::new(local));
+
+    let mut hidden_snapshot = workspaces(2);
+    hidden_snapshot.boot_id = "hidden-boot".into();
+    state.set_endpoint_snapshot(&hidden, Box::new(hidden_snapshot));
+    let mut visible_snapshot = workspaces(1);
+    visible_snapshot.boot_id = "visible-boot".into();
+    visible_snapshot.workspaces[0].workspace_id = "ash_ws".into();
+    state.set_endpoint_snapshot(&visible, Box::new(visible_snapshot));
+
+    state.add_herd(&mut ClientShellInput::default());
+    state.select_herd(0, &mut ClientShellInput::default());
+    state.move_machine_to_herd(&hidden, 1, &mut ClientShellInput::default());
+    (state, hidden, visible)
+}
+
 fn preview_key(state: &mut ClientShellState, bytes: &[u8]) {
     let outcome = state.handle_input_bytes(bytes);
     assert!(outcome.actions.is_empty(), "{bytes:?}");
@@ -224,6 +253,104 @@ fn navigation_highlights_only_the_preview_and_activates_on_enter() {
             assert!(state.navigate_workspace_id.is_none());
         }
     }
+}
+
+#[test]
+fn relative_workspace_actions_skip_other_herds_and_wrap_within_the_selected_herd() {
+    use crate::input::{KeybindAction, KeybindMatch};
+
+    let (mut state, hidden, visible) = herded_navigation_state();
+    let mut next = ClientShellInput::default();
+    state.record_binding(
+        KeybindMatch::Action(KeybindAction::NextWorkspace),
+        &mut next,
+    );
+    assert!(matches!(
+        next.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
+        }] if endpoint_id == &visible && workspace_id == "ash_ws"
+    ));
+    assert_eq!(state.selected_herd, 0);
+    assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+
+    state.set_snapshot(Box::new(workspaces(2)));
+    let mut previous = ClientShellInput::default();
+    state.record_binding(
+        KeybindMatch::Action(KeybindAction::PreviousWorkspace),
+        &mut previous,
+    );
+    assert!(matches!(
+        previous.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
+        }] if endpoint_id == &visible && workspace_id == "ash_ws"
+    ));
+    assert_eq!(state.selected_herd, 0);
+
+    state.select_herd(1, &mut ClientShellInput::default());
+    state.set_endpoint_status(&hidden, ClientEndpointStatus::Reconnecting);
+    let mut unavailable = ClientShellInput::default();
+    state.record_binding(
+        KeybindMatch::Action(KeybindAction::NextWorkspace),
+        &mut unavailable,
+    );
+    assert!(unavailable.actions.is_empty());
+    assert_eq!(state.selected_herd, 1);
+
+    state.set_endpoint_status(&hidden, ClientEndpointStatus::Online);
+    assert!(state.activate_endpoint_projection(&hidden));
+    let mut within = ClientShellInput::default();
+    state.record_binding(
+        KeybindMatch::Action(KeybindAction::NextWorkspace),
+        &mut within,
+    );
+    assert!(matches!(
+        within.actions.as_slice(),
+        [ClientShellAction::Endpoint { endpoint_id, request, .. }]
+            if endpoint_id == &hidden
+                && matches!(&request.method, crate::api::schema::Method::WorkspaceFocus(target)
+                    if target.workspace_id == "ws_2")
+    ));
+}
+
+#[test]
+fn workspace_preview_skips_other_herds_without_switching_pages() {
+    let (mut state, hidden, visible) = herded_navigation_state();
+    state.compose(100, 28).unwrap();
+    enter_navigation(&mut state);
+    assert_selected(&state, &ClientEndpointId::Local, "ws_2");
+
+    preview_key(&mut state, b"\x1b[B");
+    assert_selected(&state, &visible, "ash_ws");
+    assert_eq!(state.selected_herd, 0);
+    state.compose(100, 28).unwrap();
+    workspace_rect(&state, &visible, "ash_ws");
+    preview_key(&mut state, b"\x1b[B");
+    assert_selected(&state, &ClientEndpointId::Local, "ws_1");
+    preview_key(&mut state, b"\x1b[A");
+    assert_selected(&state, &visible, "ash_ws");
+
+    let enter = state.handle_input_bytes(b"\r");
+    assert!(matches!(
+        enter.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
+        }] if endpoint_id == &visible && workspace_id == "ash_ws"
+    ));
+    assert_eq!(state.selected_herd, 0);
+
+    state.select_herd(1, &mut ClientShellInput::default());
+    assert!(state.activate_endpoint_projection(&hidden));
+    enter_navigation(&mut state);
+    assert_selected(&state, &hidden, "ws_1");
+    preview_key(&mut state, b"\x1b[B");
+    assert_selected(&state, &hidden, "ws_2");
+    preview_key(&mut state, b"\x1b[B");
+    assert_selected(&state, &hidden, "ws_1");
 }
 
 #[test]

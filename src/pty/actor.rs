@@ -1,3 +1,38 @@
+use std::sync::{Arc, Mutex};
+
+/// An attachment-local admission lease. Revocation is serialized with the
+/// final bounded-queue enqueue, including when admission already has capacity.
+#[derive(Clone)]
+pub(crate) struct NativeInputLease(Arc<Mutex<bool>>);
+
+impl NativeInputLease {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(true)))
+    }
+
+    pub(crate) fn revoke(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    }
+
+    pub(crate) fn admit(&self, enqueue: impl FnOnce()) -> std::io::Result<()> {
+        let active = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*active {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "native terminal attachment revoked",
+            ));
+        }
+        enqueue();
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -6,6 +41,7 @@ pub(crate) use unix::*;
 
 #[cfg(windows)]
 mod windows {
+    use super::NativeInputLease;
     use std::io::{Read, Write};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -20,6 +56,7 @@ mod windows {
     }
 
     type ReadCallback = Box<dyn FnMut(&[u8]) -> PtyReadResult + Send + 'static>;
+    type PostReadCallback = Box<dyn FnMut(&[u8]) + Send + 'static>;
     type ReaderExitCallback = Box<dyn FnOnce() + Send + 'static>;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +77,8 @@ mod windows {
         pub master: Box<dyn MasterPty + Send>,
         pub initially_quiesced: bool,
         pub on_read: ReadCallback,
+        /// Runs after terminal replies are ordered, without holding response_order.
+        pub post_read: Option<PostReadCallback>,
         pub on_reader_exit: Option<ReaderExitCallback>,
     }
 
@@ -112,6 +151,31 @@ mod windows {
                         mpsc::error::TrySendError::Closed(bytes)
                     }
                 })
+        }
+
+        /// Await bounded capacity without claiming success for a revoked
+        /// attachment, even if a queue slot became available first.
+        pub(crate) async fn send_user_input(
+            &self,
+            bytes: Bytes,
+            lease: &NativeInputLease,
+        ) -> std::io::Result<()> {
+            let permit = self.data_tx.reserve().await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty actor closed")
+            })?;
+            let gate = self
+                .accepting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !gate.accepting {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pty actor not accepting input",
+                ));
+            }
+            lease.admit(|| {
+                permit.send(PtyIoDataCommand::WriteUserInput(bytes));
+            })
         }
 
         pub(crate) fn queue_user_input_submission(
@@ -208,6 +272,7 @@ mod windows {
                 master,
                 initially_quiesced,
                 mut on_read,
+                mut post_read,
                 on_reader_exit,
             } = config;
 
@@ -249,14 +314,19 @@ mod windows {
                         match reader.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                let _order = response_order
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let result = on_read(&buf[..n]);
-                                if result.terminal_responses.into_iter().any(|response| {
-                                    write_tx.send(PtyIoWriteCommand::Write(response)).is_err()
-                                }) {
-                                    break;
+                                {
+                                    let _order = response_order
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    let result = on_read(&buf[..n]);
+                                    if result.terminal_responses.into_iter().any(|response| {
+                                        write_tx.send(PtyIoWriteCommand::Write(response)).is_err()
+                                    }) {
+                                        break;
+                                    }
+                                }
+                                if let Some(post_read) = &mut post_read {
+                                    post_read(&buf[..n]);
                                 }
                             }
                             Err(err) => {

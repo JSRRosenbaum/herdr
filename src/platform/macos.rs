@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -15,12 +16,12 @@ use super::{
 };
 
 pub(crate) use super::unix_common::{
-    configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
-    create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
-    remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, set_default_plugin_pane_pwd, shutdown_client_stream,
-    status_commands_supported, wait_client_stream_readable, write_client_stream,
-    ClientStreamReader, PinnedSshControlSocket, StatusCommandGuard,
+    client_stream_disconnected, configure_status_command, create_remote_private_dir,
+    create_remote_ssh_config_dir, create_remote_ssh_config_file, hostname, local_datetime,
+    remote_bridge_endpoint_path, remote_private_temp_base, remote_reattach_argument,
+    remote_reattach_program, remote_ssh_config_paths, set_default_plugin_pane_pwd,
+    shutdown_client_stream, status_commands_supported, wait_client_stream_readable,
+    write_client_stream, ClientStreamReader, PinnedSshControlSocket, StatusCommandGuard,
 };
 
 mod bootstrap;
@@ -1123,20 +1124,48 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(&vip_path[..nul])))
 }
 
-pub fn session_processes(child_pid: u32) -> Vec<u32> {
+pub fn pane_processes(child_pid: u32) -> Vec<u32> {
     if child_pid == 0 {
         return Vec::new();
     }
 
-    let target_session = unsafe { libc::getsid(child_pid as libc::c_int) };
-    if target_session <= 0 {
-        return Vec::new();
+    let session_id = unsafe { libc::getsid(child_pid as libc::c_int) };
+    let session_pids = if session_id > 0 {
+        all_pids()
+            .into_iter()
+            .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == session_id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    super::pane_processes_from_parts(child_pid, session_pids, descendant_processes(child_pid))
+}
+
+fn descendant_processes(root_pid: u32) -> Vec<u32> {
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for pid in all_pids() {
+        if let Some(info) = process_bsdinfo(pid) {
+            children_by_parent
+                .entry(info.pbi_ppid)
+                .or_default()
+                .push(pid);
+        }
     }
 
-    all_pids()
-        .into_iter()
-        .filter(|pid| unsafe { libc::getsid(*pid as libc::pid_t) } == target_session)
-        .collect()
+    let mut descendants = Vec::new();
+    let mut pending = VecDeque::from([root_pid]);
+    let mut visited = HashSet::from([root_pid]);
+    while let Some(pid) = pending.pop_front() {
+        if pid != root_pid {
+            descendants.push(pid);
+        }
+        for child_pid in children_by_parent.remove(&pid).into_iter().flatten() {
+            if child_pid > 0 && visited.insert(child_pid) {
+                pending.push_back(child_pid);
+            }
+        }
+    }
+    descendants
 }
 
 fn all_pids() -> Vec<u32> {

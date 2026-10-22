@@ -20,7 +20,7 @@ on:
       - "src/detect/manifest_update.rs"
       - "src/detect/manifests/**"
   push:
-    branches: [master]
+    branches: [master, integration/native-main-20261016]
     paths:
       - ".github/workflows/distribution.yml"
       - "distribution/**"
@@ -56,6 +56,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Fetch upstream documentation tags in forks
+        if: github.repository != 'herdrdev/herdr'
+        run: git fetch --no-tags https://github.com/herdrdev/herdr.git 'refs/tags/v*:refs/tags/v*'
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2

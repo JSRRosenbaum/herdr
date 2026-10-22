@@ -157,6 +157,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # remove_worktree = ""  # optional, unset by default; opens confirmation
 # rename_workspace = "prefix+shift+w"
 # close_workspace = "prefix+shift+d"
+# previous_herd = "prefix+," # show previous sidebar herd without switching panes
+# next_herd = "prefix+."     # show next sidebar herd without switching panes
 # previous_workspace = "" # optional, unset by default
 # next_workspace = ""     # optional, unset by default
 # previous_agent = ""     # optional, unset by default
@@ -400,6 +402,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
+# Optional age limit for file-backed automatic resumes; 0 leaves resumes unrestricted.
+# resume_max_age_hours = 0
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

@@ -5,11 +5,19 @@ pub(super) fn render_collapsed(
     buffer: &mut Buffer,
     area: Rect,
     endpoints: &[ClientShellEndpoint],
+    machine_herds: &HashMap<ClientEndpointId, u16>,
+    selected_herd: u16,
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
     hits: &mut ShellHitMap,
 ) {
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let rows = agent_rows(
+        endpoints,
+        active_endpoint_id,
+        config,
+        machine_herds,
+        selected_herd,
+    );
     for (index, row) in rows.into_iter().take(area.height as usize).enumerate() {
         let rect = Rect::new(area.x, area.y + index as u16, area.width, 1);
         if row.agent.focused {
@@ -48,6 +56,8 @@ pub(super) fn render_expanded(
     agent_view_label: Option<&str>,
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
+    machine_herds: &HashMap<ClientEndpointId, u16>,
+    selected_herd: u16,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
@@ -61,7 +71,13 @@ pub(super) fn render_expanded(
     ) {
         return;
     }
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let rows = agent_rows(
+        endpoints,
+        active_endpoint_id,
+        config,
+        machine_herds,
+        selected_herd,
+    );
     super::agent_sidebar::render_agent_list(
         buffer,
         area,
@@ -97,7 +113,13 @@ impl ClientShellState {
         if body_height == 0 {
             return;
         }
-        let rows = agent_rows(&self.endpoints, &self.active_endpoint_id, &self.config);
+        let rows = agent_rows(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            &self.config,
+            &self.machine_herds,
+            self.selected_herd,
+        );
         let Some(target) = rows
             .iter()
             .position(|row| &row.endpoint_id == endpoint_id && row.agent.pane_id == pane_id)
@@ -133,9 +155,18 @@ fn agent_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    machine_herds: &HashMap<ClientEndpointId, u16>,
+    selected_herd: u16,
 ) -> Vec<EndpointAgentRow> {
     let mut rendered_rows = endpoints
         .iter()
+        .filter(|endpoint| {
+            machine_herds
+                .get(&endpoint.endpoint_id)
+                .copied()
+                .unwrap_or(0)
+                == selected_herd
+        })
         .filter_map(|endpoint| {
             endpoint.snapshot.as_deref().map(|snapshot| {
                 snapshot
@@ -162,6 +193,13 @@ fn agent_rows(
         config.agent_panel_sort,
     )
     .into_iter()
+    .filter(|row| {
+        machine_herds
+            .get(row.endpoint.endpoint_id)
+            .copied()
+            .unwrap_or(0)
+            == selected_herd
+    })
     .filter_map(|row| {
         let key = (row.endpoint.endpoint_id.clone(), row.agent.pane_id.clone());
         let mut agent = rendered_rows.remove(&key)?;

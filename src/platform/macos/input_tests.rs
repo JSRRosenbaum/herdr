@@ -120,6 +120,7 @@ async fn canonical_api_rejection_writes_nothing_and_allows_same_name_retry() {
             master_fd: master,
             initially_quiesced: false,
             on_read: Box::new(|_| PtyReadResult::empty()),
+            post_read: None,
             on_reader_exit: None,
         })
         .unwrap();
@@ -208,6 +209,7 @@ async fn input_admission_does_not_wait_for_actor_and_raw_input_stays_intact() {
             }
             PtyReadResult::empty()
         }),
+        post_read: None,
         on_reader_exit: None,
     })
     .unwrap();
@@ -272,6 +274,7 @@ fn canonical_multiline_submission_preserves_each_line() {
             master_fd: master,
             initially_quiesced: false,
             on_read: Box::new(|_| PtyReadResult::empty()),
+            post_read: None,
             on_reader_exit: None,
         })
         .unwrap();

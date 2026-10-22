@@ -47,60 +47,67 @@ pub(super) fn server_reader_thread(
             endpoint_id,
             generation,
         });
+        crate::ipc::abort_local_stream(stream);
         return;
     }
 
-    let mut stream = EndpointReader {
-        stream: &mut stream,
-        stopped: should_quit,
-        deadline: None,
-    };
-    loop {
-        if should_quit.load(Ordering::Acquire) {
-            break;
-        }
-
-        let message = protocol::read_message(&mut stream, max_frame_size).and_then(|message| {
-            match &mut surface_decoder {
-                Some(decoder) => decoder.decode(message).map_err(|error| {
-                    protocol::FramingError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
-                }),
-                None => Ok(message),
+    {
+        let mut stream = EndpointReader {
+            stream: &mut stream,
+            stopped: should_quit,
+            deadline: None,
+        };
+        loop {
+            if should_quit.load(Ordering::Acquire) {
+                break;
             }
-        });
-        match message {
-            Ok(msg) => {
-                if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage {
+
+            let message = protocol::read_message(&mut stream, max_frame_size).and_then(|message| {
+                match &mut surface_decoder {
+                    Some(decoder) => decoder.decode(message).map_err(|error| {
+                        protocol::FramingError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            error,
+                        ))
+                    }),
+                    None => Ok(message),
+                }
+            });
+            match message {
+                Ok(msg) => {
+                    if event_tx
+                        .blocking_send(ClientLoopEvent::ServerMessage {
+                            endpoint_id: endpoint_id.clone(),
+                            generation,
+                            message: Box::new(msg),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(protocol::FramingError::UnexpectedEof) => {
+                    let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
                         endpoint_id: endpoint_id.clone(),
                         generation,
-                        message: Box::new(msg),
-                    })
-                    .is_err()
-                {
+                    });
+                    break;
+                }
+                Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => {
+                    warn!(err = %err, "server read error");
+                    let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
+                        endpoint_id: endpoint_id.clone(),
+                        generation,
+                    });
                     break;
                 }
             }
-            Err(protocol::FramingError::UnexpectedEof) => {
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
-                    endpoint_id: endpoint_id.clone(),
-                    generation,
-                });
-                break;
-            }
-            Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(err) => {
-                warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
-                    endpoint_id: endpoint_id.clone(),
-                    generation,
-                });
-                break;
-            }
         }
     }
+    crate::ipc::abort_local_stream(stream);
 }
 
 pub(super) struct EndpointReader<'a> {

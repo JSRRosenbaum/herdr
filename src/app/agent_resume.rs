@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use ratatui::layout::Rect;
@@ -10,6 +10,7 @@ struct PendingAgentResumeCandidate {
     terminal_id: crate::terminal::TerminalId,
     cwd: std::path::PathBuf,
     plan: crate::agent_resume::AgentResumePlan,
+    last_update: SystemTime,
     rows: u16,
     cols: u16,
 }
@@ -63,6 +64,7 @@ impl App {
             plan,
             rows,
             cols,
+            ..
         } in pending
         {
             if self.terminal_runtimes.get(&terminal_id).is_some() {
@@ -125,17 +127,29 @@ impl App {
                     let Some(plan) = terminal.pending_agent_resume_plan.clone() else {
                         continue;
                     };
+                    let last_update = terminal
+                        .persisted_agent_session
+                        .as_ref()
+                        .filter(|session| {
+                            session.session_ref.kind
+                                == crate::agent_resume::AgentSessionRefKind::Path
+                        })
+                        .and_then(|session| std::fs::metadata(&session.session_ref.value).ok())
+                        .and_then(|metadata| metadata.modified().ok())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
                     pending.push(PendingAgentResumeCandidate {
                         pane_id: info.id,
                         terminal_id: pane.attached_terminal_id.clone(),
                         cwd: terminal.cwd.clone(),
                         plan,
+                        last_update,
                         rows: info.inner_rect.height,
                         cols: info.inner_rect.width,
                     });
                 }
             }
         }
+        pending.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_update));
         pending
     }
 
@@ -394,6 +408,63 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_agent_resumes_prioritize_latest_session_file() {
+        let mut app = test_app();
+        let older_workspace = crate::workspace::Workspace::test_new("older");
+        let older_id = older_workspace
+            .terminal_id(older_workspace.tabs[0].root_pane)
+            .unwrap()
+            .clone();
+        let newer_workspace = crate::workspace::Workspace::test_new("newer");
+        let newer_id = newer_workspace
+            .terminal_id(newer_workspace.tabs[0].root_pane)
+            .unwrap()
+            .clone();
+        app.state.workspaces = vec![older_workspace, newer_workspace];
+        app.state.active = Some(0);
+        app.state.view.terminal_area = Rect::new(0, 0, 100, 30);
+        app.state.ensure_test_terminals();
+
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-resume-order-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for (id, name, modified) in [
+            (&older_id, "older.jsonl", SystemTime::UNIX_EPOCH),
+            (&newer_id, "newer.jsonl", SystemTime::now()),
+        ] {
+            let path = directory.join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let terminal = app.state.terminals.get_mut(id).unwrap();
+            terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(path.display().to_string())
+                    .unwrap(),
+            });
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "pi".into(),
+                argv: vec!["pi".into()],
+                dedupe_key: name.into(),
+            });
+        }
+
+        let pending = app.pending_agent_resume_candidates();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].terminal_id, newer_id);
+        assert_eq!(pending[1].terminal_id, older_id);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

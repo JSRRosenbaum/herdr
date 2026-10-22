@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
 use tracing::{debug, warn};
 
+use super::NativeInputLease;
 use crate::pty::fd;
 
 // Actor handle methods must call wake_actor() after queuing work. The idle
@@ -40,6 +41,7 @@ impl PtyReadResult {
 }
 
 type ReadCallback = Box<dyn FnMut(&[u8]) -> PtyReadResult + Send + 'static>;
+type PostReadCallback = Box<dyn FnMut(&[u8]) + Send + 'static>;
 type ReaderExitCallback = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,8 @@ pub(crate) struct PtyIoActorConfig {
     pub master_fd: OwnedFd,
     pub initially_quiesced: bool,
     pub on_read: ReadCallback,
+    /// Runs after terminal replies are ordered, without holding response_order.
+    pub post_read: Option<PostReadCallback>,
     pub on_reader_exit: Option<ReaderExitCallback>,
 }
 
@@ -143,6 +147,45 @@ impl PtyIoActorHandle {
                 Err(mpsc::error::TrySendError::Closed(bytes))
             }
         }
+    }
+
+    /// Await bounded input capacity off the server loop. Admission checks the
+    /// per-attachment lease under its revocation lock at the final enqueue.
+    pub(crate) async fn send_user_input(
+        &self,
+        bytes: Bytes,
+        lease: &NativeInputLease,
+    ) -> std::io::Result<()> {
+        self.send_user_input_after_reserve(bytes, lease, || {})
+            .await
+    }
+
+    async fn send_user_input_after_reserve(
+        &self,
+        bytes: Bytes,
+        lease: &NativeInputLease,
+        after_reserve: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        let permit =
+            self.data_tx.reserve().await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty actor closed")
+            })?;
+        after_reserve();
+        let gate = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !gate.accepting {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty actor not accepting input",
+            ));
+        }
+        lease.admit(|| {
+            permit.send(PtyIoDataCommand::WriteUserInput(bytes));
+        })?;
+        self.wake_actor();
+        Ok(())
     }
 
     pub(crate) fn queue_user_input_submission(
@@ -427,6 +470,7 @@ impl PtyIoActor {
             controls,
             response_order,
             on_read: config.on_read,
+            post_read: config.post_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
         };
@@ -461,6 +505,7 @@ struct PtyIoActorRunner {
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
     on_read: ReadCallback,
+    post_read: Option<PostReadCallback>,
     on_reader_exit: Option<ReaderExitCallback>,
     poll_observer: Option<std_mpsc::Sender<()>>,
 }
@@ -831,17 +876,21 @@ impl PtyIoActorRunner {
                 false
             }
             Ok(n) => {
-                let response_order = Arc::clone(&self.response_order);
-                let _order = response_order
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
-                self.controls
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .terminal_responses
-                    .extend(result.terminal_responses);
-                drop(_order);
+                {
+                    let _order = self
+                        .response_order
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let result = (self.on_read)(&buf[..n]);
+                    self.controls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .terminal_responses
+                        .extend(result.terminal_responses);
+                }
+                if let Some(post_read) = &mut self.post_read {
+                    post_read(&buf[..n]);
+                }
                 let terminal_responses = std::mem::take(
                     &mut self
                         .controls
@@ -1044,6 +1093,7 @@ fn input_submission_closed_error() -> std::io::Error {
 mod tests {
     use super::*;
     use std::{
+        future::Future,
         io::{Read, Write},
         os::fd::{AsRawFd, FromRawFd, IntoRawFd},
         os::unix::net::UnixStream,
@@ -1083,6 +1133,7 @@ mod tests {
                     .expect("read callback receiver alive");
                 PtyReadResult::empty()
             }),
+            post_read: None,
             on_reader_exit: None,
         };
         let handle = if let Some(poll_observer) = poll_observer {
@@ -1117,6 +1168,7 @@ mod tests {
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
             on_read: Box::new(|_| PtyReadResult::empty()),
+            post_read: None,
             on_reader_exit: None,
             poll_observer: None,
         };
@@ -1331,6 +1383,7 @@ mod tests {
             master_fd: owned,
             initially_quiesced: false,
             on_read: Box::new(|_| PtyReadResult::empty()),
+            post_read: None,
             on_reader_exit: Some(Box::new({
                 let handle_slot = Arc::clone(&handle_slot);
                 move || {
@@ -1428,6 +1481,7 @@ mod tests {
                     .expect("read callback receiver alive");
                 PtyReadResult::empty()
             }),
+            post_read: None,
             on_reader_exit: None,
         })
         .expect("actor spawn");
@@ -1685,6 +1739,194 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_input_admission_waits_for_actor_capacity_and_respects_handoff_gate() {
+        let (runner, _peer) = actor_runner_for_unit_test();
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        assert!(data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                b"first"
+            )))
+            .is_ok());
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read) = test_wake_pair();
+        let gate = Arc::new(Mutex::new(UserWriteGate { accepting: true }));
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::clone(&gate),
+            controls: Arc::clone(&runner.controls),
+            response_order: Arc::clone(&runner.response_order),
+            input_guard: crate::platform::PtyInputGuard::new(&runner.file),
+        };
+        let lease = NativeInputLease::new();
+        let mut pending = Box::pin(handle.send_user_input(Bytes::from_static(b"second"), &lease));
+        assert!(
+            std::future::poll_fn(|cx| {
+                let pending = pending.as_mut().poll(cx);
+                std::task::Poll::Ready(pending.is_pending())
+            })
+            .await
+        );
+        let PtyIoDataCommand::WriteUserInput(first) = data_rx.recv().await.expect("queued") else {
+            panic!("expected first input");
+        };
+        assert_eq!(first, Bytes::from_static(b"first"));
+        pending.await.expect("capacity available");
+        let PtyIoDataCommand::WriteUserInput(second) = data_rx.recv().await.expect("queued") else {
+            panic!("expected second input");
+        };
+        assert_eq!(second, Bytes::from_static(b"second"));
+
+        assert!(matches!(
+            data_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        handle
+            .try_write_user_input(Bytes::from_static(b"fill"))
+            .expect("fill queue");
+        let mut cancelled =
+            Box::pin(handle.send_user_input(Bytes::from_static(b"not-admitted"), &lease));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                cancelled.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        gate.lock().expect("handoff gate").accepting = false;
+        let _ = data_rx.recv().await.expect("free capacity");
+        assert_eq!(
+            cancelled
+                .await
+                .expect_err("handoff rejects queued native input")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(matches!(
+            data_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_attachment_revoked_after_capacity_reservation_cannot_enqueue() {
+        let (runner, _peer) = actor_runner_for_unit_test();
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::clone(&runner.controls),
+            response_order: Arc::clone(&runner.response_order),
+            input_guard: crate::platform::PtyInputGuard::new(&runner.file),
+        };
+        let old_lease = NativeInputLease::new();
+        let (reserved_tx, reserved_rx) = std_mpsc::channel();
+        let (continue_tx, continue_rx) = std_mpsc::channel();
+        let old_handle = handle.clone();
+        let old_task = {
+            let old_lease = old_lease.clone();
+            tokio::spawn(async move {
+                old_handle
+                    .send_user_input_after_reserve(
+                        Bytes::from_static(b"old owner"),
+                        &old_lease,
+                        move || {
+                            reserved_tx.send(()).expect("reserved signal");
+                            continue_rx.recv().expect("resume admission");
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reserved_rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("reservation observer")
+            .expect("capacity acquired before revocation");
+        old_lease.revoke();
+        continue_tx.send(()).expect("resume old admission");
+        assert_eq!(
+            old_task
+                .await
+                .expect("old task")
+                .expect_err("revoked lease")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let new_lease = NativeInputLease::new();
+        handle
+            .send_user_input(Bytes::from_static(b"new owner"), &new_lease)
+            .await
+            .expect("new owner admitted");
+        let PtyIoDataCommand::WriteUserInput(bytes) = data_rx.recv().await.expect("queued") else {
+            panic!("expected only new owner's input");
+        };
+        assert_eq!(bytes, Bytes::from_static(b"new owner"));
+        assert!(matches!(
+            data_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn full_native_output_queue_does_not_hold_terminal_response_order() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        output_tx.try_send(vec![b'1']).expect("fill native output");
+        let (blocked_tx, blocked_rx) = std_mpsc::channel();
+        runner.post_read = Some(Box::new(move |bytes| {
+            blocked_tx.send(()).expect("announce full queue");
+            output_tx
+                .blocking_send(bytes.to_vec())
+                .expect("native output delivered");
+        }));
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::clone(&runner.controls),
+            response_order: Arc::clone(&runner.response_order),
+            input_guard: crate::platform::PtyInputGuard::new(&runner.file),
+        };
+        peer.write_all(b"raw").expect("PTY output");
+        let reader = std::thread::spawn(move || {
+            assert!(runner.read_once());
+            runner
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader backpressured");
+        let (theme_tx, theme_rx) = std_mpsc::channel();
+        let theme = std::thread::spawn(move || {
+            handle.write_terminal_response(|| Some(Bytes::from_static(b"theme")));
+            theme_tx.send(()).expect("theme completion");
+        });
+        let progressed = theme_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        assert_eq!(output_rx.blocking_recv().as_deref(), Some(&b"1"[..]));
+        theme.join().expect("theme thread");
+        let runner = reader.join().expect("reader thread");
+        assert!(
+            progressed,
+            "theme response waited for the full native output queue"
+        );
+        assert_eq!(output_rx.blocking_recv().as_deref(), Some(&b"raw"[..]));
+        assert_eq!(
+            runner
+                .pending_writes
+                .front()
+                .map(|part| part.bytes.as_ref()),
+            Some(&b"theme"[..])
+        );
+    }
+
     #[test]
     fn appearance_transition_report_precedes_query_of_new_scheme() {
         let (actor_socket, mut peer) = UnixStream::pair().expect("socket pair");
@@ -1719,6 +1961,7 @@ mod tests {
                     Bytes::from_static(b"query-dark")
                 }],
             }),
+            post_read: None,
             on_reader_exit: None,
             poll_observer: None,
         };
@@ -1850,6 +2093,7 @@ mod tests {
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
             on_read: Box::new(|_| PtyReadResult::empty()),
+            post_read: None,
             on_reader_exit: None,
             poll_observer: None,
         };

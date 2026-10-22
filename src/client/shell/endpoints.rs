@@ -44,6 +44,104 @@ pub(crate) enum ClientEndpointFocusTarget {
 }
 
 impl ClientShellState {
+    pub(super) fn herd_for(&self, endpoint_id: &ClientEndpointId) -> u16 {
+        self.machine_herds.get(endpoint_id).copied().unwrap_or(0)
+    }
+
+    fn show_herd(&mut self, index: u16, outcome: &mut ClientShellInput) -> bool {
+        if index >= self.herd_count || index == self.selected_herd {
+            return false;
+        }
+        self.selected_herd = index;
+        self.workspace_scroll = 0;
+        self.agent_scroll = 0;
+        self.reveal_focused_workspace = false;
+        self.reveal_navigation_workspace = false;
+        self.hits = ShellHitMap::default();
+        outcome.repaint = true;
+        self.persist_chrome_preferences(outcome);
+        true
+    }
+
+    pub(super) fn select_herd(&mut self, index: u16, outcome: &mut ClientShellInput) {
+        if !self.show_herd(index, outcome) {
+            return;
+        }
+        let target = self
+            .active_endpoint_by_herd
+            .get(&index)
+            .filter(|endpoint_id| {
+                self.herd_for(endpoint_id) == index && self.endpoint_is_online(endpoint_id)
+            })
+            .or_else(|| {
+                (self.herd_for(&self.active_endpoint_id) == index
+                    && self.endpoint_is_online(&self.active_endpoint_id))
+                .then_some(&self.active_endpoint_id)
+            })
+            .or_else(|| {
+                self.endpoints
+                    .iter()
+                    .find(|endpoint| {
+                        self.herd_for(&endpoint.endpoint_id) == index
+                            && endpoint.status == ClientEndpointStatus::Online
+                            && endpoint.snapshot.is_some()
+                    })
+                    .map(|endpoint| &endpoint.endpoint_id)
+            })
+            .cloned();
+        if let Some(endpoint_id) = target {
+            self.pending_workspace_highlight = None;
+            self.pending_agent_reveal = None;
+            outcome.actions.push(ClientShellAction::ActivateEndpoint {
+                endpoint_id,
+                target: None,
+            });
+        }
+    }
+
+    pub(super) fn add_herd(&mut self, outcome: &mut ClientShellInput) {
+        let Some(count) = self.herd_count.checked_add(1) else {
+            return;
+        };
+        self.herd_count = count;
+        self.select_herd(count - 1, outcome);
+    }
+
+    pub(super) fn move_machine_to_herd(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        index: u16,
+        outcome: &mut ClientShellInput,
+    ) {
+        if index >= self.herd_count
+            || self.herd_for(endpoint_id) == index
+            || !self
+                .endpoints
+                .iter()
+                .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        {
+            return;
+        }
+        let previous_herd = self.herd_for(endpoint_id);
+        if self.active_endpoint_by_herd.get(&previous_herd) == Some(endpoint_id) {
+            self.active_endpoint_by_herd.remove(&previous_herd);
+        }
+        if index == 0 {
+            self.machine_herds.remove(endpoint_id);
+        } else {
+            self.machine_herds.insert(endpoint_id.clone(), index);
+        }
+        if endpoint_id == &self.active_endpoint_id {
+            self.active_endpoint_by_herd
+                .insert(index, endpoint_id.clone());
+        }
+        self.workspace_scroll = 0;
+        self.agent_scroll = 0;
+        self.hits = ShellHitMap::default();
+        outcome.repaint = true;
+        self.persist_chrome_preferences(outcome);
+    }
+
     pub(crate) fn set_endpoint_catalog(&mut self, profiles: &[SavedSshEndpoint]) {
         let mut next = Vec::with_capacity(profiles.len().saturating_add(1));
         let local = self
@@ -102,11 +200,28 @@ impl ClientShellState {
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
         self.endpoints = next;
+        self.machine_herds.retain(|endpoint_id, _| {
+            self.endpoints
+                .iter()
+                .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        });
+        let endpoints = &self.endpoints;
+        let machine_herds = &self.machine_herds;
+        self.active_endpoint_by_herd.retain(|herd, endpoint_id| {
+            endpoints
+                .iter()
+                .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
+                && machine_herds.get(endpoint_id).copied().unwrap_or(0) == *herd
+        });
     }
 
     pub(crate) fn select_unavailable_local(&mut self) {
         self.reset_endpoint_projection();
         self.active_endpoint_id = ClientEndpointId::Local;
+        let local_herd = self.herd_for(&ClientEndpointId::Local);
+        if local_herd != self.selected_herd {
+            self.show_herd(local_herd, &mut ClientShellInput::default());
+        }
         self.mode = ClientShellMode::Terminal;
         self.snapshot = None;
         self.graphics.set_scope("local:unavailable");
@@ -232,6 +347,11 @@ impl ClientShellState {
             return false;
         };
         let generation = endpoint.snapshot_generation;
+        let herd = self.herd_for(endpoint_id);
+        if herd != self.selected_herd {
+            let mut outcome = ClientShellInput::default();
+            self.show_herd(herd, &mut outcome);
+        }
         let switching_endpoint = endpoint_id != &self.active_endpoint_id;
         let agent_scroll = self.agent_scroll;
         if switching_endpoint {
@@ -243,6 +363,10 @@ impl ClientShellState {
         if switching_endpoint {
             // The aggregate agent list belongs to the client, not one endpoint.
             self.agent_scroll = agent_scroll;
+        }
+        if self.active_endpoint_by_herd.get(&herd) != Some(endpoint_id) {
+            self.active_endpoint_by_herd
+                .insert(herd, endpoint_id.clone());
         }
         if let Some((_, pane_id)) = pending_agent_reveal {
             self.reveal_endpoint_agent(endpoint_id, &pane_id, agent_body_height);

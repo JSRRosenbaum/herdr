@@ -434,9 +434,12 @@ impl App {
                 24,
                 80,
                 config.advanced.scrollback_limit_bytes,
-                &config.terminal.default_shell,
-                config.terminal.shell_mode,
+                crate::pane::PaneShellConfig::new(
+                    &config.terminal.default_shell,
+                    config.terminal.shell_mode,
+                ),
                 config.session.resume_agents_on_restore,
+                config.session.resume_max_age_hours,
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -1562,24 +1565,22 @@ mod tests {
     }
 
     #[test]
-    fn startup_restores_preview_update_available_from_saved_notes() {
+    fn startup_restores_saved_release_notes_for_clients() {
         let _guard = config_env_lock().lock().unwrap();
-        let path = temp_config_path("startup-preview-update-available");
+        let path = temp_config_path("startup-saved-release-notes");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
-        // Use a bogus far-future version so preview=true regardless of current binary version.
         crate::release_notes::save_pending("99.99.99", "### Changed\n- One").unwrap();
 
         let app = test_app();
 
-        assert_eq!(app.state.update_available.as_deref(), Some("99.99.99"));
         assert!(app.state.latest_release_notes_available);
         assert_eq!(
             app.state
                 .latest_release_notes
                 .as_ref()
-                .map(|notes| notes.version.as_str()),
-            Some("99.99.99")
+                .map(|notes| (notes.version.as_str(), notes.body.as_str())),
+            Some(("99.99.99", "### Changed\n- One"))
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -1600,13 +1601,14 @@ mod tests {
             install_command: "herdr update".into(),
         });
 
+        assert_eq!(app.state.update_available.as_deref(), Some("99.99.99"));
+        assert!(app.state.latest_release_notes_available);
         assert_eq!(
-            app.state.latest_release_notes.as_ref().map(|notes| (
-                notes.version.as_str(),
-                notes.body.as_str(),
-                notes.preview
-            )),
-            Some(("99.99.99", "### Changed\n- One", true))
+            app.state
+                .latest_release_notes
+                .as_ref()
+                .map(|notes| (notes.version.as_str(), notes.body.as_str())),
+            Some(("99.99.99", "### Changed\n- One"))
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -1639,33 +1641,19 @@ mod tests {
             stored["show_on_startup"].as_bool()
         };
 
-        let current = env!("CARGO_PKG_VERSION");
-        crate::release_notes::save_pending(current, "### Changed\n- Current").unwrap();
+        let current = crate::build_info::version();
+        crate::release_notes::save_pending(&current, "### Changed\n- Current").unwrap();
         let mut app = test_app();
-        dismiss(&mut app, current);
+        dismiss(&mut app, &current);
         assert_eq!(show_on_startup(), Some(false));
 
-        crate::release_notes::save_pending("99.99.99", "### Changed\n- Preview").unwrap();
+        crate::release_notes::save_pending(&current, "### Changed\n- Preview").unwrap();
         let mut app = test_app();
-        dismiss(&mut app, "99.99.99");
+        // Hold the version fixed so the API preview branch, not a version mismatch,
+        // preserves the pending notes regardless of this binary's build channel.
+        app.state.latest_release_notes.as_mut().unwrap().preview = true;
+        dismiss(&mut app, &current);
         assert_eq!(show_on_startup(), Some(true));
-
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn startup_does_not_restore_update_available_from_older_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
-        let path = temp_config_path("startup-stale-update-notes");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
-
-        crate::release_notes::save_pending("0.4.9", "### Changed\n- One").unwrap();
-
-        let app = test_app();
-
-        assert_eq!(app.state.update_available, None);
-        assert!(app.state.latest_release_notes_available);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -1677,7 +1665,7 @@ mod tests {
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
+        crate::release_notes::save_pending(&crate::build_info::version(), "### Changed\n- One")
             .unwrap();
         let config = Config {
             onboarding: Some(false),
@@ -1709,10 +1697,10 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
         std::env::set_var("XDG_STATE_HOME", &state_home);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
-            .unwrap();
+        let current = crate::build_info::version();
+        crate::release_notes::save_pending(&current, "### Changed\n- One").unwrap();
         crate::product_announcements::save_manifest_announcement(
-            env!("CARGO_PKG_VERSION"),
+            &current,
             Some(&crate::product_announcements::ManifestAnnouncement {
                 id: "startup-announcement".into(),
                 title: Some("Startup announcement".into()),

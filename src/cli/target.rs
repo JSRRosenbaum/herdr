@@ -31,8 +31,32 @@ pub(super) fn maybe_run(args: &[String]) -> Option<io::Result<super::CommandOutc
         Err(error) => return Some(usage_error(error)),
     };
     Some((|| {
-        if let Err(error) = validate_machine_command(&args) {
-            return usage_error(error);
+        #[cfg(unix)]
+        if args.get(1).map(String::as_str) == Some("terminal")
+            && matches!(
+                args.get(2).map(String::as_str),
+                Some("attach" | "native-attach")
+            )
+            && args[3..]
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+        {
+            println!(
+                "usage: herdr --machine <label-or-id> terminal attach <terminal_id> [--takeover]\n\
+                 usage: herdr --machine <label-or-id> terminal native-attach <terminal_id>\n\
+                 saved-ssh-client-bridge-v1 native-terminal-attach-v1 scoped-terminal-attach-v2"
+            );
+            return Ok(super::CommandOutcome::Handled(0));
+        }
+        if !(args.get(1).map(String::as_str) == Some("terminal")
+            && matches!(
+                args.get(2).map(String::as_str),
+                Some("attach" | "native-attach")
+            ))
+        {
+            if let Err(error) = validate_machine_command(&args) {
+                return usage_error(error);
+            }
         }
         if super::spec::print_requested_help(&args)? {
             return Ok(super::CommandOutcome::Handled(0));
@@ -42,6 +66,40 @@ pub(super) fn maybe_run(args: &[String]) -> Option<io::Result<super::CommandOutc
             Ok(profile) => profile.clone(),
             Err(error) => return usage_error(error),
         };
+        #[cfg(unix)]
+        if args.get(1).map(String::as_str) == Some("terminal")
+            && matches!(
+                args.get(2).map(String::as_str),
+                Some("attach" | "native-attach")
+            )
+        {
+            let native = args[2] == "native-attach";
+            let (terminal_id, takeover) = match super::parse_attach_target(
+                &args[3..],
+                if native {
+                    "usage: herdr --machine <label-or-id> terminal native-attach <terminal_id>"
+                } else {
+                    "usage: herdr --machine <label-or-id> terminal attach <terminal_id> [--takeover]"
+                },
+            ) {
+                Ok(target) => target,
+                Err(code) => return Ok(super::CommandOutcome::Handled(code)),
+            };
+            if native && takeover {
+                return usage_error("native attach cannot take over an occupied controller".into());
+            }
+            crate::remote::run_saved_terminal_attach(&profile, &terminal_id, takeover, native)?;
+            return Ok(super::CommandOutcome::Handled(0));
+        }
+        #[cfg(windows)]
+        if args.get(1).map(String::as_str) == Some("terminal")
+            && matches!(
+                args.get(2).map(String::as_str),
+                Some("attach" | "native-attach")
+            )
+        {
+            return usage_error("saved-machine direct attach requires a Unix client".into());
+        }
         let _scope = TARGET.with(|target| {
             TargetScope(target.replace(Some(MachineTarget {
                 profile,
@@ -315,7 +373,9 @@ fn validate_machine_command(args: &[String]) -> Result<(), String> {
     if supported {
         Ok(())
     } else {
-        Err(format!("`{command} {subcommand}` is not an API-backed machine command; --machine does not run local management commands or attach a TUI"))
+        Err(format!(
+            "`{command} {subcommand}` is not an API-backed machine command; --machine does not run local management commands or attach a TUI"
+        ))
     }
 }
 
