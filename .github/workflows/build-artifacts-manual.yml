@@ -253,6 +253,16 @@ jobs:
         shell: bash
         run: |
           env -u HERDR_BUILD_CHANNEL -u HERDR_BUILD_ID -u HERDR_BUILD_COMMIT just ci-tests 'all()'
+      - name: Run patched reconnect regression gate
+        if: matrix.target == 'x86_64-unknown-linux-musl' && needs.validate-source.outputs.variant == 'patched'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in $(seq 1 10); do
+            echo "patched reconnect regression iteration $iteration/10"
+            env -u HERDR_BUILD_CHANNEL -u HERDR_BUILD_ID -u HERDR_BUILD_COMMIT \
+              just ci-tests 'test(federated_client_starts_without_local_and_survives_its_restart)'
+          done
 
       - name: Run Windows source test gate
         if: runner.os == 'Windows'
