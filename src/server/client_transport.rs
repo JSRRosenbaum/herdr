@@ -1501,6 +1501,7 @@ fn client_read_loop_with_endpoint_controls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use interprocess::local_socket::traits::Listener as _;
     use std::path::PathBuf;
 

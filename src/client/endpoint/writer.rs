@@ -54,14 +54,19 @@ impl NativeEndpointTransport {
         std::thread::Builder::new()
             .name("endpoint-writer".into())
             .spawn(move || {
+                let mut drained = false;
                 let _lifetime = lifetime;
                 while let Ok(command) = receiver.recv() {
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
                     let batch = match command {
-                        WriterCommand::Frames(batch) => batch,
+                        WriterCommand::Frames(batch) => {
+                            drained = false;
+                            batch
+                        }
                         WriterCommand::Flush(done) => {
+                            drained = true;
                             let _ = done.send(());
                             continue;
                         }
@@ -75,7 +80,13 @@ impl NativeEndpointTransport {
                         break;
                     }
                 }
-                drop(stream);
+                if drained {
+                    drop(stream);
+                } else {
+                    // Revoked input must not enter interprocess's Windows drop-flush limbo.
+                    crate::ipc::abort_local_stream(stream);
+                }
+                drop(_lifetime);
             })?;
         Ok(Self {
             sender,
@@ -260,6 +271,7 @@ mod tests {
     use super::*;
 
     fn streams() -> (LocalStream, LocalStream, std::path::PathBuf) {
+        #[cfg(unix)]
         use interprocess::local_socket::traits::Listener as _;
         let path = std::env::temp_dir().join(format!(
             "herdr-writer-{}-{}.sock",

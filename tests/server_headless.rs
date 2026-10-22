@@ -581,6 +581,15 @@ fn server_survives_hangup_and_stops_gracefully_on_termination() {
     assert_eq!(protocol, CURRENT_PROTOCOL);
     assert!(error.is_none());
 
+    // API ping works before the main loop installs its signal handlers.
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let mut client = UnixStream::connect(&client_socket).expect("connect to ready server");
+    let (version, error) = client_handshake(&mut client, CURRENT_PROTOCOL, 80, 24)
+        .expect("server event loop must be ready before SIGTERM");
+    assert_eq!(version, CURRENT_PROTOCOL);
+    assert!(error.is_none());
+    drop(client);
+
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     assert!(
         wait_for_exit(&mut spawned.child, Duration::from_secs(10)),

@@ -26,6 +26,7 @@ pub(super) fn start_endpoint_transport(
                 endpoint_id,
                 generation,
                 surface_decoder,
+                None,
             );
         })
         .map_err(ClientError::ConnectionFailed)?;
@@ -41,8 +42,11 @@ pub(super) fn server_reader_thread(
     endpoint_id: endpoint::ClientEndpointId,
     generation: u64,
     mut surface_decoder: Option<protocol::surface_reuse::Decoder>,
+    reader_completion: Option<endpoint::AttemptCompletion>,
 ) {
     if stream.set_nonblocking(true).is_err() {
+        crate::ipc::abort_local_stream(stream);
+        drop(reader_completion);
         let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
             endpoint_id,
             generation,
@@ -50,56 +54,66 @@ pub(super) fn server_reader_thread(
         return;
     }
 
-    let mut stream = EndpointReader {
-        stream: &mut stream,
-        stopped: should_quit,
-        deadline: None,
-    };
-    loop {
-        if should_quit.load(Ordering::Acquire) {
-            break;
-        }
-
-        let message = protocol::read_message(&mut stream, max_frame_size).and_then(|message| {
-            match &mut surface_decoder {
-                Some(decoder) => decoder.decode(message).map_err(|error| {
-                    protocol::FramingError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
-                }),
-                None => Ok(message),
+    let mut disconnected = false;
+    {
+        let mut stream = EndpointReader {
+            stream: &mut stream,
+            stopped: should_quit,
+            deadline: None,
+        };
+        loop {
+            if should_quit.load(Ordering::Acquire) {
+                break;
             }
-        });
-        match message {
-            Ok(msg) => {
-                if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage {
-                        endpoint_id: endpoint_id.clone(),
-                        generation,
-                        message: Box::new(msg),
-                    })
-                    .is_err()
-                {
+
+            let message = protocol::read_message(&mut stream, max_frame_size).and_then(|message| {
+                match &mut surface_decoder {
+                    Some(decoder) => decoder.decode(message).map_err(|error| {
+                        protocol::FramingError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            error,
+                        ))
+                    }),
+                    None => Ok(message),
+                }
+            });
+            match message {
+                Ok(msg) => {
+                    if event_tx
+                        .blocking_send(ClientLoopEvent::ServerMessage {
+                            endpoint_id: endpoint_id.clone(),
+                            generation,
+                            message: Box::new(msg),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(protocol::FramingError::UnexpectedEof) => {
+                    disconnected = true;
+                    break;
+                }
+                Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => {
+                    warn!(err = %err, "server read error");
+                    disconnected = true;
                     break;
                 }
             }
-            Err(protocol::FramingError::UnexpectedEof) => {
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
-                    endpoint_id: endpoint_id.clone(),
-                    generation,
-                });
-                break;
-            }
-            Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(err) => {
-                warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
-                    endpoint_id: endpoint_id.clone(),
-                    generation,
-                });
-                break;
-            }
         }
+    }
+    crate::ipc::abort_local_stream(stream);
+    // A stale disconnect notification may wait behind queued frames. The reader stream is already
+    // closed, so release the reconnect barrier before that bounded event-channel send.
+    drop(reader_completion);
+    if disconnected {
+        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
+            endpoint_id,
+            generation,
+        });
     }
 }
 

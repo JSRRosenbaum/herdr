@@ -6,9 +6,33 @@ use std::path::Path;
 
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as _;
-
+#[cfg(not(windows))]
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
+#[cfg(windows)]
+pub(crate) type LocalListener = crate::platform::LocalListener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
+#[cfg(windows)]
+const NORMAL_LOCAL_PIPE_BUFFER_SIZE: u32 = 512;
+
+/// Closes a local stream without interprocess's Windows drop-flush behavior.
+///
+/// Retirement and cancellation revoke queued input, so their handles must not enter the
+/// background flush pool. Normal shutdown uses `Write::flush` before this boundary instead.
+pub(crate) fn abort_local_stream(stream: LocalStream) {
+    #[cfg(windows)]
+    {
+        let interprocess::local_socket::Stream::NamedPipe(stream) = stream;
+        let handle: std::os::windows::io::OwnedHandle = stream.into();
+        drop(handle);
+    }
+    #[cfg(not(windows))]
+    drop(stream);
+}
+
+#[cfg(unix)]
+type PrivateLocalListener = LocalListener;
+#[cfg(windows)]
+type PrivateLocalListener = crate::platform::PrivateLocalListener;
 
 pub(crate) enum LocalStreamRead {
     Data,
@@ -106,16 +130,12 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
 
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
-        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
-
-        let name = path.to_string_lossy().to_string();
-        let name = name.to_ns_name::<GenericNamespaced>()?;
-        let listener = ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .security_descriptor(crate::platform::local_server_security_descriptor()?)
-            .create_sync()?;
+        let security_descriptor = crate::platform::local_server_security_descriptor()?;
+        let listener = crate::platform::create_local_listener(
+            path,
+            Some(security_descriptor),
+            NORMAL_LOCAL_PIPE_BUFFER_SIZE,
+        )?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
     }
@@ -176,7 +196,7 @@ pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) 
 
 /// Binds a listener for private terminal traffic. Unix callers restrict the
 /// socket file after binding; Windows must set the named-pipe DACL at creation.
-pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListener> {
+pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<PrivateLocalListener> {
     #[cfg(unix)]
     {
         bind_local_listener(path)
@@ -184,21 +204,7 @@ pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListen
 
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
-        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
-        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
-        use widestring::U16CString;
-
-        let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
-        let name = path.to_string_lossy().to_string();
-        let name = name.to_ns_name::<GenericNamespaced>()?;
-        let listener = ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .security_descriptor(security_descriptor)
-            .create_sync()?;
+        let listener = PrivateLocalListener::bind(path)?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
     }
@@ -389,8 +395,6 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
 mod tests {
     use super::*;
     #[cfg(windows)]
-    use interprocess::local_socket::traits::Listener as _;
-    #[cfg(windows)]
     use std::path::PathBuf;
 
     #[test]
@@ -406,22 +410,34 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn private_named_pipe_accepts_same_user() {
+    fn private_named_pipe_transfers_surface_bursts_without_waiting_for_peer() {
+        use interprocess::local_socket::traits::Stream as _;
         use std::io::Write as _;
 
         let path = temp_socket_marker_path("private-pipe");
         let _ = fs::remove_file(&path);
         let listener = bind_private_local_listener(&path).unwrap();
+        listener
+            .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
+            .unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let mut client = connect_local_stream(&path).unwrap();
         let mut server = listener.accept().unwrap();
-        client.write_all(b"remote").unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.set_nonblocking(true).unwrap();
 
-        let mut buffer = [0_u8; 16];
-        assert!(matches!(
-            poll_local_stream_read_count(&mut server, &mut buffer).unwrap(),
-            LocalStreamReadCount::Data(6)
-        ));
-        assert_eq!(&buffer[..6], b"remote");
+        // A screen update must fit before the peer's next poll in either direction.
+        let payload = vec![b'x'; 48 * 1024];
+        let mut received = vec![0; payload.len()];
+        assert_eq!(server.write(&payload).unwrap(), payload.len());
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(received, payload);
+        assert_eq!(client.write(&payload).unwrap(), payload.len());
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(received, payload);
 
         drop(client);
         drop(server);

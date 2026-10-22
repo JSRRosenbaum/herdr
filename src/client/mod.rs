@@ -1534,6 +1534,7 @@ async fn run_client_loop(
                         state.present_frame(frame);
                     }
                     let reader_tx = event_tx.clone();
+                    let (reader, reader_completion) = reader.into_parts();
                     std::thread::spawn(move || {
                         server_reader_thread(
                             reader,
@@ -1543,6 +1544,7 @@ async fn run_client_loop(
                             endpoint_id,
                             generation,
                             surface_decoder,
+                            Some(reader_completion),
                         );
                     });
                 }
