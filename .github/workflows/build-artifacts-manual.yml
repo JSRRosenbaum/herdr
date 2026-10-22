@@ -251,12 +251,14 @@ jobs:
       - name: Run Linux source test gate
         if: matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
-        run: just ci-tests 'all()'
+        run: |
+          env -u HERDR_BUILD_CHANNEL -u HERDR_BUILD_ID -u HERDR_BUILD_COMMIT just ci-tests 'all()'
 
       - name: Run Windows source test gate
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          Remove-Item Env:HERDR_BUILD_CHANNEL, Env:HERDR_BUILD_ID, Env:HERDR_BUILD_COMMIT -ErrorAction SilentlyContinue
           $env:CARGO_INCREMENTAL = '1'
           just check
 
@@ -392,18 +394,234 @@ jobs:
       - name: Smoke native Unix release artifact
         if: runner.os != 'Windows' && matrix.native_smoke == true
         shell: bash
-        env:
-          ARTIFACT_NAME: ${{ matrix.name }}
         run: |
           set -euo pipefail
           binary="$PWD/target/${{ matrix.target }}/release/herdr"
           "$binary" --version
           "$binary" --help >/dev/null
-          smoke_base="$RUNNER_TEMP/herdr-release-smoke-${VARIANT}-${{ matrix.target }}"
-          rm -rf "$smoke_base"
-          env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_SESSION -u HERDR_CONFIG_PATH \
-            HERDR_BIN="$binary" BASE="$smoke_base" bash scripts/smoke_live_handoff_sessions.sh
-          rm -rf "$smoke_base"
+
+          base="$(mktemp -d /tmp/herdr-release-smoke.XXXXXX)"
+          config_home="$base/config"
+          config_dir="$config_home/herdr"
+          config_path="$config_dir/config.toml"
+          runtime_dir="$base/runtime"
+          state_dir="$base/state"
+          mkdir -p "$config_dir" "$runtime_dir" "$state_dir" "$base/work"
+          printf 'onboarding = false\n' > "$config_path"
+
+          sessions=(default work api)
+          server_pids=()
+          ports=()
+
+          session_dir() {
+            if [[ "$1" == default ]]; then
+              printf '%s\n' "$config_dir"
+            else
+              printf '%s/sessions/%s\n' "$config_dir" "$1"
+            fi
+          }
+
+          api_socket() {
+            printf '%s/herdr.sock\n' "$(session_dir "$1")"
+          }
+
+          run_herdr() {
+            local session="$1"
+            shift
+            local session_args=()
+            if [[ "$session" != default ]]; then
+              session_args=(--session "$session")
+            fi
+            env -u HERDR_SOCKET_PATH \
+              -u HERDR_CLIENT_SOCKET_PATH \
+              -u HERDR_SESSION \
+              HERDR_CONFIG_PATH="$config_path" \
+              XDG_CONFIG_HOME="$config_home" \
+              XDG_RUNTIME_DIR="$runtime_dir" \
+              XDG_STATE_HOME="$state_dir" \
+              "$binary" "${session_args[@]}" "$@"
+          }
+
+          cleanup() {
+            set +e
+            for session in "${sessions[@]}"; do
+              run_herdr "$session" server stop >/dev/null 2>&1 || true
+            done
+            for pid in "${server_pids[@]}"; do
+              kill "$pid" >/dev/null 2>&1 || true
+              wait "$pid" >/dev/null 2>&1 || true
+            done
+            rm -rf "$base"
+          }
+          trap cleanup EXIT
+
+          wait_for_socket() {
+            local socket="$1"
+            local log="$2"
+            for _ in {1..200}; do
+              [[ -S "$socket" ]] && return 0
+              sleep 0.05
+            done
+            cat "$log" >&2 || true
+            echo "socket did not appear: $socket" >&2
+            return 1
+          }
+
+          wait_for_http() {
+            local port="$1"
+            local expected="$2"
+            for _ in {1..200}; do
+              if curl -fsS "http://127.0.0.1:$port/" | grep -q "$expected"; then
+                return 0
+              fi
+              sleep 0.05
+            done
+            echo "http server on port $port did not return $expected" >&2
+            return 1
+          }
+
+          unused_port() {
+            python3 - <<'PY'
+          import socket
+          sock = socket.socket()
+          sock.bind(("127.0.0.1", 0))
+          print(sock.getsockname()[1])
+          sock.close()
+          PY
+          }
+
+          json_request() {
+            local socket_path="$1"
+            local body="$2"
+            python3 - "$socket_path" "$body" <<'PY'
+          import socket
+          import sys
+
+          path, body = sys.argv[1], sys.argv[2]
+          client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          client.settimeout(10)
+          client.connect(path)
+          client.sendall(body.encode() + b"\n")
+          response = b""
+          while not response.endswith(b"\n"):
+              chunk = client.recv(65536)
+              if not chunk:
+                  break
+              response += chunk
+          print(response.decode().strip())
+          PY
+          }
+          workspace_create() {
+            local socket_path="$1"
+            local cwd="$2"
+            python3 - "$socket_path" "$cwd" <<'PY'
+          import json
+          import socket
+          import sys
+
+          path, cwd = sys.argv[1], sys.argv[2]
+          request = {
+              "id": "release-smoke-workspace",
+              "method": "workspace.create",
+              "params": {"cwd": cwd, "focus": True},
+          }
+          client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          client.settimeout(10)
+          client.connect(path)
+          client.sendall(json.dumps(request).encode() + b"\n")
+          response = b""
+          while not response.endswith(b"\n"):
+              chunk = client.recv(65536)
+              if not chunk:
+                  break
+              response += chunk
+          if b'"error"' in response:
+              raise SystemExit(response.decode())
+          print(response.decode().strip())
+          PY
+          }
+
+          send_text() {
+            local socket_path="$1"
+            local pane="$2"
+            local text="$3"
+            python3 - "$socket_path" "$pane" "$text" <<'PY'
+          import json
+          import socket
+          import sys
+
+          path, pane, text = sys.argv[1], sys.argv[2], sys.argv[3]
+          request = {
+              "id": "release-smoke-pane-input",
+              "method": "pane.send_input",
+              "params": {"pane_id": pane, "text": text, "keys": ["Enter"]},
+          }
+          client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          client.settimeout(10)
+          client.connect(path)
+          client.sendall(json.dumps(request).encode() + b"\n")
+          response = b""
+          while not response.endswith(b"\n"):
+              chunk = client.recv(65536)
+              if not chunk:
+                  break
+              response += chunk
+          if b'"error"' in response:
+              raise SystemExit(response.decode())
+          PY
+          }
+
+          for session in "${sessions[@]}"; do
+            log="$base/$session-server.log"
+            run_herdr "$session" server >"$log" 2>&1 &
+            server_pids+=("$!")
+            wait_for_socket "$(api_socket "$session")" "$log"
+          done
+
+          session_json="$(run_herdr default session list --json)"
+          printf '%s\n' "$session_json" | python3 -c '
+          import json
+          import sys
+          payload = json.load(sys.stdin)
+          sessions = {item["name"]: item for item in payload["sessions"]}
+          required = {"default", "work", "api"}
+          missing = required - sessions.keys()
+          if missing:
+              raise SystemExit(f"missing sessions: {sorted(missing)}")
+          stopped = sorted(name for name in required if not sessions[name]["running"])
+          if stopped:
+              raise SystemExit(f"stopped sessions: {stopped}")
+          '
+
+          for session in "${sessions[@]}"; do
+            port="$(unused_port)"
+            ports+=("$port")
+            web="$base/web-$session"
+            mkdir -p "$web"
+            printf 'hello-from-%s\n' "$session" > "$web/index.html"
+            socket="$(api_socket "$session")"
+            created="$(workspace_create "$socket" "$web")"
+            pane="$(printf '%s\n' "$created" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')"
+            [[ -n "$pane" ]]
+            command="cd '$web' && python3 -m http.server $port --bind 127.0.0.1"
+            send_text "$socket" "$pane" "$command"
+            wait_for_http "$port" "hello-from-$session"
+          done
+
+          for index in "${!sessions[@]}"; do
+            session="${sessions[$index]}"
+            socket="$(api_socket "$session")"
+            response="$(json_request "$socket" '{"id":"release-smoke-handoff","method":"server.live_handoff","params":{}}')"
+            printf '%s\n' "$response" | python3 -c '
+          import json
+          import sys
+          payload = json.load(sys.stdin)
+          if "error" in payload:
+              raise SystemExit(payload["error"])
+          '
+            wait_for_socket "$socket" "$base/$session-server.log"
+            wait_for_http "${ports[$index]}" "hello-from-$session"
+          done
 
       - name: Mark native Unix smoke passed
         if: runner.os != 'Windows' && matrix.native_smoke == true
