@@ -260,7 +260,6 @@ impl LocalListener {
     ) -> impl Iterator<Item = std::io::Result<crate::ipc::LocalStream>> + '_ {
         std::iter::repeat_with(move || self.accept())
     }
-
 }
 
 pub(crate) fn create_local_listener(
