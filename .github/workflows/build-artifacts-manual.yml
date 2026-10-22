@@ -3,50 +3,73 @@ name: Build artifacts (manual)
 on:
   workflow_dispatch:
     inputs:
-      build_group:
-        description: which artifacts to build
+      source_ref:
+        description: exact 40-character source commit SHA to build
         required: true
-        default: linux
+        type: string
+      variant:
+        description: source repository variant
+        required: true
         type: choice
         options:
-          - linux
-          - macos
-          - windows
-          - all
-      libghostty_optimize:
-        description: libghostty-vt optimize mode for this build
-        required: true
-        default: ReleaseSafe
-        type: choice
-        options:
-          - ReleaseSafe
-          - ReleaseFast
-          - ReleaseSmall
-          - Debug
-      libghostty_simd:
-        description: build libghostty-vt with SIMD-accelerated code paths
-        required: true
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+          - official
+          - patched
 
 permissions:
   contents: read
-  actions: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   RUST_TOOLCHAIN_VERSION: 1.96.1
+  ZIG_VERSION: 0.16.0
+  LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+  LIBGHOSTTY_VT_SIMD: 'true'
   HERDR_BUILD_CHANNEL: local
-  HERDR_BUILD_ID: manual-${{ github.run_id }}
-  HERDR_BUILD_COMMIT: ${{ github.sha }}
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
 jobs:
-  build-linux:
-    if: ${{ inputs.build_group == 'linux' || inputs.build_group == 'all' }}
+  validate-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      source_repository: ${{ steps.source.outputs.source_repository }}
+      source_ref: ${{ steps.source.outputs.source_ref }}
+      variant: ${{ steps.source.outputs.variant }}
+    steps:
+      - name: Validate source selection
+        id: source
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "source_ref must be exactly 40 hexadecimal characters" >&2
+            exit 1
+          fi
+          case "$VARIANT" in
+            official) source_repository='herdrdev/herdr' ;;
+            patched) source_repository='JSRRosenbaum/herdr' ;;
+            *)
+              echo "variant must be official or patched" >&2
+              exit 1
+              ;;
+          esac
+          source_ref="$(printf '%s' "$SOURCE_REF" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "source_repository=$source_repository"
+            echo "source_ref=$source_ref"
+            echo "variant=$VARIANT"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate-source
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -54,210 +77,434 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: herdr-linux-x86_64
+            package_extension: .tar.gz
+            native_smoke: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             name: herdr-linux-aarch64
+            package_extension: .tar.gz
+            native_smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            name: herdr-macos-x86_64
+            package_extension: .tar.gz
+            native_smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: herdr-macos-aarch64
+            package_extension: .tar.gz
+            native_smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            name: herdr-windows-x86_64
+            package_extension: .zip
+            native_smoke: true
+    permissions:
+      contents: read
     env:
-      LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
-      LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
+      SOURCE_REPOSITORY: ${{ needs.validate-source.outputs.source_repository }}
+      SOURCE_REF: ${{ needs.validate-source.outputs.source_ref }}
+      VARIANT: ${{ needs.validate-source.outputs.variant }}
+      HERDR_BUILD_ID: upstream-comparison-${{ needs.validate-source.outputs.variant }}-${{ needs.validate-source.outputs.source_ref }}
+      HERDR_BUILD_COMMIT: ${{ needs.validate-source.outputs.source_ref }}
+      CARGO_TERM_COLOR: always
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Checkout exact source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          repository: ${{ needs.validate-source.outputs.source_repository }}
+          ref: ${{ needs.validate-source.outputs.source_ref }}
+          fetch-depth: 1
           persist-credentials: false
+
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$SOURCE_REF" ]]; then
+            echo "checked out $actual, requested $SOURCE_REF" >&2
+            exit 1
+          fi
+          echo "source repository: $SOURCE_REPOSITORY"
+          echo "source commit: $actual"
+          echo "source variant: $VARIANT"
+
+      - name: Verify source-pinned toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_rust="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+          if [[ "$source_rust" != "$RUST_TOOLCHAIN_VERSION" ]]; then
+            echo "source rust-toolchain.toml pins $source_rust, expected $RUST_TOOLCHAIN_VERSION" >&2
+            exit 1
+          fi
+          grep -Eq '\.minimum_zig_version[[:space:]]*=[[:space:]]*"0\.16\.0"' vendor/libghostty-vt/build.zig.zon
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt,clippy
           targets: ${{ matrix.target }}
 
+      - name: Restore Zig compiler
+        id: zig-compiler
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/herdr-zig-${{ env.ZIG_VERSION }}
+          key: zig-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}
+
       - name: Install Zig
+        if: steps.zig-compiler.outputs.cache-hit != 'true'
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
-          version: 0.16.0
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Stabilize Zig installation path on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ZIG_RESTORED: ${{ steps.zig-compiler.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          stable_zig="$RUNNER_TEMP/herdr-zig-${ZIG_VERSION}"
+          if [[ "$ZIG_RESTORED" != 'true' ]]; then
+            mv "$(dirname "$(command -v zig)")" "$stable_zig"
+          fi
+          echo "$stable_zig" >> "$GITHUB_PATH"
+          echo "ZIG=$stable_zig/zig" >> "$GITHUB_ENV"
+
+      - name: Stabilize Zig installation path on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ZIG_RESTORED: ${{ steps.zig-compiler.outputs.cache-hit }}
+        run: |
+          $stable = Join-Path $env:RUNNER_TEMP "herdr-zig-$env:ZIG_VERSION"
+          if ($env:ZIG_RESTORED -ne 'true') {
+            $source = Split-Path (Get-Command zig).Source
+            Move-Item -LiteralPath $source -Destination $stable
+          }
+          $stable | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "ZIG=$(Join-Path $stable 'zig.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Save Zig compiler
+        if: steps.zig-compiler.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/herdr-zig-${{ env.ZIG_VERSION }}
+          key: zig-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}
 
       - name: Prefer official Ubuntu mirrors over Azure
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
+          set -euo pipefail
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
             sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
-            echo "Using apt mirrors:"
             cat /etc/apt/apt-mirrors.txt
           fi
 
       - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
+          set -euo pipefail
           sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
 
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
+
       - name: Set Linux aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+        shell: bash
+        run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
-      - name: Remove Zig caches
+      - name: Install test tools
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: just,cargo-nextest
+
+      - name: Install Bun for source checks
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      # This cache contains only Cargo dependencies; target outputs remain source-specific.
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          shared-key: upstream-comparison-deps-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN_VERSION }}
+          key: releasefast-simdtrue
+          cache-targets: false
+          cache-bin: false
+
+      # Only the native x86_64 Linux build runs the full workspace source gate.
+      # The Windows build runs the existing Windows check and transport smoke.
+      - name: Run Linux source test gate
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: just ci-tests 'all()'
+
+      - name: Run Windows source test gate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:CARGO_INCREMENTAL = '1'
+          just check
+
+      - name: Run Windows transport smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP "herdr-source-smoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $configDir = Join-Path $root 'config'
+          $stateDir = Join-Path $root 'state'
+          $runtimeDir = Join-Path $root 'runtime'
+          New-Item -ItemType Directory -Force -Path $configDir, $stateDir, $runtimeDir | Out-Null
+          $config = Join-Path $configDir 'herdr.toml'
+          Set-Content -LiteralPath $config -Value "onboarding = false`n" -Encoding utf8
+          $env:HERDR_CONFIG_PATH = $config
+          $env:XDG_CONFIG_HOME = $configDir
+          $env:XDG_STATE_HOME = $stateDir
+          $env:XDG_RUNTIME_DIR = $runtimeDir
+          Remove-Item Env:HERDR_SOCKET_PATH, Env:HERDR_CLIENT_SOCKET_PATH, Env:HERDR_SESSION -ErrorAction SilentlyContinue
+          .\scripts\windows_smoke_conpty_path.ps1 `
+            -ExePath (Join-Path $PWD 'target\debug\herdr.exe') `
+            -Session "comparison-source-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+      - name: Record toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv > rustc-Vv.txt
+          cargo -V > cargo-V.txt
+          zig version > zig-version.txt
+          cat rustc-Vv.txt
+          cat cargo-V.txt
+          cat zig-version.txt
+
+      - name: Remove Zig build caches
+        if: runner.os != 'Windows'
+        shell: bash
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package artifact
-        run: |
-          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
-          file ${{ matrix.name }} > BUILD_INFO.txt
-          grep -Eq "statically linked|static-pie linked" BUILD_INFO.txt
-          if nm -u ${{ matrix.name }} 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
-            echo "error: Linux artifact has unresolved C++ runtime symbols" >&2
-            exit 1
-          fi
-          {
-            echo "commit=$GITHUB_SHA"
-            echo "target=${{ matrix.target }}"
-            echo "libghostty_vt_optimize=$LIBGHOSTTY_VT_OPTIMIZE"
-            echo "libghostty_vt_simd=$LIBGHOSTTY_VT_SIMD"
-          } >> BUILD_INFO.txt
-          python3 -c "import hashlib, pathlib; artifact = pathlib.Path('${{ matrix.name }}'); print(f'sha256={hashlib.sha256(artifact.read_bytes()).hexdigest()}  {artifact.name}')" >> BUILD_INFO.txt
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ${{ matrix.name }}-${{ inputs.libghostty_optimize }}-simd-${{ inputs.libghostty_simd }}
-          path: |
-            ${{ matrix.name }}
-            BUILD_INFO.txt
-          retention-days: 7
-
-  build-macos:
-    if: ${{ inputs.build_group == 'macos' || inputs.build_group == 'all' }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: herdr-macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: herdr-macos-aarch64
-    env:
-      LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
-      LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
-
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
-          targets: ${{ matrix.target }}
-
-      - name: Install Zig
-        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
-        with:
-          version: 0.16.0
-
-      - name: Install macOS build tools
-        run: brew install cmake ninja
-
-      - name: Remove Zig caches
-        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package artifact
-        run: |
-          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
-          file ${{ matrix.name }} > BUILD_INFO.txt
-          {
-            echo "commit=$GITHUB_SHA"
-            echo "target=${{ matrix.target }}"
-            echo "libghostty_vt_optimize=$LIBGHOSTTY_VT_OPTIMIZE"
-            echo "libghostty_vt_simd=$LIBGHOSTTY_VT_SIMD"
-          } >> BUILD_INFO.txt
-          python3 -c "import hashlib, pathlib; artifact = pathlib.Path('${{ matrix.name }}'); print(f'sha256={hashlib.sha256(artifact.read_bytes()).hexdigest()}  {artifact.name}')" >> BUILD_INFO.txt
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ${{ matrix.name }}-${{ inputs.libghostty_optimize }}-simd-${{ inputs.libghostty_simd }}
-          path: |
-            ${{ matrix.name }}
-            BUILD_INFO.txt
-          retention-days: 7
-
-  build-windows:
-    if: ${{ inputs.build_group == 'windows' || inputs.build_group == 'all' }}
-    runs-on: windows-latest
-    env:
-      LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
-      LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
-
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
-          targets: x86_64-pc-windows-msvc
-
-      - name: Install Zig
-        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
-        with:
-          version: 0.16.0
-
-      - name: Remove Zig caches
+      - name: Remove Zig build caches
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
 
-      - name: Build
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
-      - name: Package artifact
-        shell: pwsh
+      - name: Build release artifact
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package Unix release artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+          NATIVE_SMOKE: ${{ matrix.native_smoke }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
-          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/herdr"
+          test -x "$binary"
+          if [[ "${{ runner.os }}" == 'Linux' ]]; then
+            file "$binary" | tee binary-file.txt
+            ldd "$binary" > binary-ldd.txt 2>&1 || true
+            cat binary-ldd.txt
+            grep -Eq 'statically linked|not a dynamic executable' binary-ldd.txt
+            if nm -u "$binary" 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
+              echo 'Linux artifact has unresolved C++ runtime symbols' >&2
+              exit 1
+            fi
+          else
+            file "$binary" | tee binary-file.txt
+          fi
+          archive="${ARTIFACT_NAME}-${VARIANT}.tar.gz"
+          stage="$RUNNER_TEMP/${ARTIFACT_NAME}-${VARIANT}"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp "$binary" "$stage/$ARTIFACT_NAME"
+          tar -czf "$archive" -C "$stage" "$ARTIFACT_NAME"
+          python3 - "$archive" "$stage/$ARTIFACT_NAME" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          archive = pathlib.Path(sys.argv[1])
+          binary = pathlib.Path(sys.argv[2])
+          digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          source_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          version = subprocess.check_output([str(binary), '--version'], text=True).strip()
+          info = {
+              'schema_version': 1,
+              'source_repository': os.environ['SOURCE_REPOSITORY'],
+              'source_sha': source_sha,
+              'variant': os.environ['VARIANT'],
+              'target': os.environ['TARGET'],
+              'version': version,
+              'channel': os.environ['HERDR_BUILD_CHANNEL'],
+              'build_id': os.environ['HERDR_BUILD_ID'],
+              'profile': 'ReleaseFast',
+              'simd': True,
+              'libghostty_vt_optimize': 'ReleaseFast',
+              'libghostty_vt_simd': True,
+              'native_smoke': os.environ['NATIVE_SMOKE'].lower() == 'true',
+              'smoke': (
+                  'pending'
+                  if os.environ['NATIVE_SMOKE'].lower() == 'true'
+                  else 'not-run-cross-target'
+              ),
+              'toolchains': {
+                  'rustc_vv': pathlib.Path('rustc-Vv.txt').read_text().strip(),
+                  'cargo': pathlib.Path('cargo-V.txt').read_text().strip(),
+                  'zig': pathlib.Path('zig-version.txt').read_text().strip(),
+              },
+              'package_name': archive.name,
+              'package_sha256': digest(archive),
+              'binary_name': binary.name,
+              'binary_sha256': digest(binary),
+          }
+          archive.with_suffix(archive.suffix + '.sha256').write_text(
+              f"{info['package_sha256']}  {archive.name}\n", encoding='ascii'
+          )
+          pathlib.Path('BUILD_INFO.json').write_text(
+              json.dumps(info, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          PY
+
+      - name: Smoke native Unix release artifact
+        if: runner.os != 'Windows' && matrix.native_smoke == true
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          binary="$PWD/target/${{ matrix.target }}/release/herdr"
+          "$binary" --version
+          "$binary" --help >/dev/null
+          smoke_base="$RUNNER_TEMP/herdr-release-smoke-${VARIANT}-${{ matrix.target }}"
+          rm -rf "$smoke_base"
+          env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_SESSION -u HERDR_CONFIG_PATH \
+            HERDR_BIN="$binary" BASE="$smoke_base" bash scripts/smoke_live_handoff_sessions.sh
+          rm -rf "$smoke_base"
+
+      - name: Mark native Unix smoke passed
+        if: runner.os != 'Windows' && matrix.native_smoke == true
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path('BUILD_INFO.json')
+          info = json.loads(path.read_text(encoding='utf-8'))
+          if info.get('smoke') != 'pending':
+              raise SystemExit(f"unexpected pre-smoke status: {info.get('smoke')!r}")
+          info['smoke'] = 'passed'
+          path.write_text(json.dumps(info, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+
+      - name: Package Windows ConPTY release artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARTIFACT_NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "$env:ARTIFACT_NAME-$env:VARIANT.zip"
+          $package = Join-Path $env:RUNNER_TEMP 'Microsoft.Windows.Console.ConPTY.nupkg'
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64-$env:VARIANT"
+          $exe = Join-Path $PWD "target\${env:TARGET}\release\herdr.exe"
           .\scripts\package_windows_conpty.ps1 `
-            -HerdrExe target\x86_64-pc-windows-msvc\release\herdr.exe `
+            -HerdrExe $exe `
             -PackagePath $package `
             -StageDir $stage `
-            -OutputPath herdr-windows-x86_64.zip
-          "commit=$env:GITHUB_SHA" | Out-File -Encoding utf8 BUILD_INFO.txt
-          "target=x86_64-pc-windows-msvc" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          $hash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.zip).Hash.ToLowerInvariant()
-          "sha256=$hash  herdr-windows-x86_64.zip" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-
-      - name: Probe bundled Windows ConPTY
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
-          $exe = Join-Path $stage "herdr.exe"
-          $consoleHost = Join-Path $stage "conpty\x64\OpenConsole.exe"
+            -OutputPath $archive
+          $metadata = Get-Content packaging\windows\conpty.json -Raw | ConvertFrom-Json
+          if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
+            throw "ConPTY package was not acquired: $package"
+          }
+          $expectedConptyHash = $metadata.package.sha256.ToLowerInvariant()
+          $actualConptyHash = (Get-FileHash -Algorithm SHA256 $package).Hash.ToLowerInvariant()
+          if ($actualConptyHash -ne $expectedConptyHash) {
+            throw "ConPTY package hash mismatch: expected $expectedConptyHash, got $actualConptyHash"
+          }
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "herdr-release-smoke-$env:VARIANT-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $configDir = Join-Path $smokeRoot 'config'
+          $stateDir = Join-Path $smokeRoot 'state'
+          $runtimeDir = Join-Path $smokeRoot 'runtime'
+          New-Item -ItemType Directory -Force -Path $configDir, $stateDir, $runtimeDir | Out-Null
+          $config = Join-Path $configDir 'herdr.toml'
+          Set-Content -LiteralPath $config -Value "onboarding = false`n" -Encoding utf8
+          $env:HERDR_CONFIG_PATH = $config
+          $env:XDG_CONFIG_HOME = $configDir
+          $env:XDG_STATE_HOME = $stateDir
+          $env:XDG_RUNTIME_DIR = $runtimeDir
+          Remove-Item Env:HERDR_SOCKET_PATH, Env:HERDR_CLIENT_SOCKET_PATH, Env:HERDR_SESSION -ErrorAction SilentlyContinue
+          $version = (& (Join-Path $stage 'herdr.exe') --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'packaged Windows binary --version failed' }
+          & (Join-Path $stage 'herdr.exe') --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'packaged Windows binary --help failed' }
           .\scripts\windows_conpty_enhanced_input_probe.ps1 `
-            -ExePath $exe `
-            -Session "manual-conpty-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" `
-            -ExpectedConsoleHostPath $consoleHost
+            -ExePath (Join-Path $stage 'herdr.exe') `
+            -Session "comparison-conpty-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" `
+            -ExpectedConsoleHostPath (Join-Path $stage 'conpty\x64\OpenConsole.exe')
+          $packageHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $binaryHash = (Get-FileHash -Algorithm SHA256 (Join-Path $stage 'herdr.exe')).Hash.ToLowerInvariant()
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $rustc = (Get-Content rustc-Vv.txt -Raw).Trim()
+          $cargo = (Get-Content cargo-V.txt -Raw).Trim()
+          $zig = (Get-Content zig-version.txt -Raw).Trim()
+          $conptyHash = $actualConptyHash
+          [ordered]@{
+            schema_version = 1
+            source_repository = $env:SOURCE_REPOSITORY
+            source_sha = $sourceSha
+            variant = $env:VARIANT
+            target = $env:TARGET
+            version = $version
+            channel = $env:HERDR_BUILD_CHANNEL
+            build_id = $env:HERDR_BUILD_ID
+            profile = 'ReleaseFast'
+            simd = $true
+            libghostty_vt_optimize = 'ReleaseFast'
+            libghostty_vt_simd = $true
+            native_smoke = $true
+            smoke = 'passed'
+            toolchains = [ordered]@{ rustc_vv = $rustc; cargo = $cargo; zig = $zig }
+            package_name = $archive
+            package_sha256 = $packageHash
+            binary_name = 'herdr.exe'
+            binary_sha256 = $binaryHash
+            conpty_package_sha256 = $conptyHash
+          } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath BUILD_INFO.json -Encoding utf8
+          "$packageHash  $archive" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
 
-      - name: Upload artifact
+      - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: herdr-windows-x86_64-${{ inputs.libghostty_optimize }}-simd-${{ inputs.libghostty_simd }}
+          name: upstream-comparison-${{ needs.validate-source.outputs.variant }}-${{ matrix.target }}-releasefast-simdtrue-${{ needs.validate-source.outputs.source_ref }}
           path: |
-            herdr-windows-x86_64.zip
-            BUILD_INFO.txt
+            ${{ matrix.name }}-${{ needs.validate-source.outputs.variant }}${{ matrix.package_extension }}
+            ${{ matrix.name }}-${{ needs.validate-source.outputs.variant }}${{ matrix.package_extension }}.sha256
+            BUILD_INFO.json
+          if-no-files-found: error
           retention-days: 7
