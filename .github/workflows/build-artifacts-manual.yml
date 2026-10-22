@@ -428,9 +428,10 @@ jobs:
           run_herdr() {
             local session="$1"
             shift
-            local session_args=()
+            local -a herdr_cmd
+            herdr_cmd=("$binary")
             if [[ "$session" != default ]]; then
-              session_args=(--session "$session")
+              herdr_cmd+=(--session "$session")
             fi
             env -u HERDR_SOCKET_PATH \
               -u HERDR_CLIENT_SOCKET_PATH \
@@ -439,7 +440,7 @@ jobs:
               XDG_CONFIG_HOME="$config_home" \
               XDG_RUNTIME_DIR="$runtime_dir" \
               XDG_STATE_HOME="$state_dir" \
-              "$binary" "${session_args[@]}" "$@"
+              "${herdr_cmd[@]}" "$@"
           }
 
           cleanup() {
@@ -447,10 +448,12 @@ jobs:
             for session in "${sessions[@]}"; do
               run_herdr "$session" server stop >/dev/null 2>&1 || true
             done
-            for pid in "${server_pids[@]}"; do
-              kill "$pid" >/dev/null 2>&1 || true
-              wait "$pid" >/dev/null 2>&1 || true
-            done
+            if [[ -n ${server_pids[*]-} ]]; then
+              for pid in "${server_pids[@]}"; do
+                kill "$pid" >/dev/null 2>&1 || true
+                wait "$pid" >/dev/null 2>&1 || true
+              done
+            fi
             rm -rf "$base"
           }
           trap cleanup EXIT
