@@ -606,6 +606,7 @@ impl WindowsInputPump {
                     decode_windows_terminal_paste_enters(text);
                 }
                 self.paste_from_win32_key_records = false;
+            }
         }
 
         let accepted_default_mouse = self.default_mouse_candidate.active
@@ -725,6 +726,7 @@ impl PlatformInputItem {
 /// modifier-only reports. Mixed, incomplete, or unsupported payloads stay
 /// opaque here; the boundary normalizer below handles only the captured
 /// balanced Ctrl+Enter group.
+fn decode_win32_paste_payload(text: &str) -> Option<String> {
     let mut reports = text.split_inclusive('_');
     let mut units = Vec::new();
     while let Some(report) = reports.next() {
