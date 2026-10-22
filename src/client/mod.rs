@@ -1544,8 +1544,8 @@ async fn run_client_loop(
                             endpoint_id,
                             generation,
                             surface_decoder,
+                            Some(reader_completion),
                         );
-                        drop(reader_completion);
                     });
                 }
             },

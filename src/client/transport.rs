@@ -26,6 +26,7 @@ pub(super) fn start_endpoint_transport(
                 endpoint_id,
                 generation,
                 surface_decoder,
+                None,
             );
         })
         .map_err(ClientError::ConnectionFailed)?;
@@ -41,16 +42,19 @@ pub(super) fn server_reader_thread(
     endpoint_id: endpoint::ClientEndpointId,
     generation: u64,
     mut surface_decoder: Option<protocol::surface_reuse::Decoder>,
+    reader_completion: Option<endpoint::AttemptCompletion>,
 ) {
     if stream.set_nonblocking(true).is_err() {
+        crate::ipc::abort_local_stream(stream);
+        drop(reader_completion);
         let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
             endpoint_id,
             generation,
         });
-        crate::ipc::abort_local_stream(stream);
         return;
     }
 
+    let mut disconnected = false;
     {
         let mut stream = EndpointReader {
             stream: &mut stream,
@@ -87,10 +91,7 @@ pub(super) fn server_reader_thread(
                     }
                 }
                 Err(protocol::FramingError::UnexpectedEof) => {
-                    let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
-                        endpoint_id: endpoint_id.clone(),
-                        generation,
-                    });
+                    disconnected = true;
                     break;
                 }
                 Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -98,16 +99,22 @@ pub(super) fn server_reader_thread(
                 }
                 Err(err) => {
                     warn!(err = %err, "server read error");
-                    let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
-                        endpoint_id: endpoint_id.clone(),
-                        generation,
-                    });
+                    disconnected = true;
                     break;
                 }
             }
         }
     }
     crate::ipc::abort_local_stream(stream);
+    // A stale disconnect notification may wait behind queued frames. The reader stream is already
+    // closed, so release the reconnect barrier before that bounded event-channel send.
+    drop(reader_completion);
+    if disconnected {
+        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
+            endpoint_id,
+            generation,
+        });
+    }
 }
 
 pub(super) struct EndpointReader<'a> {

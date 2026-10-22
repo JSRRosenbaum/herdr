@@ -261,14 +261,6 @@ impl LocalListener {
         std::iter::repeat_with(move || self.accept())
     }
 
-    pub(crate) fn set_nonblocking(
-        &self,
-        mode: interprocess::local_socket::ListenerNonblockingMode,
-    ) -> std::io::Result<()> {
-        self.listener.set_nonblocking(mode.accept_nonblocking())?;
-        self.nonblocking.store(mode as u32, AtomicOrdering::Release);
-        Ok(())
-    }
 }
 
 pub(crate) fn create_local_listener(
