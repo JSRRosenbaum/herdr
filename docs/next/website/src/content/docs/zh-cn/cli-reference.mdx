@@ -355,6 +355,9 @@ herdr terminal native-attach <terminal_id>
 herdr --machine <profile-id> terminal native-attach <terminal_id>
 herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
+herdr terminal presentation <terminal_id>
+herdr terminal presentation --caller-pane-id <pane_id>
+herdr terminal presentation --current
 herdr terminal title set <title>
 herdr terminal title clear
 ```
@@ -368,6 +371,8 @@ ANSI `terminal attach` 用 `ctrl+b q` 分离。用 `ctrl+b ctrl+b` 发送字面�
 `terminal session observe` 为相同目标打开只读实时流，输出包含 base64 ANSI 字节的逐行 JSON `terminal.frame`，服务器关闭流时输出 `terminal.closed`。多个观察方可以同时查看终端，不获取输入、调整尺寸、滚动或接管权限。Linux/macOS 上，若套接字写入连续 30 秒没有进展，观察方会被断开；此时可能没有最后的 `terminal.closed` 记录，但窗格和其他客户端继续运行。安静、没有输出的窗格不会触发此超时。
 
 `terminal title clear` 把外层终端窗口标题交还给 `ui.window_title`。
+
+`terminal presentation` 返回规范终端 ID 以及当前原生、ANSI 查看器数量。可提供终端 ID、调用方窗格 ID，或在受管理窗格内使用 `--current`。可选的 `terminal_presentation` 服务器能力公布此只读 API 的支持情况。该命令不会附加查看器或改变输入控制权。
 
 ## 输出等待
 

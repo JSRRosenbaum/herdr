@@ -30,14 +30,26 @@ impl HostGeometry {
     }
 
     #[cfg(unix)]
-    pub(crate) fn current() -> Option<Self> {
-        let size = crossterm::terminal::window_size().ok()?;
-        Self::new(
-            size.columns,
-            size.rows,
-            u32::from(size.width),
-            u32::from(size.height),
+    pub(crate) fn current(reported_cell_size: Option<(u32, u32)>) -> Option<Self> {
+        Self::from_window_size(
+            &crossterm::terminal::window_size().ok()?,
+            reported_cell_size,
         )
+    }
+
+    #[cfg(any(unix, test))]
+    fn from_window_size(
+        size: &crossterm::terminal::WindowSize,
+        reported_cell_size: Option<(u32, u32)>,
+    ) -> Option<Self> {
+        let (width_px, height_px) = match reported_cell_size {
+            Some((width, height)) => (
+                u32::from(size.columns).checked_mul(width)?,
+                u32::from(size.rows).checked_mul(height)?,
+            ),
+            None => (u32::from(size.width), u32::from(size.height)),
+        };
+        Self::new(size.columns, size.rows, width_px, height_px)
     }
 
     pub(crate) fn cell(self, x: u32, y: u32) -> Option<(u16, u16)> {
@@ -142,6 +154,29 @@ fn grid_cell(pixel: u32, count: u16, extent: u32) -> Option<u16> {
     u16::try_from(cell).ok().filter(|cell| *cell < count)
 }
 
+/// Side-button SGR reports cannot round-trip through crossterm's mouse buttons.
+#[cfg(any(unix, test))]
+pub(crate) fn navigation_report(data: &[u8]) -> Option<(u32, u32, u32, u8)> {
+    let body = data.strip_prefix(b"\x1b[<")?;
+    let (&suffix, fields) = body.split_last()?;
+    if !matches!(suffix, b'M' | b'm') {
+        return None;
+    }
+    let parse_number = |field: &[u8]| {
+        (!field.is_empty() && field.iter().all(u8::is_ascii_digit))
+            .then(|| std::str::from_utf8(field).ok()?.parse::<u32>().ok())
+            .flatten()
+    };
+    let mut fields = fields.split(|byte| *byte == b';');
+    let button = parse_number(fields.next()?)?;
+    if !matches!(button & !28, 128 | 129) {
+        return None;
+    }
+    let x = parse_number(fields.next()?)?;
+    let y = parse_number(fields.next()?)?;
+    fields.next().is_none().then_some((button, x, y, suffix))
+}
+
 fn scale(pixel: u32, source: u32, target: u32) -> u32 {
     ((u64::from(pixel) * u64::from(target)) / u64::from(source))
         .min(u64::from(target.saturating_sub(1))) as u32
@@ -150,6 +185,71 @@ fn scale(pixel: u32, source: u32, target: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_reports_preserve_only_side_presses_and_releases() {
+        for button in [128, 129] {
+            for modifiers in 0..8 {
+                let code = button | (modifiers << 2);
+                for suffix in [b'M', b'm'] {
+                    let report = format!("\x1b[<{code};12;34{}", suffix as char);
+                    assert_eq!(
+                        navigation_report(report.as_bytes()),
+                        Some((code, 12, 34, suffix))
+                    );
+                }
+            }
+        }
+        for code in [0, 1, 2, 64, 65, 130, 131, 160, 161, 192] {
+            let report = format!("\x1b[<{code};12;34M");
+            assert_eq!(navigation_report(report.as_bytes()), None);
+        }
+        for report in [
+            b"\x1b[<128;12;34".as_slice(),
+            b"\x1b[<128;12;34Mtext",
+            b"\x1b[<128;12;34;56M",
+            b"\x1b[<128;12;badM",
+            b"text",
+        ] {
+            assert_eq!(navigation_report(report), None);
+        }
+    }
+
+    #[test]
+    fn reported_cell_pitch_corrects_ssh_pixel_hit_testing() {
+        let mut size = crossterm::terminal::WindowSize {
+            columns: 251,
+            rows: 86,
+            width: 640,
+            height: 480,
+        };
+        let unconfirmed = HostGeometry::from_window_size(&size, None).unwrap();
+        assert_eq!(unconfirmed.cell(1001, 441), None);
+
+        let reported = HostGeometry::from_window_size(&size, Some((10, 22))).unwrap();
+        assert_eq!(reported.cell(1001, 441), Some((100, 20)));
+        assert_eq!(reported.cell(2510, 1892), Some((250, 85)));
+        assert_eq!(reported.cell(2511, 1892), None);
+        let pane = ratatui::layout::Rect::new(27, 0, 224, 85);
+        assert_eq!(
+            HostPixels {
+                x: 1001,
+                y: 441,
+                geometry: reported,
+            }
+            .pane_position(pane, 2240, 1870),
+            Some(Position::Pixels { x: 731, y: 441 })
+        );
+
+        size.width = 0;
+        size.height = 0;
+        assert_eq!(
+            HostGeometry::from_window_size(&size, Some((10, 22)))
+                .unwrap()
+                .cell(1001, 441),
+            Some((100, 20))
+        );
+    }
 
     #[test]
     fn integer_cell_pitch_ignores_trailing_pixel_remainder() {

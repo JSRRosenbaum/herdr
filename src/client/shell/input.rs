@@ -162,6 +162,46 @@ impl ClientShellState {
         data: &[u8],
         geometry: crate::input::mouse::HostGeometry,
     ) -> ClientShellInput {
+        if let Some((button, x, y, suffix)) = crate::input::mouse::navigation_report(data) {
+            let mut outcome = ClientShellInput::default();
+            let Some((column, row)) = geometry.cell(x, y) else {
+                return outcome;
+            };
+            if self.mode != ClientShellMode::Terminal
+                || self.overlay.is_some()
+                || self.popup_pending
+                || self.popup_input_target().is_some()
+            {
+                return outcome;
+            }
+            let focused_pane_id = self.focused_pane_id();
+            let Some(hit) = self.hits.panes.iter().find(|hit| {
+                !hit.popup
+                    && hit.mouse_reporting
+                    && hit.sgr_pixel_mouse
+                    && focused_pane_id.as_deref() == Some(hit.pane_id.as_str())
+                    && super::contains(hit.inner_rect, (column, row))
+            }) else {
+                return outcome;
+            };
+            let Some(crate::input::mouse::Position::Pixels { x, y }) =
+                (crate::input::mouse::HostPixels { x, y, geometry }).pane_position(
+                    hit.inner_rect,
+                    hit.pixel_width,
+                    hit.pixel_height,
+                )
+            else {
+                return outcome;
+            };
+            self.push_endpoint_method(
+                crate::api::schema::Method::PaneSendText(crate::api::schema::PaneSendTextParams {
+                    pane_id: hit.pane_id.clone(),
+                    text: format!("\x1b[<{button};{x};{y}{}", suffix as char),
+                }),
+                &mut outcome,
+            );
+            return outcome;
+        }
         let Some(report) = crate::raw_input::parse_sgr_mouse_report(data) else {
             return ClientShellInput::default();
         };

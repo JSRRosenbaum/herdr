@@ -230,6 +230,13 @@ fn terminal_command() -> Command {
                 .arg(flag("takeover")),
         )
         .subcommand(
+            Command::new("presentation")
+                .about("Inspect live native and ANSI viewer counts")
+                .arg(Arg::new("terminal_id").value_name("TERMINAL_ID"))
+                .arg(option("caller-pane-id", "PANE_ID"))
+                .arg(flag("current")),
+        )
+        .subcommand(
             Command::new("session")
                 .about("Work with terminal sessions")
                 .subcommand(

@@ -376,6 +376,9 @@ herdr terminal native-attach <terminal_id>
 herdr --machine <profile-id> terminal native-attach <terminal_id>
 herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
+herdr terminal presentation <terminal_id>
+herdr terminal presentation --caller-pane-id <pane_id>
+herdr terminal presentation --current
 herdr terminal title set <title>
 herdr terminal title clear
 ```
@@ -408,6 +411,8 @@ On Linux and macOS, an observer is disconnected if a socket write makes no progr
 for 30 seconds. A stalled stream can end without a final `terminal.closed` record;
 the pane and other clients keep running. Quiet panes do not trigger this timeout.
 `terminal title clear` hands the outer terminal window title back to `ui.window_title`.
+
+`terminal presentation` returns the canonical terminal ID and live native/ANSI viewer counts. Supply a terminal ID, caller-pane ID, or `--current` inside a managed pane. The optional `terminal_presentation` server capability advertises this read-only API. It does not attach a viewer or change input ownership.
 
 ## Output waits
 
@@ -577,5 +582,6 @@ These meanings apply to reads. For `pane wait-output` only, both `recent` and `r
 | `HERDR_PANE_ID` | Public pane id for the running pane process. |
 | `HERDR_TAB_ID` | Public tab id for the running pane process. |
 | `HERDR_WORKSPACE_ID` | Public workspace id for the running pane process. |
+| `PI_TUI_NATIVE` | New panes default to `managed`, deferring patched OMP native rendering until its companion resolves viewer policy; an explicit `0` is preserved. |
 | `HERDR_LOG` | Set log filter, for example `HERDR_LOG=herdr=debug`. |
 | `HERDR_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |

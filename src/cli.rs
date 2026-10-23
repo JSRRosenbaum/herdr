@@ -431,6 +431,7 @@ fn run_terminal_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => terminal_attach(&args[1..]),
         "native-attach" => terminal_native_attach(&args[1..]),
         "session" => terminal_session(&args[1..]),
+        "presentation" => terminal_presentation(&args[1..]),
         "title" => terminal_title(&args[1..]),
         "help" | "--help" | "-h" => {
             print_terminal_help();
@@ -716,6 +717,47 @@ fn parse_terminal_dimension(raw: &str, flag: &str) -> std::io::Result<u16> {
         ));
     }
     Ok(parsed)
+}
+
+fn terminal_presentation(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str =
+        "usage: herdr terminal presentation <terminal_id> | --caller-pane-id <pane_id> | --current";
+    let params = match args {
+        [terminal_id] if !terminal_id.starts_with('-') => {
+            crate::api::schema::TerminalPresentationGetParams {
+                terminal_id: Some(terminal_id.clone()),
+                caller_pane_id: None,
+            }
+        }
+        [flag, pane_id] if flag == "--caller-pane-id" => {
+            crate::api::schema::TerminalPresentationGetParams {
+                terminal_id: None,
+                caller_pane_id: Some(pane_id.clone()),
+            }
+        }
+        [flag] if flag == "--current" => {
+            let Some(pane_id) = target::caller_pane_id() else {
+                eprintln!("--current requires HERDR_PANE_ID");
+                return Ok(2);
+            };
+            crate::api::schema::TerminalPresentationGetParams {
+                terminal_id: None,
+                caller_pane_id: Some(pane_id),
+            }
+        }
+        [flag] if matches!(flag.as_str(), "help" | "--help" | "-h") => {
+            eprintln!("{USAGE}");
+            return Ok(0);
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    };
+    print_response(&send_request(&Request {
+        id: "cli:terminal:presentation".into(),
+        method: Method::TerminalPresentationGet(params),
+    })?)
 }
 
 fn terminal_title(args: &[String]) -> std::io::Result<i32> {
@@ -1007,6 +1049,9 @@ fn print_terminal_help() {
     );
     eprintln!("  herdr terminal session control <target> [--takeover] [--cols N] [--rows N]");
     eprintln!("  herdr terminal session observe <target> [--cols N] [--rows N]");
+    eprintln!(
+        "  herdr terminal presentation <terminal_id> | --caller-pane-id <pane_id> | --current"
+    );
     eprintln!("  herdr terminal title set <title>");
     eprintln!("  herdr terminal title clear");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");

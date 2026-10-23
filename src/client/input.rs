@@ -10,9 +10,9 @@
 //! - We avoid duplicating parsing logic in the client
 //! - Host terminal control replies can be buffered or discarded before they leak
 
+use std::sync::atomic::AtomicBool;
 #[cfg(unix)]
-use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -32,6 +32,25 @@ pub(super) mod windows_vti;
 // Stdin reader thread
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+#[derive(Default)]
+pub(super) struct HostQueryPending {
+    pub(super) theme: AtomicU32,
+    pub(super) cell_size: AtomicU32,
+}
+
+#[cfg(unix)]
+impl HostQueryPending {
+    fn arm(&self, framer: &mut crate::raw_input::RawInputByteFramer) {
+        for _ in 0..self.theme.swap(0, Ordering::AcqRel) {
+            framer.host_color_query_sent();
+        }
+        for _ in 0..self.cell_size.swap(0, Ordering::AcqRel) {
+            framer.host_cell_size_query_sent();
+        }
+    }
+}
+
 /// Reads raw bytes from stdin and sends them to the main event loop.
 ///
 /// This runs on a dedicated thread because stdin reading is blocking.
@@ -40,10 +59,10 @@ pub(super) mod windows_vti;
 pub(super) fn stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
-    (host_color_query_sent, host_cell_size_query_sent): (bool, bool),
-    host_theme_query_pending: Arc<AtomicU32>,
-    host_mouse_capture_active: Arc<AtomicBool>,
-    host_sgr_pixels_active: Arc<AtomicBool>,
+    host_color_query_sent: bool,
+    #[cfg(unix)] host_query_pending: Arc<HostQueryPending>,
+    (host_mouse_capture_active, host_sgr_pixels_active): (Arc<AtomicBool>, Arc<AtomicBool>),
+    #[cfg(unix)] reported_cell_size: Arc<AtomicU64>,
     host_escape_disambiguation_active: bool,
     initial_host_input: Vec<u8>,
     #[cfg(unix)] direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
@@ -52,12 +71,7 @@ pub(super) fn stdin_reader_loop(
 ) {
     #[cfg(windows)]
     {
-        let _ = (
-            host_theme_query_pending,
-            host_cell_size_query_sent,
-            host_mouse_capture_active,
-            host_sgr_pixels_active,
-        );
+        let _ = (host_mouse_capture_active, host_sgr_pixels_active);
         let _ = (host_escape_disambiguation_active, initial_host_input);
         windows_stdin_reader_loop(event_tx, should_quit, host_color_query_sent);
     }
@@ -66,10 +80,10 @@ pub(super) fn stdin_reader_loop(
     unix_stdin_reader_loop(
         event_tx,
         should_quit,
-        (host_color_query_sent, host_cell_size_query_sent),
-        host_theme_query_pending,
-        host_mouse_capture_active,
-        host_sgr_pixels_active,
+        host_color_query_sent,
+        host_query_pending,
+        (host_mouse_capture_active, host_sgr_pixels_active),
+        reported_cell_size,
         host_escape_disambiguation_active,
         initial_host_input,
         direct_response,
@@ -341,10 +355,10 @@ fn target_changed(target: Option<&AttachTarget>, event_tx: &mpsc::Sender<ClientL
 fn unix_stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
-    (host_color_query_sent, host_cell_size_query_sent): (bool, bool),
-    host_theme_query_pending: Arc<AtomicU32>,
-    host_mouse_capture_active: Arc<AtomicBool>,
-    host_sgr_pixels_active: Arc<AtomicBool>,
+    host_color_query_sent: bool,
+    host_query_pending: Arc<HostQueryPending>,
+    (host_mouse_capture_active, host_sgr_pixels_active): (Arc<AtomicBool>, Arc<AtomicBool>),
+    reported_cell_size: Arc<AtomicU64>,
     host_escape_disambiguation_active: bool,
     initial_host_input: Vec<u8>,
     direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
@@ -362,10 +376,10 @@ fn unix_stdin_reader_loop(
             (reader, Some(target)),
             event_tx,
             should_quit,
-            (host_color_query_sent, host_cell_size_query_sent),
-            host_theme_query_pending,
-            host_mouse_capture_active,
-            host_sgr_pixels_active,
+            host_color_query_sent,
+            host_query_pending,
+            (host_mouse_capture_active, host_sgr_pixels_active),
+            reported_cell_size,
             host_escape_disambiguation_active,
             initial_host_input,
             direct_response,
@@ -376,10 +390,10 @@ fn unix_stdin_reader_loop(
             (stdin.lock(), None),
             event_tx,
             should_quit,
-            (host_color_query_sent, host_cell_size_query_sent),
-            host_theme_query_pending,
-            host_mouse_capture_active,
-            host_sgr_pixels_active,
+            host_color_query_sent,
+            host_query_pending,
+            (host_mouse_capture_active, host_sgr_pixels_active),
+            reported_cell_size,
             host_escape_disambiguation_active,
             initial_host_input,
             direct_response,
@@ -393,10 +407,10 @@ fn unix_input_from_reader(
     (mut reader, target): (impl Read + AsRawFd, Option<AttachTarget>),
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
-    (host_color_query_sent, host_cell_size_query_sent): (bool, bool),
-    host_theme_query_pending: Arc<AtomicU32>,
-    host_mouse_capture_active: Arc<AtomicBool>,
-    host_sgr_pixels_active: Arc<AtomicBool>,
+    host_color_query_sent: bool,
+    host_query_pending: Arc<HostQueryPending>,
+    (host_mouse_capture_active, host_sgr_pixels_active): (Arc<AtomicBool>, Arc<AtomicBool>),
+    reported_cell_size: Arc<AtomicU64>,
     host_escape_disambiguation_active: bool,
     initial_host_input: Vec<u8>,
     direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
@@ -406,13 +420,10 @@ fn unix_input_from_reader(
     let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
     framer.set_host_escape_disambiguation_active(host_escape_disambiguation_active);
     if host_color_query_sent {
-        framer.host_color_query_sent();
         framer.enable_host_color_scheme_change_tracking();
         framer.enable_host_appearance_query_on_focus();
     }
-    if host_cell_size_query_sent {
-        framer.host_cell_size_query_sent();
-    }
+    host_query_pending.arm(&mut framer);
     let mut pending_palette = Vec::new();
     let mut pending_mode = None;
     let mut last_geometry = None;
@@ -424,8 +435,13 @@ fn unix_input_from_reader(
     if !initial_host_input.is_empty() {
         let sgr_pixels = host_sgr_pixels_active.load(Ordering::Acquire);
         if sgr_pixels {
-            last_geometry = crate::input::mouse::HostGeometry::current();
+            last_geometry = crate::input::mouse::HostGeometry::current(
+                super::terminal_geometry::unpack_cell_size(
+                    reported_cell_size.load(Ordering::Acquire),
+                ),
+            );
         }
+        host_query_pending.arm(&mut framer);
         let chunks = framer.push(&initial_host_input);
         if !send_unix_input_chunks(
             chunks,
@@ -504,15 +520,17 @@ fn unix_input_from_reader(
             Ok(n) => {
                 // A redraw can issue queries while this thread is blocked in read().
                 // Arm the split-reply guard before framing the returned bytes.
-                for _ in 0..host_theme_query_pending.swap(0, Ordering::AcqRel) {
-                    framer.host_color_query_sent();
-                }
+                host_query_pending.arm(&mut framer);
                 let sgr_pixels = *pending_mode
                     .get_or_insert_with(|| host_sgr_pixels_active.load(Ordering::Acquire));
                 if sgr_pixels {
                     last_geometry = retain_geometry(
                         last_geometry,
-                        crate::input::mouse::HostGeometry::current(),
+                        crate::input::mouse::HostGeometry::current(
+                            super::terminal_geometry::unpack_cell_size(
+                                reported_cell_size.load(Ordering::Acquire),
+                            ),
+                        ),
                     );
                 }
                 let filtered = filter_direct_input(
@@ -678,7 +696,10 @@ fn classify_unix_input(
     sgr_pixels: bool,
     geometry: Option<crate::input::mouse::HostGeometry>,
 ) -> Option<ClientLoopEvent> {
-    if sgr_pixels && crate::raw_input::parse_sgr_mouse_report(&data).is_some() {
+    if sgr_pixels
+        && (crate::raw_input::parse_sgr_mouse_report(&data).is_some()
+            || crate::input::mouse::navigation_report(&data).is_some())
+    {
         return geometry.map(|geometry| ClientLoopEvent::PixelMouse(data, geometry));
     }
     Some(ClientLoopEvent::StdinInput(data))
@@ -890,10 +911,13 @@ mod tests {
                 (reader, Some(target)),
                 tx,
                 &quit,
-                (false, false),
-                Arc::new(AtomicU32::new(0)),
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
+                false,
+                Arc::new(HostQueryPending::default()),
+                (
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+                Arc::new(AtomicU64::new(0)),
                 false,
                 Vec::new(),
                 Arc::new(std::sync::Mutex::new(
@@ -957,6 +981,21 @@ mod tests {
         };
         assert_eq!(cell_report, report);
         assert!(classify_unix_input(report, true, None).is_none());
+
+        for report in [
+            b"\x1b[<128;321;241M".as_slice(),
+            b"\x1b[<157;321;241m".as_slice(),
+        ] {
+            assert!(matches!(
+                classify_unix_input(report.to_vec(), true, Some(geometry)),
+                Some(ClientLoopEvent::PixelMouse(_, captured)) if captured == geometry
+            ));
+            assert!(classify_unix_input(report.to_vec(), true, None).is_none());
+            assert!(matches!(
+                classify_unix_input(report.to_vec(), false, Some(geometry)),
+                Some(ClientLoopEvent::StdinInput(_))
+            ));
+        }
 
         for raw in [
             b"key".as_slice(),
@@ -1123,6 +1162,26 @@ mod tests {
                 "binding {binding:?} followed by {next:?} after {gap_ms} ms"
             );
         }
+    }
+
+    #[test]
+    fn second_notified_cell_query_keeps_split_reply_tail_out_of_typed_input() {
+        let pending = HostQueryPending::default();
+        let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
+        pending.cell_size.fetch_add(1, Ordering::AcqRel);
+        pending.arm(&mut framer);
+        assert_eq!(
+            framer.push(b"\x1b[6;21;10t"),
+            vec![b"\x1b[6;21;10t".to_vec()]
+        );
+
+        // A resize sends a second query after the first reply exhausted the guard.
+        pending.cell_size.fetch_add(1, Ordering::AcqRel);
+        pending.arm(&mut framer);
+        assert!(framer.push(b"\x1b[6;").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert_eq!(framer.push(b"22;11tq"), vec![b"q".to_vec()]);
+        assert!(framer.flush_timeout().is_empty());
     }
 
     #[test]

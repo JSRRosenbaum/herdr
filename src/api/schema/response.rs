@@ -123,6 +123,11 @@ pub enum ResponseResult {
     PaneCurrent {
         pane: PaneInfo,
     },
+    TerminalPresentation {
+        terminal_id: String,
+        native_viewers: usize,
+        ansi_viewers: usize,
+    },
     PaneSwap {
         swap: PaneSwapResult,
     },

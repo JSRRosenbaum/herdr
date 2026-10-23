@@ -100,6 +100,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 终端 | `terminal.presentation.get` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -509,6 +510,22 @@ Herdr 在本地 socket 上使用换行分隔的 JSON。在 Unix 上,那个 socke
 `HERDR_SOCKET_PATH` 只用于底层覆盖。
 
 对插件来说,需要可移植的 Windows 行为时,优先调用 `HERDR_BIN_PATH` 和 CLI 包装命令。原始 socket 客户端要自己负责使用平台原生的本地 socket 形式。
+
+## 终端呈现
+
+`terminal.presentation.get` 是无界面服务器的只读 API，通过可选的 `terminal_presentation` 能力公布。必须且只能提供 `terminal_id` 或 `caller_pane_id` 其中一个。
+
+```json
+{"id":"viewers","method":"terminal.presentation.get","params":{"caller_pane_id":"w1:p1"}}
+```
+
+```json
+{"id":"viewers","result":{"type":"terminal_presentation","terminal_id":"term_abc123","native_viewers":1,"ansi_viewers":0}}
+```
+
+计数来自已解析终端的实时客户端状态。缺少写入队列或队列已经关闭的连接不参与计数。原生订阅还需要存活的输出订阅及运行中的终端运行时。传统控制连接、只读观察连接和可见的 ANSI shell 投影计为 ANSI。Shell 投影会考虑客户端本地标签页、缩放、显示订阅及弹窗归属。元数据 API 连接和无关终端不参与计数。调用方窗格使用与 `pane.current` 相同的上下文和别名解析规则。
+
+OMP 配套扩展仅在 `native_viewers > 0` 且 `ansi_viewers == 0` 时允许原生显示。即使原生查看器仍在响应探测，任何 ANSI 查看器都会否决原生模式。查询这些信息不会授予输入、调整尺寸、滚动或接管权限，也不会改变二进制协议 22。不支持此方法的旧服务器会返回普通 API 错误。
 
 ## 智能体状态上报
 

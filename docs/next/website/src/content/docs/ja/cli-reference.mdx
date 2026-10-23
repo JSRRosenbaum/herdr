@@ -355,6 +355,9 @@ herdr terminal native-attach <terminal_id>
 herdr --machine <profile-id> terminal native-attach <terminal_id>
 herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
+herdr terminal presentation <terminal_id>
+herdr terminal presentation --caller-pane-id <pane_id>
+herdr terminal presentation --current
 herdr terminal title set <title>
 herdr terminal title clear
 ```
@@ -368,6 +371,8 @@ ANSI の `terminal attach` からは `ctrl+b q` でデタッチします。リ�
 `terminal session observe` は同じ対象の読み取り専用ストリームを開きます。base64 の ANSI バイト列を含む `terminal.frame` と、サーバー終了時の `terminal.closed` を改行区切り JSON で出力します。複数の観測クライアントは入力、リサイズ、スクロール、制御権を取得せずに同じターミナルを監視できます。Linux/macOS ではソケットへの書き込みが 30 秒間進まない観測クライアントを切断します。その場合は最後の `terminal.closed` が届かないことがありますが、ペインや他のクライアントは動き続けます。出力のない静かなペインはこのタイムアウトの対象ではありません。
 
 `terminal title clear` は外側ターミナルウィンドウタイトルを `ui.window_title` に戻します。
+
+`terminal presentation` は、正規のターミナル ID と現在のネイティブ・ANSI ビューアー数を返します。ターミナル ID、呼び出し元ペイン ID、または管理対象ペイン内で `--current` を指定します。オプションの `terminal_presentation` サーバー能力が、この読み取り専用 API への対応を通知します。ビューアーをアタッチしたり、入力の所有権を変更したりすることはありません。
 
 ## 出力待機
 

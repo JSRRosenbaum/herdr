@@ -52,7 +52,7 @@ pub(super) fn pack_cell_size(width_px: u32, height_px: u32) -> u64 {
     (u64::from(width_px) << 32) | u64::from(height_px)
 }
 
-fn unpack_cell_size(packed: u64) -> Option<(u32, u32)> {
+pub(super) fn unpack_cell_size(packed: u64) -> Option<(u32, u32)> {
     let width_px = (packed >> 32) as u32;
     let height_px = (packed & u64::from(u32::MAX)) as u32;
     (width_px > 0 && height_px > 0).then_some((width_px, height_px))
@@ -71,6 +71,17 @@ pub(super) fn current_terminal_geometry_with(
     if !pixel_geometry_enabled {
         let (cols, rows) = terminal_grid_size()?;
         return Ok((cols, rows, 0, 0, false));
+    }
+    // SSH/ConPTY can retain placeholder pixel extents even after the text grid
+    // changes. A reply from the outer terminal describes the actual cell pitch.
+    if let Some((cell_width_px, cell_height_px)) =
+        unpack_cell_size(reported_cell_size.load(Ordering::Acquire))
+    {
+        let (cols, rows) = match exact_geometry {
+            Some((cols, rows, _, _)) => (cols, rows),
+            None => terminal_grid_size()?,
+        };
+        return Ok((cols, rows, cell_width_px, cell_height_px, true));
     }
     if let Some((cols, rows, cell_width_px, cell_height_px)) = exact_geometry {
         return Ok((cols, rows, cell_width_px, cell_height_px, true));
@@ -100,8 +111,8 @@ fn current_terminal_geometry(
     )
 }
 
-/// Reads terminal geometry before the handshake. Pixel input and direct graphics
-/// are eligible only when one ioctl supplied a coherent exact geometry snapshot.
+/// Reads terminal geometry before the handshake. An available ioctl supplies
+/// the initial geometry; a subsequent host report can correct its cell pitch.
 pub(super) fn initial_terminal_geometry(
     pixel_geometry_enabled: bool,
     pixel_geometry_fallback: bool,
@@ -245,7 +256,7 @@ pub(super) fn should_query_host_cell_size() -> bool {
 }
 
 pub(super) fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
-    kitty_graphics_enabled && should_query_host_cell_size() && ioctl_terminal_geometry().is_none()
+    kitty_graphics_enabled && should_query_host_cell_size()
 }
 
 pub(super) fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {

@@ -131,6 +131,57 @@ fn missing_pixel_geometry_keeps_a_valid_terminal_grid() {
 }
 
 #[test]
+fn terminal_cell_report_overrides_stale_ssh_pixel_extent() {
+    let reported_cell_size = AtomicU64::new(pack_cell_size(10, 22));
+    let geometry = current_terminal_geometry_with(
+        true,
+        true,
+        &reported_cell_size,
+        Some((2, 5)),
+        Some((251, 86, 2, 5)),
+        || panic!("the ioctl already supplied the text grid"),
+    )
+    .expect("the terminal report supplies real pixel geometry");
+
+    assert_eq!(geometry, (251, 86, 10, 22, true));
+
+    reported_cell_size.store(pack_cell_size(12, 26), Ordering::Release);
+    let resized = current_terminal_geometry_with(
+        true,
+        true,
+        &reported_cell_size,
+        Some((10, 22)),
+        Some((209, 72, 3, 6)),
+        || panic!("the ioctl already supplied the resized text grid"),
+    )
+    .expect("a later terminal report replaces the previous pitch");
+
+    assert_eq!(resized, (209, 72, 12, 26, true));
+}
+
+#[test]
+fn terminal_cell_report_works_without_ioctl_pixels_and_respects_disabled_geometry() {
+    let reported_cell_size = AtomicU64::new(pack_cell_size(10, 22));
+    let geometry =
+        current_terminal_geometry_with(true, false, &reported_cell_size, None, None, || {
+            Ok((251, 86))
+        })
+        .expect("a confirmed report does not require assumed-pixel fallback");
+    assert_eq!(geometry, (251, 86, 10, 22, true));
+
+    let disabled = current_terminal_geometry_with(
+        false,
+        false,
+        &reported_cell_size,
+        None,
+        Some((251, 86, 2, 5)),
+        || Ok((251, 86)),
+    )
+    .expect("the text grid remains available when pixels are disabled");
+    assert_eq!(disabled, (251, 86, 0, 0, false));
+}
+
+#[test]
 fn direct_graphics_profile_is_narrow_and_transport_safe() {
     for (program, term, kitty, expected) in [
         ("ghostty", "", false, true),

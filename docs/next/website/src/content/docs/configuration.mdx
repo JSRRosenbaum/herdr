@@ -123,6 +123,28 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+### Inline-image pixel size over SSH
+
+On Unix, when Kitty graphics are enabled, Herdr queries the outer terminal's
+cell-pixel size at connection and on resize. A terminal reply takes precedence
+over the operating system's pixel extent: SSH/ConPTY can retain placeholder
+pixels even while the terminal's row and column counts change. This prevents
+inline charts from being rasterized for tiny cells and enlarged by the viewer.
+
+The query changes display geometry, not running applications or session state.
+Terminals that do not answer retain the ioctl or configured fallback behavior.
+After updating Herdr, reconnect the viewer to use the new geometry handling;
+the backend and its agents do not need restarting.
+
+Applications may need their own display-reset action to regenerate images
+that were cached at the old pixel size.
+
+Pixel-mouse input uses the same confirmed cell pitch, so SSH placeholder
+dimensions do not shift pane hit testing or pane-relative coordinates.
+Focused pixel-reporting panes receive back/forward button presses and releases,
+including modifiers, without changing pane focus. Copy mode and overlays retain
+their input ownership.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

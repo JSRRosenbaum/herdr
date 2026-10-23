@@ -132,7 +132,11 @@ impl ClientWriter {
         self.render.queue.discard_pending_render();
     }
 
-    #[cfg(all(test, unix))]
+    pub(crate) fn is_alive(&self) -> bool {
+        self.render.queue.lock_state().writer_alive
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_paused() -> Self {
         let queue = ClientWriterQueue::new();
         Self {
