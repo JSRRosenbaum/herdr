@@ -666,7 +666,7 @@ platform-native local socket form.
 {"id":"viewers","result":{"type":"terminal_presentation","terminal_id":"term_abc123","native_viewers":1,"ansi_viewers":0}}
 ```
 
-Counts come from live client state for the resolved terminal. Native subscribers count as native; classic controllers, read-only observers and visible ANSI shell projections count as ANSI. Shell projections respect client-local tabs, zoom, surface interest and popup ownership. Metadata API connections and unrelated terminals do not count. Caller-pane resolution uses the same context/alias rules as `pane.current`.
+Counts come from live client state for the resolved terminal; clients with missing or closed writer queues do not qualify. Native subscribers also need a live output subscription and running terminal runtime. Classic controllers, read-only observers and visible ANSI shell projections count as ANSI. Shell projections respect client-local tabs, zoom, surface interest and popup ownership. Metadata API connections and unrelated terminals do not count. Caller-pane resolution uses the same context/alias rules as `pane.current`.
 
 An OMP companion permits native only when `native_viewers > 0` and `ansi_viewers == 0`; any ANSI viewer vetoes it even while a native viewer answers probes. Querying these facts does not grant input, resize, scroll or takeover authority, and does not change binary protocol 22. Unsupported older servers remain normal API errors.
 
