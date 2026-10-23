@@ -27,6 +27,14 @@ pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
 
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
+    // Native presentation needs the OMP companion's authoritative viewer policy.
+    // Guard the speculative startup composer too, while preserving an explicit off.
+    if cmd
+        .get_env("PI_TUI_NATIVE")
+        .is_none_or(|value| value != "0")
+    {
+        cmd.env("PI_TUI_NATIVE", "managed");
+    }
     if let Ok(executable) = crate::platform::launch_executable() {
         cmd.env("HERDR_BIN_PATH", executable);
     }

@@ -148,7 +148,7 @@ use terminal_sessions::terminal_control_command_from_json;
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::io::{self, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
@@ -609,10 +609,12 @@ async fn run_client_loop(
 
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme = state.attach_escape.is_none();
-    let host_theme_query_pending = Arc::new(AtomicU32::new(0));
-    let stdin_host_theme_query_pending = host_theme_query_pending.clone();
-    // Terminals behind ConPTY report no pixel size through the ioctl, so ask the
-    // host terminal directly instead of falling back to an assumed cell size.
+    #[cfg(unix)]
+    let host_query_pending = Arc::new(input::HostQueryPending::default());
+    #[cfg(unix)]
+    let stdin_host_query_pending = host_query_pending.clone();
+    // SSH/ConPTY may report missing or placeholder pixels through the ioctl.
+    // Ask the outer terminal even when those pixel fields are nonzero.
     let will_query_host_cell_size = state.attach_escape.is_none()
         && host_cell_size_query_required(state.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
@@ -646,6 +648,8 @@ async fn run_client_loop(
     } else {
         attach_target.as_ref().map(input::AttachTarget::input_guard)
     };
+    #[cfg(unix)]
+    let stdin_reported_cell_size = reported_cell_size.clone();
     let stdin_thread = std::thread::spawn(move || {
         #[cfg(unix)]
         if native_raw {
@@ -660,10 +664,12 @@ async fn run_client_loop(
         input::stdin_reader_loop(
             stdin_tx,
             &stdin_quit,
-            (will_query_host_terminal_theme, will_query_host_cell_size),
-            stdin_host_theme_query_pending,
-            stdin_mouse_capture_active,
-            stdin_sgr_pixels_active,
+            will_query_host_terminal_theme,
+            #[cfg(unix)]
+            stdin_host_query_pending,
+            (stdin_mouse_capture_active, stdin_sgr_pixels_active),
+            #[cfg(unix)]
+            stdin_reported_cell_size,
             stdin_escape_disambiguation_active,
             stdin_initial_host_input,
             #[cfg(unix)]
@@ -683,6 +689,8 @@ async fn run_client_loop(
 
     #[cfg(unix)]
     if will_query_host_terminal_theme {
+        #[cfg(unix)]
+        host_query_pending.theme.fetch_add(1, Ordering::AcqRel);
         query_host_terminal_theme();
         if state.shell.is_some() {
             query_host_terminal_appearance();
@@ -690,6 +698,8 @@ async fn run_client_loop(
     }
 
     if will_query_host_cell_size {
+        #[cfg(unix)]
+        host_query_pending.cell_size.fetch_add(1, Ordering::AcqRel);
         query_host_cell_size();
     }
 
@@ -1118,6 +1128,7 @@ async fn run_client_loop(
                         query_host_terminal_appearance();
                     }
                     if crate::raw_input::events_require_host_terminal_theme_query(&events) {
+                        // The stdin framer arms this refresh when it sees the scheme change.
                         query_host_terminal_theme();
                     }
                     if let Some((width_px, height_px)) = reported_cell_size_from_events(&events) {
@@ -1414,8 +1425,13 @@ async fn run_client_loop(
                 // Re-query on redraw, including SIGWINCH without a resize.
                 #[cfg(unix)]
                 if will_query_host_terminal_theme {
-                    host_theme_query_pending.fetch_add(1, Ordering::AcqRel);
+                    host_query_pending.theme.fetch_add(1, Ordering::AcqRel);
                     query_host_terminal_theme();
+                }
+                if will_query_host_cell_size {
+                    #[cfg(unix)]
+                    host_query_pending.cell_size.fetch_add(1, Ordering::AcqRel);
+                    query_host_cell_size();
                 }
                 let pixel_mouse_available =
                     pixel_geometry_exact && state.host_sgr_pixel_mouse == Some(true);

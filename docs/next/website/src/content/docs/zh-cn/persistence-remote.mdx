@@ -169,9 +169,9 @@ herdr --machine PROFILE_ID terminal native-attach term_abc123
 
 输入与 PTY 输出保持为不透明字节流，并使用有界背压。原生模式不解释 `ctrl+b q`。关闭前端，或仅向其连接客户端发送 SIGTERM，即可断开；服务器中的应用继续运行。断开时会等待输入线程退出，并隔离旧前端的延迟回复，避免它们进入下一次连接。
 
-重新连接的前端不会重建应用的原生界面历史。已加载伴随扩展且处于空闲状态的 OMP 可用 `/native on` 重新探测并绘制，保持 PID、会话和内存中的对话不变。安装扩展不会把它热加载到已经运行的智能体中。
+连接流本身不会重建应用的原生界面历史。更新后的 OMP 与伴随扩展读取 `terminal.presentation.get`，仅在存在原生查看器且同一终端没有 ANSI 查看器时选择原生渲染。任何 ANSI 查看器（包括只读观察者）都会强制切回 ANSI，即使原生查看器仍然响应。最后一个 ANSI 查看器离开后，OMP 会重新协商并重建当前完整界面，同时保留 PID、历史和未发送草稿。安装扩展不会把它热加载到已运行的智能体中。
 
 对于已经运行的 ANSI 应用，请选择 Tern 的 **Use ANSI screen**。它使用普通 `terminal attach` 显示当前虚拟终端画面，即使应用空闲也能显示，且不改变 PID 或对话。这是明确的显示选择，不是原生连接的自动回退。与经典连接相同，选择休眠终端可能触发其恢复流程。
 
-两种视图的目标输入保护和就绪标记都要求本地客户端提供 `scoped-terminal-attach-v2`；远程原生服务器继续使用 `native-terminal-attach-v1`。升级 CLI 和插件后应重新创建跟随窗格。选择 **Use Native TSP** 本身不会切换 OMP 的渲染器：连接就绪后再执行 `/native on`；将原生渲染的 OMP 切回 ANSI 视图前先执行 `/native off`。
+两种视图的目标输入保护和就绪标记都要求本地客户端提供 `scoped-terminal-attach-v2`；远程原生服务器继续使用 `native-terminal-attach-v1`。升级 CLI 和插件后应重新创建跟随窗格。新窗格使用 `PI_TUI_NATIVE=managed` 保护 OMP 的早期启动渲染；在旧有 shell 中使用 `PI_TUI_NATIVE=managed omp`。`/native status` 显示策略，`/native off` 固定 ANSI，`/native on` 恢复原生偏好但不能覆盖 ANSI 查看器的优先权。旧 OMP 进程应保持 ANSI，直到正常重启到更新版本。
 

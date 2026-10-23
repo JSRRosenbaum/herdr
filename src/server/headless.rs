@@ -82,6 +82,7 @@ mod lifecycle;
 mod native_graphics;
 mod native_terminal;
 mod notifications;
+mod presentation;
 mod render;
 mod retained_surface;
 mod surface_interest;
@@ -3119,6 +3120,12 @@ impl HeadlessServer {
         changed |= self.drain_all_internal_events_with_forwarding();
         if self.host_shutdown_requested() {
             Self::reject_api_request_for_shutdown(msg);
+            return changed;
+        }
+
+        if let api::schema::Method::TerminalPresentationGet(params) = &msg.request.method {
+            let response = self.terminal_presentation_response(&msg.request.id, params);
+            let _ = msg.respond_to.send(response);
             return changed;
         }
 

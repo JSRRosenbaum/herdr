@@ -104,6 +104,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Terminal | `terminal.presentation.get` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -652,6 +653,22 @@ Use `HERDR_SOCKET_PATH` only for low-level overrides.
 For plugins, prefer invoking `HERDR_BIN_PATH` and the CLI wrappers when you need
 portable Windows behavior. Raw socket clients are responsible for using the
 platform-native local socket form.
+
+## Terminal presentation
+
+`terminal.presentation.get` is a read-only headless-server API, advertised by the optional `terminal_presentation` capability. Supply exactly one of `terminal_id` or `caller_pane_id`:
+
+```json
+{"id":"viewers","method":"terminal.presentation.get","params":{"caller_pane_id":"w1:p1"}}
+```
+
+```json
+{"id":"viewers","result":{"type":"terminal_presentation","terminal_id":"term_abc123","native_viewers":1,"ansi_viewers":0}}
+```
+
+Counts come from live client state for the resolved terminal. Native subscribers count as native; classic controllers, read-only observers and visible ANSI shell projections count as ANSI. Shell projections respect client-local tabs, zoom, surface interest and popup ownership. Metadata API connections and unrelated terminals do not count. Caller-pane resolution uses the same context/alias rules as `pane.current`.
+
+An OMP companion permits native only when `native_viewers > 0` and `ansi_viewers == 0`; any ANSI viewer vetoes it even while a native viewer answers probes. Querying these facts does not grant input, resize, scroll or takeover authority, and does not change binary protocol 22. Unsupported older servers remain normal API errors.
 
 ## Agent state reporting
 

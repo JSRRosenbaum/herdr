@@ -4357,6 +4357,23 @@
           ],
           "type": "object"
         },
+        "TerminalPresentationGetParams": {
+          "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -6305,6 +6322,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.presentation.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalPresentationGetParams"
             }
           },
           "required": [
@@ -9592,6 +9625,34 @@
             },
             {
               "properties": {
+                "ansi_viewers": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "native_viewers": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "terminal_presentation",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "terminal_id",
+                "native_viewers",
+                "ansi_viewers"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "swap": {
                   "$ref": "#/schemas/success_response/$defs/PaneSwapResult"
                 },
@@ -10449,6 +10510,11 @@
             "surface_interest": {
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
+              "type": "boolean"
+            },
+            "terminal_presentation": {
+              "default": false,
+              "description": "Supports derived viewer counts via `terminal.presentation.get`.",
               "type": "boolean"
             }
           },

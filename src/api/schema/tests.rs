@@ -515,6 +515,55 @@ fn pane_current_request_round_trips() {
 }
 
 #[test]
+fn terminal_presentation_json_method_and_optional_capability_round_trip() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "presentation",
+        "method": "terminal.presentation.get",
+        "params": {"caller_pane_id": "w1:p1"}
+    }))
+    .unwrap();
+    assert_eq!(
+        request.method,
+        Method::TerminalPresentationGet(TerminalPresentationGetParams {
+            terminal_id: None,
+            caller_pane_id: Some("w1:p1".into()),
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&request).unwrap()["params"],
+        serde_json::json!({"caller_pane_id": "w1:p1"})
+    );
+    let response = SuccessResponse {
+        id: request.id,
+        result: ResponseResult::TerminalPresentation {
+            terminal_id: "term_1".into(),
+            native_viewers: 1,
+            ansi_viewers: 2,
+        },
+    };
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        value["result"],
+        serde_json::json!({
+            "type": "terminal_presentation",
+            "terminal_id": "term_1",
+            "native_viewers": 1,
+            "ansi_viewers": 2
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(value).unwrap(),
+        response
+    );
+
+    let capabilities: ServerCapabilities = serde_json::from_value(serde_json::json!({
+        "live_handoff": false
+    }))
+    .unwrap();
+    assert!(!capabilities.terminal_presentation);
+}
+
+#[test]
 fn pane_process_info_request_round_trips() {
     let request = Request {
         id: "req_process_info".into(),
@@ -727,6 +776,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_presentation: true,
             }),
         },
     };

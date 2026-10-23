@@ -77,6 +77,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        terminal_presentation: true,
     })
 }
 
@@ -1398,6 +1399,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_presentation: true,
             }),
             None,
             None,

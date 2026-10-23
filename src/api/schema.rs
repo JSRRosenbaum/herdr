@@ -117,7 +117,7 @@ operations::define_operations! {
     PaneLinkActivate(PaneLinkActivateParams) => "pane.link.activate", false, true;
     PaneLinkResolve(PaneLinkActivateParams) => "pane.link.resolve", false, true;
     PaneRename(PaneRenameParams) => "pane.rename", true, true;
-    PaneSendText(PaneSendTextParams) => "pane.send_text", false, false;
+    PaneSendText(PaneSendTextParams) => "pane.send_text", false, true;
     PaneSendKeys(PaneSendKeysParams) => "pane.send_keys", false, false;
     PaneSendInput(PaneSendInputParams) => "pane.send_input", false, false;
     PaneRead(PaneReadParams) => "pane.read", false, false;
@@ -145,6 +145,7 @@ operations::define_operations! {
     PluginPaneOpen(PluginPaneOpenParams) => "plugin.pane.open", true, false;
     PluginPaneFocus(PluginPaneFocusParams) => "plugin.pane.focus", true, false;
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
+    TerminalPresentationGet(TerminalPresentationGetParams) => "terminal.presentation.get", false, false;
 }
 
 #[cfg(test)]
